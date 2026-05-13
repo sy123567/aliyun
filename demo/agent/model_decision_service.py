@@ -1,0 +1,486 @@
+"""DP-ORH-MS 决策服务：动态偏好感知的在线滚动时域多目标评分。
+
+依赖 ``simkit.ports.SimulationApiPort``：评测进程会注入具体的环境实现。
+
+主流程（详见 ``docs/06-设计过程思路总文档.md`` 6.1 节）：
+1. 读取司机状态（``get_driver_status``）。
+2. 检测偏好变化，仅在变化时重新调用 LLM 解析。
+3. 同步历史动作到司机记忆（``query_decision_history``）。
+4. 查询候选货源并更新热点 + 小时桋。
+5. 生成接单/休息/空驶候选 + 自适应权重评分。
+6. 选择最高分动作，过 ``action_validator`` 后输出。
+7. 任何阶段异常回退到安全休息，不会抛出未捕获异常。
+"""
+
+from __future__ import annotations
+
+import logging
+import math
+from typing import Any
+
+from simkit.ports import SimulationApiPort
+
+from . import action_validator, config, driver_memory, geo_utils, preference_parser, scoring
+from .scoring import DecisionContext, ScoredAction
+
+_LOGGER = logging.getLogger("agent.decision_service")
+
+_HISTORY_LOOKBACK_STEPS = config.HISTORY_LOOKBACK_STEPS
+_TOP_ORDER_CANDIDATES = config.TOP_ORDER_CANDIDATES
+_TOP_REPOSITION_TARGETS = config.TOP_REPOSITION_TARGETS
+_MIN_WAIT_FALLBACK_MINUTES = config.MIN_WAIT_FALLBACK_MINUTES
+_TOP_LOG_CANDIDATES = 5
+
+
+class ModelDecisionService:
+    """参赛智能体单步决策入口。"""
+
+    def __init__(self, api: SimulationApiPort) -> None:
+        self._api = api
+        self._logger = _LOGGER
+
+    # ---------------- 主入口 ----------------
+
+    def decide(self, driver_id: str) -> dict[str, Any]:
+        """主决策入口；全过程异常回退到安全休息。"""
+        try:
+            return self._decide_inner(driver_id)
+        except Exception as exc:  # noqa: BLE001 - 最外层兜底，避免评测进程被决策损坏
+            self._logger.exception("decide 未捕获异常 driver_id=%s err=%s", driver_id, exc)
+            return action_validator.safe_wait(_MIN_WAIT_FALLBACK_MINUTES, note="unhandled_exception")
+
+    def _decide_inner(self, driver_id: str) -> dict[str, Any]:
+        try:
+            status = self._api.get_driver_status(driver_id)
+        except Exception as exc:  # noqa: BLE001 - 状态接口异常时退化为短休息
+            self._logger.warning("get_driver_status 失败 driver_id=%s err=%s", driver_id, exc)
+            return action_validator.safe_wait(_MIN_WAIT_FALLBACK_MINUTES, note="status_unavailable")
+
+        memory = driver_memory.get_or_create(driver_id)
+        self._sync_history(driver_id, memory)
+
+        sim_minutes = int(status.get("simulation_progress_minutes") or 0)
+        rules = self._ensure_rules_parsed(driver_id, status, memory, sim_minutes)
+
+        current_lat = float(status.get("current_lat") or 0.0)
+        current_lng = float(status.get("current_lng") or 0.0)
+
+        cargo_items = self._safe_query_cargo(driver_id, current_lat, current_lng)
+        try:
+            status = self._api.get_driver_status(driver_id)
+        except Exception as exc:  # noqa: BLE001
+            self._logger.warning("query_cargo 后刷新 get_driver_status 失败 driver_id=%s err=%s", driver_id, exc)
+
+        sim_minutes = int(status.get("simulation_progress_minutes") or sim_minutes)
+        rules = self._ensure_rules_parsed(driver_id, status, memory, sim_minutes)
+        current_lat = float(status.get("current_lat") or current_lat)
+        current_lng = float(status.get("current_lng") or current_lng)
+        truck_length = str(status.get("truck_length") or "")
+        memory.last_status_minutes = sim_minutes
+        memory.last_lat = current_lat
+        memory.last_lng = current_lng
+
+        cost_per_km = float(status.get("cost_per_km") or 1.5)
+        ctx = DecisionContext(
+            driver_id=driver_id,
+            cost_per_km=cost_per_km,
+            truck_length=truck_length,
+            current_lat=current_lat,
+            current_lng=current_lng,
+            current_minutes=sim_minutes,
+            horizon_minutes=config.AGENT_HORIZON_MINUTES,
+        )
+
+        self._update_hotspots(memory, cargo_items, sim_minutes)
+
+        # 自适应权重（文档 8.4 节）：根据月末/夜间/稀缺/违规预警调位
+        ctx.weights = scoring.resolve_adaptive_weights(
+            rules=rules,
+            memory=memory,
+            ctx=ctx,
+            visible_cargo_count=len(cargo_items),
+        )
+        ctx.visible_cargo_count = len(cargo_items)
+
+        order_candidates = self._build_order_candidates(cargo_items, rules, memory, ctx)
+        has_good_order = any(c.feasible and c.score > 0 for c in order_candidates)
+
+        wait_candidates = self._build_wait_candidates(rules, memory, ctx, has_good_order)
+        reposition_candidates = self._build_reposition_candidates(
+            cargo_items, rules, memory, ctx, has_good_order
+        )
+
+        all_candidates: list[ScoredAction] = []
+        all_candidates.extend(order_candidates)
+        all_candidates.extend(wait_candidates)
+        all_candidates.extend(reposition_candidates)
+        feasible = [c for c in all_candidates if c.feasible]
+
+        self._log_top_candidates(driver_id, sim_minutes, len(cargo_items), all_candidates)
+
+        if not feasible:
+            filtered_notes = sorted({c.note for c in all_candidates if c.note})
+            self._logger.warning(
+                "无可行候选 driver_id=%s sim_min=%s items=%s filtered=%s -> safe_wait",
+                driver_id,
+                sim_minutes,
+                len(cargo_items),
+                filtered_notes,
+            )
+            return action_validator.safe_wait(_MIN_WAIT_FALLBACK_MINUTES, note="no_feasible_candidate")
+
+        best = max(feasible, key=lambda c: c.score)
+        allowed_cargo_ids: set[str] | None = None
+        if best.action == "take_order":
+            allowed_cargo_ids = {
+                str((item.get("cargo") or {}).get("cargo_id", "")).strip()
+                for item in cargo_items
+            }
+            allowed_cargo_ids.discard("")
+
+        try:
+            validated = action_validator.validate_action(
+                best.as_action_dict(),
+                allowed_cargo_ids=allowed_cargo_ids,
+            )
+        except action_validator.ActionInvalid as exc:
+            self._logger.warning(
+                "action_validator 拒绝 driver_id=%s action=%s err=%s -> safe_wait",
+                driver_id,
+                best.as_action_dict(),
+                exc,
+            )
+            return action_validator.safe_wait(_MIN_WAIT_FALLBACK_MINUTES, note=f"invalid_action:{exc}")
+
+        self._logger.info(
+            "decision driver_id=%s sim_min=%s items=%s action=%s score=%.2f note=%s token_used=%s",
+            driver_id,
+            sim_minutes,
+            len(cargo_items),
+            validated.get("action"),
+            best.score,
+            best.note,
+            memory.token_used,
+        )
+        return validated
+
+    # ---------------- 历史记忆同步 ----------------
+
+    def _sync_history(self, driver_id: str, memory: driver_memory.DriverMemory) -> None:
+        try:
+            history = self._api.query_decision_history(driver_id, _HISTORY_LOOKBACK_STEPS)
+        except Exception as exc:  # noqa: BLE001
+            self._logger.warning("query_decision_history 失败 driver_id=%s err=%s", driver_id, exc)
+            return
+        records = history.get("records") if isinstance(history, dict) else None
+        if isinstance(records, list):
+            memory.absorb_history_records(records)
+            if memory.rules is not None:
+                self._update_timed_event_flags(memory, memory.rules, records)
+
+    def _update_timed_event_flags(
+        self,
+        memory: driver_memory.DriverMemory,
+        rules: preference_parser.ParsedRules,
+        records: list[dict[str, Any]],
+    ) -> None:
+        for event in rules.timed_stay_events:
+            key = scoring.timed_event_key(event)
+            pickup_run = 0
+            for record in records:
+                action = record.get("action", {}) or {}
+                action_name = str(action.get("action", "")).strip().lower()
+                result = record.get("result", {}) or {}
+                pos_before = record.get("position_before", {}) or {}
+                pos_after = record.get("position_after", {}) or {}
+                try:
+                    before_lat = float(pos_before.get("lat"))
+                    before_lng = float(pos_before.get("lng"))
+                    after_lat = float(pos_after.get("lat"))
+                    after_lng = float(pos_after.get("lng"))
+                    step_end = int(result.get("simulation_progress_minutes", 0) or 0)
+                    action_exec = int(record.get("action_exec_cost_minutes", 0) or 0)
+                except (TypeError, ValueError):
+                    continue
+                near_pick_after = geo_utils.haversine_km(after_lat, after_lng, event.pickup_lat, event.pickup_lng) <= event.radius_km
+                near_pick_before = geo_utils.haversine_km(before_lat, before_lng, event.pickup_lat, event.pickup_lng) <= event.radius_km
+                near_home_after = geo_utils.haversine_km(after_lat, after_lng, event.home_lat, event.home_lng) <= event.radius_km
+                if step_end >= event.start_minutes and action_name == "wait" and near_pick_after:
+                    pickup_run += action_exec
+                    if pickup_run >= event.pickup_stay_minutes:
+                        memory.timed_event_flags.add(f"{key}:pickup")
+                elif not (near_pick_before and near_pick_after):
+                    pickup_run = 0
+                if step_end >= event.start_minutes and near_home_after:
+                    memory.timed_event_flags.add(f"{key}:home")
+
+    # ---------------- 偏好解析（带缓存） ----------------
+
+    def _ensure_rules_parsed(
+        self,
+        driver_id: str,
+        status: dict[str, Any],
+        memory: driver_memory.DriverMemory,
+        sim_minutes: int,
+    ) -> preference_parser.ParsedRules:
+        preferences = status.get("preferences") or []
+        signature = preference_parser.signature_of(preferences)
+        if memory.rules is not None and memory.rules_signature == signature:
+            return memory.rules  # type: ignore[return-value]
+
+        # 仅在 token 预算允许时交由 LLM 主解析；否则走正则安全网
+        llm_caller = None
+        if memory.can_call_model(expected_tokens=2000):
+            llm_caller = self._make_llm_caller(driver_id, memory)
+        else:
+            self._logger.warning(
+                "token 预算接近上限，偏好解析降级为纯正则 driver_id=%s token_used=%s",
+                driver_id,
+                memory.token_used,
+            )
+
+        rules = preference_parser.parse_preferences(preferences, llm_caller=llm_caller)
+        # 持久化保留：把先前已解析的高额规则（家事 / 熟货）合并到本次结果。
+        # 仿真器按墙钟隐藏偏好（如家事仅 3/10–3/13 可见），但 agent 需要提前对位。
+        prior_rules = memory.rules
+        if prior_rules is not None:
+            seen_keys = {(e.start_minutes, round(e.pickup_lat, 4), round(e.home_lat, 4)) for e in rules.timed_stay_events}
+            for ev in prior_rules.timed_stay_events:
+                key = (ev.start_minutes, round(ev.pickup_lat, 4), round(ev.home_lat, 4))
+                if key in seen_keys:
+                    continue
+                if ev.stay_until_minutes <= sim_minutes:
+                    continue  # 已结束的事件不再保留
+                rules.timed_stay_events.append(ev)
+            seen_cargo = {r.cargo_id for r in rules.preferred_cargo}
+            for pc in prior_rules.preferred_cargo:
+                if pc.cargo_id in seen_cargo:
+                    continue
+                rules.preferred_cargo.append(pc)
+                if pc.cargo_id not in rules.preferred_cargo_ids:
+                    rules.preferred_cargo_ids.append(pc.cargo_id)
+        memory.rules = rules
+        memory.rules_signature = signature
+        memory.record_preference_change(
+            new_signature=signature,
+            sim_minutes=sim_minutes,
+            parsed_by_llm=rules.parsed_by_llm,
+            parsed_by_regex=rules.parsed_by_regex,
+            parse_failure_count=rules.parse_failure_count,
+        )
+        self._logger.info(
+            "偏好解析完成 driver_id=%s total=%s llm=%s regex=%s failed=%s changes=%s",
+            driver_id,
+            len(rules.raw_preferences),
+            rules.parsed_by_llm,
+            rules.parsed_by_regex,
+            rules.parse_failure_count,
+            len(memory.preference_state.dynamic_changes),
+        )
+        return rules
+
+    def _make_llm_caller(self, driver_id: str, memory: driver_memory.DriverMemory):
+        def _caller(payload: dict[str, Any]) -> dict[str, Any]:
+            try:
+                resp = self._api.model_chat_completion(payload)
+            except Exception as exc:  # noqa: BLE001
+                self._logger.warning("model_chat_completion 失败 driver_id=%s err=%s", driver_id, exc)
+                return {}
+            if not isinstance(resp, dict):
+                return {}
+            usage = resp.get("usage")
+            if isinstance(usage, dict):
+                memory.update_token(int(usage.get("total_tokens", 0)))
+            return resp
+
+        return _caller
+
+    def _log_top_candidates(
+        self,
+        driver_id: str,
+        sim_minutes: int,
+        items_count: int,
+        candidates: list[ScoredAction],
+    ) -> None:
+        """依文档 12.3 节要求记录 Top 候选评分明细供人工复核。"""
+        if not candidates:
+            return
+        ranked = sorted(candidates, key=lambda c: c.score, reverse=True)[:_TOP_LOG_CANDIDATES]
+        for rank, cand in enumerate(ranked, start=1):
+            top_breakdown = sorted(
+                cand.breakdown.items(), key=lambda kv: abs(kv[1]), reverse=True
+            )[:5]
+            self._logger.debug(
+                "top%s driver=%s sim_min=%s items=%s action=%s feasible=%s score=%.2f params=%s breakdown=%s note=%s",
+                rank,
+                driver_id,
+                sim_minutes,
+                items_count,
+                cand.action,
+                cand.feasible,
+                cand.score,
+                cand.params,
+                top_breakdown,
+                cand.note,
+            )
+
+    # ---------------- 货源查询 ----------------
+
+    def _safe_query_cargo(self, driver_id: str, lat: float, lng: float) -> list[dict[str, Any]]:
+        try:
+            resp = self._api.query_cargo(driver_id=driver_id, latitude=lat, longitude=lng)
+        except Exception as exc:  # noqa: BLE001
+            self._logger.warning("query_cargo 失败 driver_id=%s err=%s", driver_id, exc)
+            return []
+        items = resp.get("items") if isinstance(resp, dict) else None
+        return list(items) if isinstance(items, list) else []
+
+    def _update_hotspots(
+        self,
+        memory: driver_memory.DriverMemory,
+        items: list[dict[str, Any]],
+        sim_minutes: int,
+    ) -> None:
+        for item in items:
+            cargo = item.get("cargo") or {}
+            start = cargo.get("start") or {}
+            try:
+                lat = float(start["lat"])
+                lng = float(start["lng"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            price = float(cargo.get("price") or 0.0)
+            minutes = int(cargo.get("cost_time_minutes") or 0)
+            memory.update_hotspot(lat, lng, price, max(1, minutes), sim_minutes)
+
+    # ---------------- 候选生成 ----------------
+
+    def _build_order_candidates(
+        self,
+        items: list[dict[str, Any]],
+        rules: preference_parser.ParsedRules,
+        memory: driver_memory.DriverMemory,
+        ctx: DecisionContext,
+    ) -> list[ScoredAction]:
+        candidates: list[ScoredAction] = []
+        preferred_ids = set(rules.preferred_cargo_ids)
+        selected = list(items[:_TOP_ORDER_CANDIDATES])
+        if preferred_ids:
+            selected_ids = {
+                str(((item.get("cargo") or {}).get("cargo_id", ""))).strip()
+                for item in selected
+            }
+            for item in items[_TOP_ORDER_CANDIDATES:]:
+                cargo_id = str(((item.get("cargo") or {}).get("cargo_id", ""))).strip()
+                if cargo_id in preferred_ids and cargo_id not in selected_ids:
+                    selected.append(item)
+                    selected_ids.add(cargo_id)
+        for item in selected:
+            scored = scoring.score_take_order(item, rules, memory, ctx)
+            candidates.append(scored)
+        return candidates
+
+    def _build_wait_candidates(
+        self,
+        rules: preference_parser.ParsedRules,
+        memory: driver_memory.DriverMemory,
+        ctx: DecisionContext,
+        has_good_order: bool,
+    ) -> list[ScoredAction]:
+        durations = scoring.build_wait_durations(rules, ctx, memory)
+        candidates = [
+            scoring.score_wait(d, rules, memory, ctx, has_good_order=has_good_order) for d in durations
+        ]
+        return candidates
+
+    def _build_reposition_candidates(
+        self,
+        items: list[dict[str, Any]],
+        rules: preference_parser.ParsedRules,
+        memory: driver_memory.DriverMemory,
+        ctx: DecisionContext,
+        has_good_order: bool,
+    ) -> list[ScoredAction]:
+        # 高优先级偏好目标点：事件接人点 / 老家 / 熟货 / 必到 / 回家
+        priority_targets: list[tuple[float, float]] = []
+        for event in rules.timed_stay_events:
+            phase = scoring.timed_event_phase(event, memory, ctx)
+            if phase in {"approaching", "pickup", "late_pickup"}:
+                priority_targets.append((event.pickup_lat, event.pickup_lng))
+            elif phase in {"home", "late_home"}:
+                priority_targets.append((event.home_lat, event.home_lng))
+        for preferred in rules.preferred_cargo:
+            target = scoring.preferred_cargo_target(preferred)
+            if target is not None and scoring.preferred_cargo_preposition_ready(preferred, ctx.current_minutes):
+                priority_targets.append(target)
+        for must in rules.must_visit:
+            priority_targets.append((must.lat, must.lng))
+        if rules.home_rule is not None:
+            priority_targets.append((rules.home_rule.lat, rules.home_rule.lng))
+
+        # 当前位置已有可接好单时，避免无意义远距离空驶。
+        targets: list[tuple[float, float]] = list(priority_targets)
+        if not has_good_order:
+            targets.extend(self._reposition_targets_from_cargo(items, ctx))
+            targets.extend(self._reposition_targets_from_hotspots(memory, ctx))
+        # 去重
+        seen: set[tuple[float, float]] = set()
+        deduped: list[tuple[float, float]] = []
+        for t in targets:
+            key = (round(t[0], 3), round(t[1], 3))
+            if key in seen:
+                continue
+            if math.hypot(t[0] - ctx.current_lat, t[1] - ctx.current_lng) < 0.01:
+                continue
+            seen.add(key)
+            deduped.append(t)
+        return [
+            scoring.score_reposition(t[0], t[1], rules, memory, ctx)
+            for t in deduped[:_TOP_REPOSITION_TARGETS]
+        ]
+
+    def _reposition_targets_from_cargo(
+        self,
+        items: list[dict[str, Any]],
+        ctx: DecisionContext,
+    ) -> list[tuple[float, float]]:
+        # 取价格-时间比 Top 货源的装货点作为空驶候选；过滤过近的点
+        scored: list[tuple[float, float, float]] = []
+        for item in items[:_TOP_ORDER_CANDIDATES]:
+            cargo = item.get("cargo") or {}
+            start = cargo.get("start") or {}
+            try:
+                lat = float(start["lat"])
+                lng = float(start["lng"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            price = float(cargo.get("price") or 0.0)
+            minutes = max(1, int(cargo.get("cost_time_minutes") or 60))
+            ratio = price / minutes
+            distance_km = float(item.get("distance_km") or 0.0)
+            if distance_km < 5:
+                continue
+            scored.append((ratio, lat, lng))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return [(lat, lng) for _, lat, lng in scored[:_TOP_REPOSITION_TARGETS]]
+
+    def _reposition_targets_from_hotspots(
+        self,
+        memory: driver_memory.DriverMemory,
+        ctx: DecisionContext,
+    ) -> list[tuple[float, float]]:
+        scored: list[tuple[float, tuple[float, float]]] = []
+        for key, cell in memory.hotspots.items():
+            if cell.samples < 2:
+                continue
+            lat, lng = geo_utils.grid_center(key)
+            if math.hypot(lat - ctx.current_lat, lng - ctx.current_lng) < 0.05:
+                continue
+            avg_yield = cell.sum_price_per_minute / max(1, cell.samples)
+            scored.append((avg_yield, (lat, lng)))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return [coord for _, coord in scored[:_TOP_REPOSITION_TARGETS]]
+
+
+# 列出可供外部导出的名字，保证 ``from agent.model_decision_service import *`` 不会泄露内部状态。
+__all__ = ["ModelDecisionService"]

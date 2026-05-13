@@ -1,0 +1,31 @@
+{
+  "month": "2026-03",
+  "simulate_time_seconds": 161.89,
+  "simulation_duration_days": 31,
+  "completed_steps": 1405,
+  "remaining_cargo_count": 0,
+  "driver_completed_steps": {
+    "D001": 247,
+    "D002": 63,
+    "D003": 470,
+    "D004": 54,
+    "D005": 90,
+    "D006": 75,
+    "D007": 68,
+    "D008": 87,
+    "D009": 122,
+    "D010": 129
+  },
+  "driver_result_files": {
+    "D001": "D:\\vs code\\aliyun\\demo\\results\\actions_202603_D001_20260511_172912.jsonl",
+    "D002": "D:\\vs code\\aliyun\\demo\\results\\actions_202603_D002_20260511_172912.jsonl",
+    "D003": "D:\\vs code\\aliyun\\demo\\results\\actions_202603_D003_20260511_172912.jsonl",
+    "D004": "D:\\vs code\\aliyun\\demo\\results\\actions_202603_D004_20260511_172912.jsonl",
+    "D005": "D:\\vs code\\aliyun\\demo\\results\\actions_202603_D005_20260511_172912.jsonl",
+    "D006": "D:\\vs code\\aliyun\\demo\\results\\actions_202603_D006_20260511_172912.jsonl",
+    "D007": "D:\\vs code\\aliyun\\demo\\results\\actions_202603_D007_20260511_172912.jsonl",
+    "D008": "D:\\vs code\\aliyun\\demo\\results\\actions_202603_D008_20260511_172912.jsonl",
+    "D009": "D:\\vs code\\aliyun\\demo\\results\\actions_202603_D009_20260511_172912.jsonl",
+    "D010": "D:\\vs code\\aliyun\\demo\\results\\actions_202603_D010_20260511_172912.jsonl"
+  }
+}

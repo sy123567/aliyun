@@ -1,0 +1,35 @@
+@startuml
+actor User
+participant System
+participant ReservationService
+participant Classroom
+participant TimeSlot
+participant Reservation
+
+User -> System: login(username, password)
+System --> User: User object
+
+User -> ReservationService: browseAvailableClassrooms(date)
+ReservationService -> Classroom: getAvailableTimeSlots(date)
+Classroom -> TimeSlot: checkAvailability()
+TimeSlot --> Classroom: available slots list
+Classroom --> ReservationService: classroom list with slots
+ReservationService --> User: available classroom list
+
+User -> ReservationService: selectClassroom(classroomId)
+ReservationService -> Classroom: getAvailableTimeSlots(date)
+Classroom --> ReservationService: available time slots
+ReservationService --> User: time slot list
+
+User -> ReservationService: selectTimeSlot(classroomId, slot)
+ReservationService -> TimeSlot: isAvailable()
+TimeSlot --> ReservationService: boolean
+
+alt slot is available
+  ReservationService -> Reservation: create(userId, classroomId, slot)
+  Reservation --> ReservationService: success
+  ReservationService --> User: reservation success
+else slot not available
+  ReservationService --> User: reservation failed
+end
+@enduml

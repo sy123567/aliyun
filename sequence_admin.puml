@@ -1,0 +1,34 @@
+@startuml
+actor Admin
+participant AdminService
+participant User
+participant Classroom
+participant TimeSlot
+
+Admin -> AdminService: addUser(userData)
+AdminService -> User: create(name, password, role)
+User --> AdminService: new User object
+AdminService --> Admin: add success
+
+Admin -> AdminService: deleteUser(userId)
+AdminService -> User: remove(userId)
+User --> AdminService: delete success
+AdminService --> Admin: delete success
+
+Admin -> AdminService: addClassroom(classroomData)
+AdminService -> Classroom: create(name, location, capacity)
+Classroom --> AdminService: new Classroom object
+AdminService --> Admin: add success
+
+Admin -> AdminService: setTimeSlots(classroomId, slots)
+AdminService -> Classroom: updateTimeSlots(slots)
+Classroom -> TimeSlot: create(startTime, endTime)
+TimeSlot --> Classroom: TimeSlot object
+Classroom --> AdminService: update success
+AdminService --> Admin: set success
+
+Admin -> AdminService: viewReservations()
+AdminService -> Classroom: getAllReservations()
+Classroom --> AdminService: reservation list
+AdminService --> Admin: reservation report
+@enduml

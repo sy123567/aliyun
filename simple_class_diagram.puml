@@ -1,0 +1,15 @@
+@startuml
+class User {
+  - id: String
+  - name: String
+  + login(): boolean
+}
+
+class Classroom {
+  - id: String
+  - name: String
+  + getSlots(): List
+}
+
+User --> Classroom
+@enduml
