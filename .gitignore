@@ -56,5 +56,5 @@ Thumbs.db
 *.java~
 *.jsp~
 
-# Large data files
-demo/server/data/cargo_dataset.jsonl
+# Large data files (tracked by Git LFS)
+# demo/server/data/cargo_dataset.jsonl
