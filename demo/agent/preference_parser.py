@@ -26,7 +26,14 @@ logger = logging.getLogger("agent.preference_parser")
 
 # 数字提取常用正则
 _NUM_PATTERN = re.compile(r"(\d+(?:\.\d+)?)")
-_HOUR_RANGE_PATTERN = re.compile(r"(\d{1,2})\s*(?:点|时|:00)?\s*(?:至|到|-|~|—)\s*(?:次日\s*)?(\d{1,2})\s*(?:点|时|:00)?")
+# 时间范围正则：可选性捕获 group(1)=起始时段、(2)=起始点、(3)=结束时段、(4)=结束点。
+# 主要为了覆盖 D004 的「中午 12 点至下午 1 点」这种跨中午、依赖上/下午标记才能正确解析的表达。
+# 原版只拍「数字 + 点/时」，会把「下午 1 点」当作 1 点，导致 D004 每天出一次 12-13 违规、全月 ¥3,000。
+_HOUR_RANGE_PATTERN = re.compile(
+    r"(上午|中午|下午|晚上|凌晨|早上)?\s*(\d{1,2})\s*(?:点|时|:00)?\s*"
+    r"(?:至|到|-|~|—)\s*"
+    r"(?:次日\s*)?(上午|中午|下午|晚上|凌晨|早上)?\s*(\d{1,2})\s*(?:点|时|:00)?"
+)
 _LATLNG_PATTERN = re.compile(r"[（(]\s*(\d{1,3}(?:\.\d+)?)\s*[，,]\s*(\d{1,3}(?:\.\d+)?)\s*[)）]")
 _WALL_TIME_ZH_PATTERN = re.compile(r"(\d{4})年(\d{1,2})月(\d{1,2})日\s*(\d{1,2})(?::|点)(\d{2})?")
 _WALL_TIME_ISO_PATTERN = re.compile(r"(\d{4})-(\d{1,2})-(\d{1,2})\s+(\d{1,2}):(\d{2})")
@@ -232,15 +239,43 @@ def _extract_lat_lng(text: str) -> list[tuple[float, float]]:
     return pairs
 
 
+def _convert_period_hour(period: str | None, hour: int) -> int:
+    """根据上下午/中午等标记把 12 小时制转为 24 小时制。
+
+    例：下午 1 点 -> 13，晚上 11 点 -> 23。「中午 12」 / 「凌晨 12」 保持 12 / 0。
+    """
+    if period in ("下午", "晚上"):
+        if 1 <= hour <= 11:
+            return hour + 12
+        return hour  # 12 点 / 超过 12 不变
+    if period == "凌晨":
+        if hour == 12:
+            return 0
+        return hour  # 凌晨 1-5 / 6 保持原值
+    if period == "中午":
+        # 「中午 11/12/13 点」保持原值，避免过度修正。
+        return hour
+    if period in ("上午", "早上"):
+        if hour == 12:
+            return 0
+        return hour
+    return hour
+
+
 def _extract_hour_range(text: str) -> tuple[int, int] | None:
     m = _HOUR_RANGE_PATTERN.search(text)
     if m is None:
         return None
+    # Group 1=起始时段标记, 2=起始点, 3=结束时段标记, 4=结束点。
+    start_period = m.group(1)
+    end_period = m.group(3)
     try:
-        start = int(m.group(1))
-        end = int(m.group(2))
-    except ValueError:
+        start = int(m.group(2))
+        end = int(m.group(4))
+    except (ValueError, TypeError):
         return None
+    start = _convert_period_hour(start_period, start)
+    end = _convert_period_hour(end_period, end)
     if not (0 <= start <= 24 and 0 <= end <= 24):
         return None
     return start, end

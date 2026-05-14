@@ -593,16 +593,33 @@ def score_take_order(
             )
 
     # 偏好：禁行时段——评测按「当天有违规活动」扣固定罚金（如 D007 每天扣 500、上限 15000），
-    # 不按重叠分钟数计。任何与禁行窗重叠的订单均视为当天违规，直接拒绝。
-    # 加安全裕量：防止仿真实际用时超估计而意外触碰禁行窗。
+    # 不按重叠分钟数计。任何与禁行窗重叠的订单均视为当天违规。
+    # 严格/软划分：单日罚金 ≤ NO_DRIVE_SOFT_PENALTY_THRESHOLD（默认 150 元）的窗作「软偏好」处理：仅接受软罚、
+    # 不启用双重裕量、不硬拒（如 D004 「中午 12–13 不接」单日 ¥100，硬拒损失远大于罚金）。
+    # 严格窗启用双重保险裕量：
+    #   1) HAUL_TIME_OVERESTIMATE_RATIO 把 haversine 低估的 occupied_minutes 补回来（公路里程比直线长 10–15%）；
+    #   2) NO_DRIVE_SAFETY_BUFFER_MINUTES 再叠加固定裕量，防止 cost_time_minutes 本身也偏乐观。
+    overestimated_finish = ctx.current_minutes + int(
+        (finish_minutes - ctx.current_minutes) * config.HAUL_TIME_OVERESTIMATE_RATIO
+    )
     for window in rules.no_drive_windows:
-        buffered_finish = finish_minutes + config.NO_DRIVE_SAFETY_BUFFER_MINUTES
+        window_penalty = float(window.penalty_amount or 0.0)
+        is_soft_window = 0 < window_penalty <= config.NO_DRIVE_SOFT_PENALTY_THRESHOLD
+        if is_soft_window:
+            # 软窗：用原始 estimate（不加裕量）检测重叠，重叠则按单日固定罚金计软价。
+            real_overlap = _hits_no_drive_window(ctx.current_minutes, finish_minutes, window)
+            if real_overlap > 0:
+                breakdown["no_drive_window_soft_penalty"] = -window_penalty
+                note_parts.append("no_drive_soft_window")
+            continue
+        buffered_finish = overestimated_finish + config.NO_DRIVE_SAFETY_BUFFER_MINUTES
         overlap = _hits_no_drive_window(ctx.current_minutes, buffered_finish, window)
         if overlap > 0:
             # 高价值熟货：禁行代价 < 错过熟货代价时，降级为软惩罚
             if preferred_rule is not None and preferred_rule.penalty_amount >= 5000:
                 real_overlap = _hits_no_drive_window(ctx.current_minutes, finish_minutes, window)
-                soft_cost = float(window.penalty_amount or 500.0) * max(1, real_overlap / 60.0)
+                soft_cost = window_penalty if window_penalty > 0 else 500.0
+                soft_cost *= max(1, real_overlap / 60.0)
                 breakdown["no_drive_window_soft_penalty"] = -soft_cost
                 note_parts.append("no_drive_preferred_override")
             else:
