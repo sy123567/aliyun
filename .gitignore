@@ -58,3 +58,6 @@ Thumbs.db
 
 # Large data files (tracked by Git LFS)
 # demo/server/data/cargo_dataset.jsonl
+# Python cache
+__pycache__/
+*.pyc

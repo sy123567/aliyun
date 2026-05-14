@@ -1,31 +1,31 @@
 {
   "month": "2026-03",
-  "simulate_time_seconds": 161.56,
+  "simulate_time_seconds": 676.53,
   "simulation_duration_days": 31,
-  "completed_steps": 1809,
+  "completed_steps": 1369,
   "remaining_cargo_count": 0,
   "driver_completed_steps": {
-    "D001": 114,
-    "D002": 101,
-    "D003": 906,
-    "D004": 44,
-    "D005": 101,
-    "D006": 121,
-    "D007": 143,
-    "D008": 80,
+    "D001": 131,
+    "D002": 81,
+    "D003": 215,
+    "D004": 202,
+    "D005": 182,
+    "D006": 93,
+    "D007": 167,
+    "D008": 72,
     "D009": 138,
-    "D010": 61
+    "D010": 88
   },
   "driver_result_files": {
-    "D001": "D:\\vs code\\aliyun\\demo\\results\\actions_202603_D001_20260513_184940.jsonl",
-    "D002": "D:\\vs code\\aliyun\\demo\\results\\actions_202603_D002_20260513_184940.jsonl",
-    "D003": "D:\\vs code\\aliyun\\demo\\results\\actions_202603_D003_20260513_184940.jsonl",
-    "D004": "D:\\vs code\\aliyun\\demo\\results\\actions_202603_D004_20260513_184940.jsonl",
-    "D005": "D:\\vs code\\aliyun\\demo\\results\\actions_202603_D005_20260513_184940.jsonl",
-    "D006": "D:\\vs code\\aliyun\\demo\\results\\actions_202603_D006_20260513_184940.jsonl",
-    "D007": "D:\\vs code\\aliyun\\demo\\results\\actions_202603_D007_20260513_184940.jsonl",
-    "D008": "D:\\vs code\\aliyun\\demo\\results\\actions_202603_D008_20260513_184940.jsonl",
-    "D009": "D:\\vs code\\aliyun\\demo\\results\\actions_202603_D009_20260513_184940.jsonl",
-    "D010": "D:\\vs code\\aliyun\\demo\\results\\actions_202603_D010_20260513_184940.jsonl"
+    "D001": "/home/ubuntu/aliyun/demo/results/actions_202603_D001_20260514_093623.jsonl",
+    "D002": "/home/ubuntu/aliyun/demo/results/actions_202603_D002_20260514_093623.jsonl",
+    "D003": "/home/ubuntu/aliyun/demo/results/actions_202603_D003_20260514_093623.jsonl",
+    "D004": "/home/ubuntu/aliyun/demo/results/actions_202603_D004_20260514_093623.jsonl",
+    "D005": "/home/ubuntu/aliyun/demo/results/actions_202603_D005_20260514_093623.jsonl",
+    "D006": "/home/ubuntu/aliyun/demo/results/actions_202603_D006_20260514_093623.jsonl",
+    "D007": "/home/ubuntu/aliyun/demo/results/actions_202603_D007_20260514_093623.jsonl",
+    "D008": "/home/ubuntu/aliyun/demo/results/actions_202603_D008_20260514_093623.jsonl",
+    "D009": "/home/ubuntu/aliyun/demo/results/actions_202603_D009_20260514_093623.jsonl",
+    "D010": "/home/ubuntu/aliyun/demo/results/actions_202603_D010_20260514_093623.jsonl"
   }
 }

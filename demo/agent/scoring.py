@@ -560,18 +560,14 @@ def score_take_order(
                 )
             pref_penalty += float(limit.penalty_amount or 100.0)
         elif limit.kind == "monthly_deadhead":
-            projected = memory.total_deadhead_km + distance_pickup_km - limit.max_km
-            if projected > 0:
-                # 累计已超上限直接拒绝
-                if memory.total_deadhead_km >= limit.max_km:
-                    return ScoredAction(
-                        action="take_order",
-                        params={"cargo_id": cargo_id},
-                        score=-HARD_CONSTRAINT_PENALTY,
-                        feasible=False,
-                        note="monthly_deadhead_already_exceeded",
-                    )
-                pref_penalty += float(limit.penalty_amount or 10.0) * projected
+            # 月度空驶赶路上限：按「新增超额公里数 × 单价」计软惩罚，不硬阻拦。
+            # 评测仅按累计 over_km × 单价（≈10 元/km）扣分；硬阻拦会让司机在累计稍超即停摆。
+            # 原硬阻拦在 D003（限 100km）触发后导致全月 899 次 wait、3 单 → 改为软罚。
+            already_over = max(0.0, memory.total_deadhead_km - limit.max_km)
+            new_total = memory.total_deadhead_km + distance_pickup_km
+            new_over_km = max(0.0, max(0.0, new_total - limit.max_km) - already_over)
+            if new_over_km > 0:
+                pref_penalty += float(limit.penalty_amount or 10.0) * new_over_km
     if pref_penalty > 0:
         breakdown["distance_limit_penalty"] = -pref_penalty
 
@@ -646,19 +642,17 @@ def score_take_order(
         if finish_minutes + minutes_to_home_from_end <= end_day * 1440 + home_by_min:
             can_reach_home_by_deadline = True
         end_in_home = _is_in_circle(end_lat, end_lng, rules.home_rule)
-        # 若接单后当天无法在截止前回到家附近，拒绝该订单
+        # 若接单后当天无法在截止前回到家附近，一律拒绝该订单。
+        # 评测按「当天最后一个 step_end 之前位置距离家 > radius」判违规，且每天罚金高（D009 单日 900 元 / 上限 6300）。
+        # 既往 12 小时阈值过宽，会放行清晨即可预判违规的订单——这里改为严格判定。
         if not can_reach_home_by_deadline and not end_in_home:
-            # 提前半天预判：当前时刻距离 home_by_hour 还有 > 12 小时说明太早，仅施加软惩罚
-            cur_day = ctx.current_minutes // 1440
-            hours_until_deadline = (cur_day * 1440 + home_by_min - ctx.current_minutes) / 60.0
-            if hours_until_deadline <= 12:
-                return ScoredAction(
-                    action="take_order",
-                    params={"cargo_id": cargo_id},
-                    score=-HARD_CONSTRAINT_PENALTY,
-                    feasible=False,
-                    note="home_rule_unreachable",
-                )
+            return ScoredAction(
+                action="take_order",
+                params={"cargo_id": cargo_id},
+                score=-HARD_CONSTRAINT_PENALTY,
+                feasible=False,
+                note="home_rule_unreachable",
+            )
         if finish_hour >= rules.home_rule.home_by_hour and not end_in_home:
             breakdown["home_rule_penalty"] = -float(rules.home_rule.penalty_amount or 600.0)
         else:
@@ -738,17 +732,51 @@ def score_take_order(
                 breakdown["timed_event_order_penalty"] = breakdown.get("timed_event_order_penalty", 0.0) - penalty
                 note_parts.append("timed_event_pre_lock_block")
 
-    # 每日休息风险：接单后当天剩余时间是否足以满足休息要求
+    # 每日休息风险：接单后当天剩余时间是否足以满足休息要求。
+    # 评测按「当天最长连续 wait 段 < required_minutes」判一日罚（每日上限 200-300 元）；
+    # 单纯软惩罚不足以挡住高额订单收益，故引入硬阻拦：若接单前尚能完成休息、接单后不再可能 → 直接拒单。
     for rest in rules.rest_rules:
         today_rest = memory.longest_rest_today(ctx.current_minutes)
         deficit = rest.required_minutes - today_rest
         if deficit > 0:
+            cur_md = geo_utils.minute_of_day(ctx.current_minutes)
             finish_md = geo_utils.minute_of_day(finish_minutes)
-            remaining_after = 1440 - finish_md
-            if remaining_after < deficit:
-                unit = float(rest.penalty_amount or 200.0)
-                breakdown["daily_rest_risk_penalty"] = -unit * 0.8
+            crosses_day = finish_minutes // 1440 > ctx.current_minutes // 1440
+            remaining_after = 1440 - finish_md if not crosses_day else 0
+            available_now = 1440 - cur_md
+            unit = float(rest.penalty_amount or 200.0)
+            if available_now >= deficit and (crosses_day or remaining_after < deficit):
+                # 接单前还可以完成 deficit，接单后不再可能 → 硬阻拦
+                return ScoredAction(
+                    action="take_order",
+                    params={"cargo_id": cargo_id},
+                    score=-HARD_CONSTRAINT_PENALTY,
+                    feasible=False,
+                    note="daily_rest_blocked",
+                )
+            if remaining_after < deficit * 1.3:
+                # 余量紧张：强软惩罚（覆盖单日上限）
+                breakdown["daily_rest_risk_penalty"] = -unit * 2.5
+                note_parts.append("rest_risk_tight")
+            elif remaining_after < deficit * 2.0:
+                breakdown["daily_rest_risk_penalty"] = -unit * 1.0
                 note_parts.append("rest_risk")
+
+    # 月度休息日：评测按 step_end 所在日判「成交接单活跃日」，所以此处需预估该订单 step_end 所落日。
+    # 当接单后预计成为活跃的日集合超出 max_active 阈值 → 硬阻拦（D006/D007/D008 必须有 N 整天不接单）。
+    if rules.monthly_day_off is not None:
+        finish_day_str = geo_utils.date_str(max(0, finish_minutes - 1))
+        projected_active = set(memory.daily_active)
+        projected_active.add(finish_day_str)
+        max_active = config.AGENT_HORIZON_DAYS - rules.monthly_day_off.required_days
+        if len(projected_active) > max_active:
+            return ScoredAction(
+                action="take_order",
+                params={"cargo_id": cargo_id},
+                score=-HARD_CONSTRAINT_PENALTY,
+                feasible=False,
+                note="monthly_day_off_required_today",
+            )
 
     # 未来位置价值：卸货点的热点收益 + 到达时段的在线模式信号
     arrival_hour = geo_utils.hour_of_day(finish_minutes)
@@ -784,7 +812,25 @@ def build_wait_durations(rules: ParsedRules, ctx: DecisionContext, memory: Drive
         durations.add(max(deficit, 30))
     if rules.monthly_day_off is not None:
         cur_md = geo_utils.minute_of_day(ctx.current_minutes)
-        if cur_md <= 90:
+        date_today = geo_utils.date_str(ctx.current_minutes)
+        today_already_active = date_today in memory.daily_active
+        active_so_far = memory.days_active_count()
+        max_active = config.AGENT_HORIZON_DAYS - rules.monthly_day_off.required_days
+        # 必须休息日：今日剩余分钟都加为超长 wait 候选，让 agent 一次性吃满整天。
+        # 该检查依据「现有活跃日数 + 今日可能变为活跃」；仅在必须未活跃日时赋予超长 wait
+        days_off_required = rules.monthly_day_off.required_days
+        days_remaining = max(0, config.AGENT_HORIZON_DAYS - 1 - ctx.current_minutes // 1440)
+        days_off_so_far = max(0, ctx.current_minutes // 1440 - active_so_far)
+        needs_off_today = (
+            not today_already_active
+            and (
+                active_so_far + 1 > max_active
+                or days_off_so_far + days_remaining < days_off_required
+            )
+        )
+        if needs_off_today:
+            long_durations.add(max(1, 1440 - cur_md))
+        elif cur_md <= 90:
             durations.add(max(1, 24 * 60 - cur_md))
     # 回家窗口或夜间禁行：休息至次日 6:00 / 8:00
     for window in rules.no_drive_windows:
@@ -996,15 +1042,34 @@ def score_wait(
         breakdown["stagnation_penalty"] = -stagnation_penalty
         note_parts.append(f"stagnation={memory.consecutive_wait_count}")
 
-    # 月度休息日：在月末若仍未达到则补休一天
-    if rules.monthly_day_off is not None and duration_minutes >= 12 * 60:
+    # 月度休息日：必须休息日时给予完整罚金等额奖励，确保 wait 候选战胜其他动作。
+    # 由于评测按 step_end 日判「成交接单」，需活跃日数预估到今日是否必须作为休息日
+    if rules.monthly_day_off is not None:
+        date_today = geo_utils.date_str(ctx.current_minutes)
+        today_already_active = date_today in memory.daily_active
+        active_so_far = memory.days_active_count()
+        max_active = config.AGENT_HORIZON_DAYS - rules.monthly_day_off.required_days
         days_off_required = rules.monthly_day_off.required_days
-        days_active = memory.days_active_count()
-        sim_day = (ctx.current_minutes // (24 * 60)) + 1
-        days_remaining = max(0, 31 - sim_day)
-        days_off_so_far = max(0, sim_day - 1 - days_active)
-        if days_off_so_far + days_remaining < days_off_required:
-            breakdown["monthly_day_off_gain"] = float(rules.monthly_day_off.penalty_amount or 3000.0) / 5.0
+        sim_day = (ctx.current_minutes // (24 * 60))
+        days_remaining = max(0, config.AGENT_HORIZON_DAYS - 1 - sim_day)
+        days_off_so_far = max(0, sim_day - active_so_far)
+        needs_off_today = (
+            not today_already_active
+            and (
+                active_so_far + 1 > max_active
+                or days_off_so_far + days_remaining < days_off_required
+            )
+        )
+        if needs_off_today:
+            cur_md_off = geo_utils.minute_of_day(ctx.current_minutes)
+            remaining_today = max(60, 1440 - cur_md_off)
+            base = float(rules.monthly_day_off.penalty_amount or 3000.0)
+            ratio = min(1.0, duration_minutes / float(remaining_today))
+            breakdown["monthly_day_off_gain"] = base * ratio
+            note_parts.append("day_off_required")
+        elif days_off_so_far + days_remaining < days_off_required and duration_minutes >= 12 * 60:
+            # 预防性增益：后续可用日数刚好够时也给一些 wait 奖励
+            breakdown["monthly_day_off_gain"] = float(rules.monthly_day_off.penalty_amount or 3000.0) * 0.5
             note_parts.append("day_off_relief")
 
     _apply_adaptive_weights(breakdown, ctx.weights)
@@ -1182,13 +1247,82 @@ def score_reposition(
             breakdown["must_visit_gain"] = float(must.penalty_amount or 3000.0) / max(1, must.required_days)
             note_parts.append("must_visit")
 
-    # 月度空驶累计限制
+    # 月度空驶累计限制：超过预算的普通空驶直接拒绝（D003 月预算 100km 单一约束极紧）。
+    # 仅允许「优先目标」（家、必到、定时事件接人/老家点、熟货）破例，并按强罚记分。
+    target_is_priority_deadhead = False
+    if rules.home_rule is not None and _is_in_circle(target_lat, target_lng, rules.home_rule):
+        target_is_priority_deadhead = True
+    if not target_is_priority_deadhead:
+        for must in rules.must_visit:
+            if geo_utils.haversine_km(target_lat, target_lng, must.lat, must.lng) <= must.radius_km:
+                target_is_priority_deadhead = True
+                break
+    if not target_is_priority_deadhead:
+        for ev in rules.timed_stay_events:
+            if (
+                geo_utils.haversine_km(target_lat, target_lng, ev.pickup_lat, ev.pickup_lng) <= ev.radius_km
+                or geo_utils.haversine_km(target_lat, target_lng, ev.home_lat, ev.home_lng) <= ev.radius_km
+            ):
+                target_is_priority_deadhead = True
+                break
+    if not target_is_priority_deadhead:
+        for pref in rules.preferred_cargo:
+            pref_target = preferred_cargo_target(pref)
+            if pref_target is None or not preferred_cargo_preposition_ready(pref, ctx.current_minutes):
+                continue
+            if geo_utils.haversine_km(target_lat, target_lng, pref_target[0], pref_target[1]) <= 3.0:
+                target_is_priority_deadhead = True
+                break
     for limit in rules.distance_limits:
         if limit.kind == "monthly_deadhead":
-            if memory.total_deadhead_km + distance_km > limit.max_km:
+            projected = memory.total_deadhead_km + distance_km
+            if projected > limit.max_km:
+                if not target_is_priority_deadhead:
+                    return ScoredAction(
+                        action="reposition",
+                        params={"latitude": float(target_lat), "longitude": float(target_lng)},
+                        score=-HARD_CONSTRAINT_PENALTY,
+                        feasible=False,
+                        note="monthly_deadhead_over_limit",
+                    )
+                # 优先目标：强软惩罚，由偏好增益自身决定是否抵消
                 breakdown["monthly_deadhead_penalty"] = -float(limit.penalty_amount or 10.0) * (
-                    memory.total_deadhead_km + distance_km - limit.max_km
+                    projected - limit.max_km
+                ) * 3.0
+
+    # 空驶层面的每日休息约束：避免空驶占用当日唯一可休息时段
+    for rest in rules.rest_rules:
+        today_rest = memory.longest_rest_today(ctx.current_minutes)
+        deficit = rest.required_minutes - today_rest
+        if deficit > 0:
+            cur_md = geo_utils.minute_of_day(ctx.current_minutes)
+            finish_md_repo = geo_utils.minute_of_day(end_minutes)
+            crosses_day_repo = end_minutes // 1440 > ctx.current_minutes // 1440
+            remaining_after_repo = 1440 - finish_md_repo if not crosses_day_repo else 0
+            available_now = 1440 - cur_md
+            if available_now >= deficit and (crosses_day_repo or remaining_after_repo < deficit):
+                return ScoredAction(
+                    action="reposition",
+                    params={"latitude": float(target_lat), "longitude": float(target_lng)},
+                    score=-HARD_CONSTRAINT_PENALTY,
+                    feasible=False,
+                    note="daily_rest_blocked_reposition",
                 )
+
+    # 月度休息日：必须休息日时禁止空驶。按空驶完成日预估。
+    if rules.monthly_day_off is not None:
+        finish_day_str_repo = geo_utils.date_str(max(0, end_minutes - 1))
+        projected_active_repo = set(memory.daily_active)
+        projected_active_repo.add(finish_day_str_repo)
+        max_active_repo = config.AGENT_HORIZON_DAYS - rules.monthly_day_off.required_days
+        if len(projected_active_repo) > max_active_repo:
+            return ScoredAction(
+                action="reposition",
+                params={"latitude": float(target_lat), "longitude": float(target_lng)},
+                score=-HARD_CONSTRAINT_PENALTY,
+                feasible=False,
+                note="monthly_day_off_required_today",
+            )
 
     _apply_adaptive_weights(breakdown, ctx.weights)
     score = sum(breakdown.values())
