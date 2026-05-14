@@ -1,31 +1,31 @@
 {
   "month": "2026-03",
-  "simulate_time_seconds": 676.53,
+  "simulate_time_seconds": 148.73,
   "simulation_duration_days": 31,
-  "completed_steps": 1369,
+  "completed_steps": 1222,
   "remaining_cargo_count": 0,
   "driver_completed_steps": {
-    "D001": 131,
-    "D002": 81,
-    "D003": 215,
-    "D004": 202,
-    "D005": 182,
-    "D006": 93,
-    "D007": 167,
-    "D008": 72,
-    "D009": 138,
-    "D010": 88
+    "D001": 116,
+    "D002": 49,
+    "D003": 586,
+    "D004": 55,
+    "D005": 62,
+    "D006": 62,
+    "D007": 50,
+    "D008": 54,
+    "D009": 133,
+    "D010": 55
   },
   "driver_result_files": {
-    "D001": "/home/ubuntu/aliyun/demo/results/actions_202603_D001_20260514_093623.jsonl",
-    "D002": "/home/ubuntu/aliyun/demo/results/actions_202603_D002_20260514_093623.jsonl",
-    "D003": "/home/ubuntu/aliyun/demo/results/actions_202603_D003_20260514_093623.jsonl",
-    "D004": "/home/ubuntu/aliyun/demo/results/actions_202603_D004_20260514_093623.jsonl",
-    "D005": "/home/ubuntu/aliyun/demo/results/actions_202603_D005_20260514_093623.jsonl",
-    "D006": "/home/ubuntu/aliyun/demo/results/actions_202603_D006_20260514_093623.jsonl",
-    "D007": "/home/ubuntu/aliyun/demo/results/actions_202603_D007_20260514_093623.jsonl",
-    "D008": "/home/ubuntu/aliyun/demo/results/actions_202603_D008_20260514_093623.jsonl",
-    "D009": "/home/ubuntu/aliyun/demo/results/actions_202603_D009_20260514_093623.jsonl",
-    "D010": "/home/ubuntu/aliyun/demo/results/actions_202603_D010_20260514_093623.jsonl"
+    "D001": "demo/results/history/20260513_124222/actions_202603_D001_20260513_092357.jsonl",
+    "D002": "demo/results/history/20260513_124222/actions_202603_D002_20260513_092357.jsonl",
+    "D003": "demo/results/history/20260513_124222/actions_202603_D003_20260513_092357.jsonl",
+    "D004": "demo/results/history/20260513_124222/actions_202603_D004_20260513_092357.jsonl",
+    "D005": "demo/results/history/20260513_124222/actions_202603_D005_20260513_092357.jsonl",
+    "D006": "demo/results/history/20260513_124222/actions_202603_D006_20260513_092357.jsonl",
+    "D007": "demo/results/history/20260513_124222/actions_202603_D007_20260513_092357.jsonl",
+    "D008": "demo/results/history/20260513_124222/actions_202603_D008_20260513_092357.jsonl",
+    "D009": "demo/results/history/20260513_124222/actions_202603_D009_20260513_092357.jsonl",
+    "D010": "demo/results/history/20260513_124222/actions_202603_D010_20260513_092357.jsonl"
   }
 }
