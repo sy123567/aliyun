@@ -567,7 +567,7 @@ def score_take_order(
             new_total = memory.total_deadhead_km + distance_pickup_km
             new_over_km = max(0.0, max(0.0, new_total - limit.max_km) - already_over)
             if new_over_km > 0:
-               pen_per_km_t = float(limit.penalty_amount or 10.0)
+                pen_per_km_t = float(limit.penalty_amount or 10.0)
                 cap_to = limit.penalty_cap
                 if cap_to is not None and pen_per_km_t > 0:
                     paid_so_far_to = min(already_over * pen_per_km_t, cap_to)
@@ -617,10 +617,9 @@ def score_take_order(
         window_penalty = float(window.penalty_amount or 0.0)
         is_soft_window = 0 < window_penalty <= config.NO_DRIVE_SOFT_PENALTY_THRESHOLD
         if is_soft_window:
-            # 软窗：用原始 estimate（不加裕量）检测重叠，重叠则按单日固定罚金计软价。
             real_overlap = _hits_no_drive_window(ctx.current_minutes, finish_minutes, window)
             if real_overlap > 0:
-                breakdown["no_drive_window_soft_penalty"] = -window_penalty
+                breakdown["no_drive_window_soft_penalty"] = breakdown.get("no_drive_window_soft_penalty", 0.0) - window_penalty
                 note_parts.append("no_drive_soft_window")
             continue
         buffered_finish = overestimated_finish + config.NO_DRIVE_SAFETY_BUFFER_MINUTES
@@ -820,11 +819,30 @@ def score_take_order(
             days_left_after_today_to = max(0, config.AGENT_HORIZON_DAYS - 1 - sim_day_to)
             if deficit_after > 0:
                 urgency = deficit_after / max(1, days_left_after_today_to + 1)
-                if urgency >= 0.2:
+                if urgency >= 0.15:
                     base_pen = float(rules.monthly_day_off.penalty_amount or 3000.0)
-                    # 软惩罚上限 = 35% 名义罚金，避免压死高单价订单
-                    breakdown["monthly_day_off_urgency_penalty"] = -base_pen * min(1.0, urgency) * 0.35
+                    coeff = min(1.0, urgency) * 0.5
+                    if urgency >= 0.5:
+                        coeff = min(1.5, urgency)
+                    breakdown["monthly_day_off_urgency_penalty"] = -base_pen * coeff
                     note_parts.append(f"day_off_urgency(urg={urgency:.2f})")
+        # 跨天订单额外检查：若 step_end 落在新一天，也会激活该天
+        elif not finishes_today and not today_already_active_to:
+            finish_day_active = finish_day_str in memory.daily_active
+            if not finish_day_active:
+                R = rules.monthly_day_off.required_days
+                sim_day_to = ctx.current_minutes // 1440
+                active_so_far_to = len(memory.daily_active)
+                projected_active_count = active_so_far_to + 2
+                max_active_days = config.AGENT_HORIZON_DAYS - R
+                if projected_active_count > max_active_days:
+                    return ScoredAction(
+                        action="take_order",
+                        params={"cargo_id": cargo_id},
+                        score=-HARD_CONSTRAINT_PENALTY,
+                        feasible=False,
+                        note="monthly_day_off_cross_day_block",
+                    )
                     
     # 未来位置价值：卸货点的热点收益 + 到达时段的在线模式信号
     arrival_hour = geo_utils.hour_of_day(finish_minutes)
@@ -1119,24 +1137,28 @@ def score_wait(
             # 预防性增益：后续可用日数刚好够时也给一些 wait 奖励
             breakdown["monthly_day_off_gain"] = float(rules.monthly_day_off.penalty_amount or 3000.0) * 0.5
             note_parts.append("day_off_relief")
-     elif not today_already_active:
-            # B.1 pacing soft incentive：在「还没硬卡」之前，依据 urgency 预先鼓励 wait。
-            # urgency = 剩余需要的休息日 / (剩余可用日 + 1)，避免月末挤压硬阻拦。
-            # 阈值 0.2 / 系数 0.5：阈值过高（0.4）会导致月初/月中绝大多数日不触发——
-            # 因为 D002 R=4、days_remaining=15 时 urgency=4/16=0.25 < 0.4。
+        elif not today_already_active:
             past_off_days = max(0, sim_day - active_so_far)
             deficit_after_today_if_active = days_off_required - past_off_days
             if deficit_after_today_if_active > 0 and days_remaining >= 0:
                 urgency = deficit_after_today_if_active / max(1, days_remaining + 1)
-                if urgency >= 0.2 and duration_minutes >= 60:
+                if urgency >= 0.15 and duration_minutes >= 60:
                     cur_md_off = geo_utils.minute_of_day(ctx.current_minutes)
                     remaining_today = max(60, 1440 - cur_md_off)
                     base = float(rules.monthly_day_off.penalty_amount or 3000.0)
                     ratio = min(1.0, duration_minutes / float(remaining_today))
-                    pacing_gain = base * min(1.0, urgency) * ratio * 0.5
+                    coeff = min(1.0, urgency) * 0.6
+                    if urgency >= 0.4:
+                        coeff = min(1.5, urgency)
+                    pacing_gain = base * coeff * ratio
                     if pacing_gain > 0:
                         breakdown["monthly_day_off_pacing_gain"] = pacing_gain
                         note_parts.append(f"day_off_pacing(urg={urgency:.2f})")
+                # 当天还没活跃且当日是可能的休息日候选，早期就开始小麟奖励
+                elif cur_md <= 6 * 60 and deficit_after_today_if_active >= 1:
+                    base = float(rules.monthly_day_off.penalty_amount or 3000.0)
+                    breakdown["monthly_day_off_pacing_gain"] = base * 0.15
+                    note_parts.append("day_off_early_pacing")
     _apply_adaptive_weights(breakdown, ctx.weights)
     score = sum(breakdown.values()) + 1.0  # 兜底：始终略大于零
     return ScoredAction(
@@ -1255,12 +1277,12 @@ def score_reposition(
             home_by_min = rules.home_rule.home_by_hour * 60
             cur_md = geo_utils.minute_of_day(ctx.current_minutes)
             unit = float(rules.home_rule.penalty_amount or 600.0)
+            # 行程本身的耗时：远距离回家时，即便当前时刻"看似还早"，
+            # 也需要立即出发才能在截止前抵达。slack = 距截止还剩多少分钟可挥霍。
+            slack_minutes = home_by_min - arrival_min_of_day
             # 已过 home_by_hour（已经违规）：尽快回家止损，最高增益
             if cur_md >= home_by_min:
                 breakdown["home_rule_gain"] = unit * config.HOME_RULE_TARGET_GAIN_MULTIPLIER * 1.5
-                  # 行程本身的耗时：远距离回家时，即便当前时刻"看似还早"，
-            # 也需要立即出发才能在截止前抵达。slack = 距截止还剩多少分钟可挥霍。
-            slack_minutes = home_by_min - arrival_min_of_day
                 note_parts.append("home_target_urgent")
             # 在 home_by_hour 之前到家且距截止 ≤4h：给予完整违规罚金等额奖励
             elif arrival_min_of_day < home_by_min and cur_md >= home_by_min - 4 * 60:
@@ -1269,7 +1291,7 @@ def score_reposition(
             elif cur_md >= home_by_min - 2 * 60:
                 breakdown["home_rule_gain"] = unit * config.HOME_RULE_TARGET_GAIN_MULTIPLIER / 2.0
                 note_parts.append("home_target")
-         # 关键修复（B.3）：行程耗时已逼近截止——必须立刻出发才能赶上。
+            # 关键修复（B.3）：行程耗时已逼近截止——必须立刻出发才能赶上。
             # 旧逻辑仅依赖 cur_md ≥ home_by_min - 4h；若当下 cur_md 较早但回家路途≥3.5h，
             # 等到原触发窗口才反应已迟。改为：到家与截止 slack ≤ 60 分钟时立即给予完整奖励。
             elif arrival_min_of_day < home_by_min and slack_minutes <= 60:
@@ -1372,7 +1394,7 @@ def score_reposition(
                         feasible=False,
                         note="monthly_deadhead_over_limit",
                     )
-               if cap_reached:
+                if cap_reached:
                     # cap 已耗尽：仅施加名义软成本（路上时间成本由 expected_market_gain 自然权衡）
                     breakdown["monthly_deadhead_overcap_penalty"] = -50.0
                     note_parts.append("deadhead_overcap_soft")
