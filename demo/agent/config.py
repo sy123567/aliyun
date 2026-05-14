@@ -146,7 +146,7 @@ CARGO_SUCCESS_RATE_FLOOR = 0.4
 CARGO_FAILURE_ATTEMPT_COST_YUAN = 80.0
 """单次 take_order 失败的固定隐性成本（10 分钟扫描 + 1 分钟尝试 + 重试机会损失）。"""
 
-STAGNATION_WAIT_THRESHOLD = 2
+STAGNATION_WAIT_THRESHOLD = 3
 """连续 wait 次数 > 该阈值后开始增长惩罚，迫使智能体尝试 reposition。"""
 
 STAGNATION_WAIT_PENALTY_PER_STEP = 120.0
@@ -183,8 +183,12 @@ PREFERRED_CARGO_MAX_WAIT_MINUTES = 8 * 60
 
 TIMED_EVENT_APPROACH_WINDOW_MINUTES = 2 * 60
 
-TIMED_EVENT_PRE_LOCK_WINDOW_MINUTES = 24 * 60
-"""事件开始前的提前对位窗口：在此窗内若接单后会被锁在远处，则视同违规并施加重罚。"""
+TIMED_EVENT_PRE_LOCK_WINDOW_MINUTES = 48 * 60
+"""事件开始前的提前对位窗口：在此窗内若接单后会被锁在远处，则视同违规并施加重罚。
+扩大到 48h 以确保 D010 等有多日家事约定的司机能提前对位。"""
+
+TIMED_EVENT_EARLY_APPROACH_WINDOW_MINUTES = 72 * 60
+"""事件开始前的早期趋近窗口：在此窗内给予软激励让司机向接人点靠拢。"""
 
 TIMED_EVENT_PRE_LOCK_DISTANCE_KM = 80.0
 """提前对位窗内，订单完工点距离接人点超过此值即施加重罚。"""
@@ -212,7 +216,7 @@ HAUL_TIME_OVERESTIMATE_RATIO = 1.0
 当前保持 1.0（不放大），仅靠 SAFETY_BUFFER + 软偏好阈值就足以让 D004 的中午软窗 + 整体罚分趋于最优。
 留下常量是为后续可能场景（如长距离干线）按需再启用。"""
 
-NO_DRIVE_SOFT_PENALTY_THRESHOLD = 150.0
+NO_DRIVE_SOFT_PENALTY_THRESHOLD = 120.0
 """禁行窗「软 / 严」划分阈值：单日罚金 ≤ 该值的 no_drive_window 走软偏好逻辑（仅接受软罚、不启用双重裕量、不硬拒）。
 D004 「中午 12–13 不接」单日罚金 ¥100（上限 ¥3,000）是典型软偏好：硬拒该窗会让 agent 错失 30×单价¥1,000+ 的订单。
-反之 D003 「凌晨 2–5 不接」¥200/天、D007 夜禁 ¥500/天是严偏好，应硬拒。阈值 150 能区分 D004(100) 与 D003(200)。"""
+反之 D003 「凌晨 2–5 不接」¥200/天、D005/D007 夜禁均 ¥200+/天是严偏好，应硬拒。阈值 120 能区分 D004(100) 与 D003/D005(200)。"""
