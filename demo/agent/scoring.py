@@ -1081,12 +1081,16 @@ def score_wait(
             rest_gain += unit * (covered / max(1, deficit))
             # P2: 长时间 wait 完全覆盖 deficit 时给予额外奖励，避免多次短wait代替一次长wait
             if duration_minutes >= deficit:
-                rest_gain += unit * 0.3
+                rest_gain += unit * 0.5
+            # R7: 夜间(22:00-06:00)休息增益翻倍，鼓励夜间集中休息
+            hour = geo_utils.hour_of_day(ctx.current_minutes)
+            if hour >= 22 or hour < 6:
+                rest_gain *= 2.0
             # 当天即将结束但仍未满足休息要求时，给予额外的紧急增益
             remaining_today = 1440 - cur_md
             if remaining_today < deficit * 2 and duration_minutes >= deficit:
-                urgency = min(2.0, deficit / max(1, remaining_today - deficit))
-                rest_gain += unit * (0.5 + urgency * 0.5)
+                urgency = min(3.0, deficit / max(1, remaining_today - deficit))
+                rest_gain += unit * (1.0 + urgency * 0.8)
     if rest_gain > 0:
         breakdown["rest_preference_gain"] = rest_gain
         note_parts.append("rest_gain")
