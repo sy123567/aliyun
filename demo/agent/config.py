@@ -197,6 +197,25 @@ TIMED_EVENT_FIXED_GAIN_MULTIPLIER = 1.2
 
 TIMED_EVENT_STAY_CHUNK_MINUTES = 12 * 60
 TIMED_EVENT_LONG_STAY_MAX_MINUTES = 4 * 24 * 60
+
+TIMED_EVENT_HOME_MANDATORY_WINDOW_MINUTES = 24 * 60
+"""事件开始前 N 分钟内，若司机不在家附近，硬阻拦所有 take_order，强制回家。"""
+
+TIMED_EVENT_PRECOMPLETION_WINDOW_MINUTES = 48 * 60
+"""事件开始前 N 分钟内，只允许接在事件开始前能完工的订单。"""
+
+TIMED_EVENT_STAY_GAIN_MULTIPLIER = 5.0
+"""stay 阶段 wait 增益倍数：确保司机留在家中不外出。（R5: 3.0→5.0）"""
+
+TIMED_EVENT_SOFT_LIMIT_WINDOW_MINUTES = 48 * 60
+"""事件开始前 N 分钟内，只允许接卸货点在家附近的订单（软限制窗口）。"""
+
+TIMED_EVENT_SOFT_LIMIT_DISTANCE_KM = 200.0
+"""软限制窗口内，订单卸货点距家超过此距离则施加重罚。"""
+
+TIMED_EVENT_POST_STAY_BUFFER_MINUTES = 2 * 60
+"""事件结束后 N 分钟内仍给予stay增益（避免事件刚结束就跑太远）。"""
+
 TIMED_EVENT_APPROACH_GAIN_MULTIPLIER = 1.6
 TIMED_EVENT_START_BUFFER_MINUTES = 30
 TIMED_EVENT_PICKUP_OVERSTAY_MULTIPLIER = 2.0
@@ -204,6 +223,12 @@ HOME_RULE_PREP_WINDOW_MINUTES = 6 * 60
 HOME_RULE_TARGET_GAIN_MULTIPLIER = 2.0
 HOME_RULE_REACHABILITY_MULTIPLIER = 2.0
 HOME_RULE_AWAY_WAIT_PENALTY_MULTIPLIER = 2.0
+
+HOME_RULE_AFTERNOON_BLOCK_HOUR = 14
+"""下午 N 点后且距家>200km 时开始阻拦新订单（D009 回家规则优化）。"""
+
+HOME_RULE_AFTERNOON_BLOCK_DISTANCE_KM = 200.0
+"""下午阻拦距离阈值：超过此距离开始阻拦。"""
 NO_DRIVE_ACTIVE_PENALTY_MULTIPLIER = 2.0
 NO_DRIVE_SAFETY_BUFFER_MINUTES = 45
 """安全裕量：订单/空驶预计完成时间 + 该值若触碰禁行窗则拒绝。保持 master 45 min 默认值。
@@ -220,3 +245,24 @@ NO_DRIVE_SOFT_PENALTY_THRESHOLD = 120.0
 """禁行窗「软 / 严」划分阈值：单日罚金 ≤ 该值的 no_drive_window 走软偏好逻辑（仅接受软罚、不启用双重裕量、不硬拒）。
 D004 「中午 12–13 不接」单日罚金 ¥100（上限 ¥3,000）是典型软偏好：硬拒该窗会让 agent 错失 30×单价¥1,000+ 的订单。
 反之 D003 「凌晨 2–5 不接」¥200/天、D005/D007 夜禁均 ¥200+/天是严偏好，应硬拒。阈值 120 能区分 D004(100) 与 D003/D005(200)。"""
+
+
+# ---------------- 月度休息日优化参数（第四/五/六轮） ----------------
+
+MONTHLY_DAY_OFF_SPACING_COEFF = 0.4
+"""月度休息日spacing惩罚系数（R4=0.3, R5=0.4温和增加）。"""
+
+MONTHLY_DAY_OFF_MONTH_END_DAYS = 5
+"""月末集中休息触发：剩余天数 ≤ 该值且deficit=1时，给予更高wait增益。"""
+
+MONTHLY_DAY_OFF_URGENCY_THRESHOLD_EARLY = 0.08
+"""R6-P1: 前半月urgency软罚分触发阈值（原0.1→0.08，更早开始抑制）。"""
+
+MONTHLY_DAY_OFF_URGENCY_THRESHOLD_LATE = 0.06
+"""R6-P1: 后半月urgency软罚分触发阈值（day≥20后更敏感）。"""
+
+MONTHLY_DAY_OFF_LATE_MONTH_DAY = 20
+"""R6-P1: 后半月起始日（0-indexed），此后使用更低的urgency阈值。"""
+
+MONTHLY_DAY_OFF_FORCE_REST_DAY = 25
+"""R6-P1: 强制休息检查日（0-indexed），day≥此值且deficit≥1时给极高wait增益。"""
