@@ -100,6 +100,9 @@ class DriverMemory:
 
     timed_event_flags: set[str] = field(default_factory=set)
 
+    # R7: LLM辅助决策计数器
+    llm_critical_count: int = 0
+
     def update_token(self, delta: int) -> None:
         if delta > 0:
             self.token_used += int(delta)

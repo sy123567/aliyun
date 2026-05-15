@@ -266,3 +266,27 @@ MONTHLY_DAY_OFF_LATE_MONTH_DAY = 20
 
 MONTHLY_DAY_OFF_FORCE_REST_DAY = 25
 """R6-P1: 强制休息检查日（0-indexed），day≥此值且deficit≥1时给极高wait增益。"""
+
+
+# ---------------- R7: LLM辅助决策参数 ----------------
+
+LLM_DAILY_REPARSE_ENABLED = True
+"""R7-T5: 每日强制重新解析偏好，捕获仿真器新暴露的事件偏好。"""
+
+LLM_CRITICAL_DECISION_ENABLED = True
+"""R7: 在高风险决策点使用LLM辅助决策。"""
+
+LLM_EVENT_HORIZON_MINUTES = 48 * 60
+"""R7-T1: 距事件开始≤此时间时触发LLM审核take_order。"""
+
+LLM_HOME_CRITICAL_HOURS = 4
+"""R7-T3: 距回家截止≤此小时数时触发LLM审核。"""
+
+LLM_SCORE_CLOSE_RATIO = 0.0
+"""R7-T4: 已禁用(0.0)——测试表明仲裁弊大于利(D002:-3716,D009影响)。"""
+
+LLM_REST_DEFICIT_DAY = 99
+"""R7-T2: 已禁用(99)——测试表明LLM对REST/WORK的回答不一致，D007被18次调用浪费token且净收入-1960。"""
+
+LLM_CRITICAL_DECISION_MAX_PER_DRIVER = 200
+"""R7: 每个司机最多LLM辅助决策调用次数（防止超预算）。"""

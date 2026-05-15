@@ -130,6 +130,15 @@ class ModelDecisionService:
             return action_validator.safe_wait(_MIN_WAIT_FALLBACK_MINUTES, note="no_feasible_candidate")
 
         best = max(feasible, key=lambda c: c.score)
+
+        # R7: LLM辅助关键决策
+        if config.LLM_CRITICAL_DECISION_ENABLED and memory.can_call_model(expected_tokens=2000):
+            llm_override = self._llm_critical_decision(
+                best, feasible, rules, memory, ctx, cargo_items
+            )
+            if llm_override is not None:
+                best = llm_override
+
         allowed_cargo_ids: set[str] | None = None
         if best.action == "take_order":
             allowed_cargo_ids = {
@@ -225,7 +234,21 @@ class ModelDecisionService:
     ) -> preference_parser.ParsedRules:
         preferences = status.get("preferences") or []
         signature = preference_parser.signature_of(preferences)
-        if memory.rules is not None and memory.rules_signature == signature:
+
+        # R7-T5: 仅当偏好签名变化（仿真器暴露新偏好）时才重新解析
+        force_reparse = False
+        if config.LLM_DAILY_REPARSE_ENABLED and memory.rules is not None:
+            current_day = sim_minutes // 1440
+            last_parse_day = memory.preference_state.last_parse_time_minutes // 1440
+            if current_day > last_parse_day and signature != memory.rules_signature and memory.can_call_model(expected_tokens=3000):
+                force_reparse = True
+                self._logger.info(
+                    "R7-T5 签名变化重解析偏好 driver_id=%s day=%s->%s sig=%s->%s",
+                    driver_id, last_parse_day, current_day,
+                    memory.rules_signature[:16], signature[:16],
+                )
+
+        if memory.rules is not None and memory.rules_signature == signature and not force_reparse:
             return memory.rules  # type: ignore[return-value]
 
         # 仅在 token 预算允许时交由 LLM 主解析；否则走正则安全网
@@ -480,6 +503,354 @@ class ModelDecisionService:
             scored.append((avg_yield, (lat, lng)))
         scored.sort(key=lambda x: x[0], reverse=True)
         return [coord for _, coord in scored[:_TOP_REPOSITION_TARGETS]]
+
+
+    # ---------------- R7: LLM 辅助关键决策 ----------------
+
+    def _llm_critical_decision(
+        self,
+        best: ScoredAction,
+        feasible: list[ScoredAction],
+        rules: preference_parser.ParsedRules,
+        memory: driver_memory.DriverMemory,
+        ctx: DecisionContext,
+        cargo_items: list[dict[str, Any]],
+    ) -> ScoredAction | None:
+        """在高风险决策点调用LLM辅助决策，返回覆盖选项或None保持原选择。"""
+        if not memory.can_call_model(expected_tokens=2000):
+            return None
+        llm_call_count = getattr(memory, "llm_critical_count", 0)
+        if llm_call_count >= config.LLM_CRITICAL_DECISION_MAX_PER_DRIVER:
+            return None
+
+        # T1: 事件临近审核
+        override = self._t1_event_proximity_check(best, feasible, rules, memory, ctx, cargo_items)
+        if override is not None:
+            return override
+
+        # T2: 月末休息deficit审核
+        override = self._t2_rest_deficit_check(best, feasible, rules, memory, ctx)
+        if override is not None:
+            return override
+
+        # T3: 回家时间紧迫审核
+        override = self._t3_home_urgency_check(best, feasible, rules, memory, ctx, cargo_items)
+        if override is not None:
+            return override
+
+        # T4: 评分接近仲裁
+        override = self._t4_score_arbitration(best, feasible, rules, memory, ctx, cargo_items)
+        if override is not None:
+            return override
+
+        return None
+
+    def _call_llm_for_decision(
+        self,
+        driver_id: str,
+        memory: driver_memory.DriverMemory,
+        prompt: str,
+    ) -> str:
+        """调用LLM获取决策建议，返回响应文本。"""
+        llm_caller = self._make_llm_caller(driver_id, memory)
+        payload = {
+            "messages": [
+                {"role": "system", "content": "你是货运司机决策助手。请直接给出决策结论，格式为ACCEPT或REJECT或REST或WORK，然后用一句话说明理由。不要使用思考标签。"},
+                {"role": "user", "content": prompt},
+            ],
+            "temperature": 0.1,
+            "max_tokens": 200,
+        }
+        try:
+            resp = llm_caller(payload)
+        except Exception:  # noqa: BLE001
+            return ""
+        if not isinstance(resp, dict):
+            return ""
+        choices = resp.get("choices", [])
+        if not choices:
+            return ""
+        msg = choices[0].get("message", {})
+        content = msg.get("content", "")
+        memory.llm_critical_count = getattr(memory, "llm_critical_count", 0) + 1
+        return str(content).strip()
+
+    def _t1_event_proximity_check(
+        self,
+        best: ScoredAction,
+        feasible: list[ScoredAction],
+        rules: preference_parser.ParsedRules,
+        memory: driver_memory.DriverMemory,
+        ctx: DecisionContext,
+        cargo_items: list[dict[str, Any]],
+    ) -> ScoredAction | None:
+        """T1: 距事件≤48h且best是take_order时，让LLM审核是否安全。"""
+        if best.action != "take_order":
+            return None
+        if not rules.timed_stay_events:
+            return None
+
+        for event in rules.timed_stay_events:
+            time_to_event = event.start_minutes - ctx.current_minutes
+            if not (0 < time_to_event <= config.LLM_EVENT_HORIZON_MINUTES):
+                continue
+
+            cargo_id = best.params.get("cargo_id", "")
+            cargo_info = self._find_cargo_info(cargo_items, cargo_id)
+            if not cargo_info:
+                continue
+
+            finish_min = int(cargo_info.get("cost_time_minutes", 0) or 0) + ctx.current_minutes
+            end_lat = float(cargo_info.get("end_lat", 0))
+            end_lng = float(cargo_info.get("end_lng", 0))
+            dist_to_home = geo_utils.haversine_km(end_lat, end_lng, event.home_lat, event.home_lng)
+            hours_to_event = time_to_event / 60.0
+
+            prompt = (
+                f"当前时间：仿真第{ctx.current_minutes // 1440 + 1}天 {geo_utils.hour_of_day(ctx.current_minutes)}:{ctx.current_minutes % 60:02d}\n"
+                f"司机位置：({ctx.current_lat:.2f}, {ctx.current_lng:.2f})\n"
+                f"即将到来的家事/约定事件：{hours_to_event:.1f}小时后开始，需在({event.home_lat:.2f}, {event.home_lng:.2f})附近\n"
+                f"推荐接单：cargo_id={cargo_id}，预计用时{cargo_info.get('cost_time_minutes', 0)}分钟\n"
+                f"完单后距家事地点：{dist_to_home:.0f}km\n"
+                f"事件缺席罚金：每分钟{event.absence_penalty_per_minute}元\n\n"
+                f"问题：接这个单是否安全？会不会影响按时参加事件？\n"
+                f"请回答ACCEPT（接单）或REJECT（拒绝改为等待/回家）"
+            )
+
+            response = self._call_llm_for_decision(ctx.driver_id, memory, prompt)
+            self._logger.info(
+                "R7-T1 LLM事件审核 driver=%s event_in=%.1fh cargo=%s dist_home=%.0fkm response=%s",
+                ctx.driver_id, hours_to_event, cargo_id, dist_to_home, response[:80],
+            )
+
+            if "REJECT" in response.upper():
+                best_wait = max(
+                    (c for c in feasible if c.action == "wait" and c.feasible),
+                    key=lambda c: c.score,
+                    default=None,
+                )
+                if best_wait:
+                    best_wait.note = f"llm_event_reject({best_wait.note})"
+                    return best_wait
+
+        return None
+
+    def _t2_rest_deficit_check(
+        self,
+        best: ScoredAction,
+        feasible: list[ScoredAction],
+        rules: preference_parser.ParsedRules,
+        memory: driver_memory.DriverMemory,
+        ctx: DecisionContext,
+    ) -> ScoredAction | None:
+        """T2: 月度休息日deficit≥1且day≥18时，让LLM决定接单还是休息。"""
+        if best.action != "take_order":
+            return None
+        if rules.monthly_day_off is None:
+            return None
+
+        sim_day = ctx.current_minutes // 1440
+        if sim_day < config.LLM_REST_DEFICIT_DAY:
+            return None
+
+        required = rules.monthly_day_off.required_days
+        active_days_so_far = len(memory.daily_active)
+        remaining_days = 31 - sim_day
+        rest_days = sim_day - active_days_so_far  # approximate rest days so far
+        current_day_date = geo_utils.date_str(ctx.current_minutes)
+        current_day_active = current_day_date in memory.daily_active
+        deficit = required - rest_days
+
+        if deficit < 1 or current_day_active:
+            return None
+
+        penalty_amount = rules.monthly_day_off.penalty_amount or 3000.0
+        prompt = (
+            f"今天是仿真第{sim_day + 1}天（还剩{remaining_days}天）\n"
+            f"月度休息日要求：{required}天，已休{rest_days}天，还差{deficit}天\n"
+            f"今天尚未接单（休息中）\n"
+            f"每缺少1天休息日罚金：¥{penalty_amount}\n"
+            f"推荐接单评分：{best.score:.0f}分\n\n"
+            f"问题：今天应该继续休息还是接单工作？考虑到剩余{remaining_days}天内还需要休息{deficit}天。\n"
+            f"请回答WORK（接单）或REST（今天休息）"
+        )
+
+        response = self._call_llm_for_decision(ctx.driver_id, memory, prompt)
+        self._logger.info(
+            "R7-T2 LLM休息决策 driver=%s day=%s deficit=%s response=%s",
+            ctx.driver_id, sim_day, deficit, response[:80],
+        )
+
+        if "REST" in response.upper():
+            best_wait = max(
+                (c for c in feasible if c.action == "wait" and c.feasible),
+                key=lambda c: c.score,
+                default=None,
+            )
+            if best_wait:
+                best_wait.note = f"llm_rest_decision({best_wait.note})"
+                return best_wait
+
+        return None
+
+    def _t3_home_urgency_check(
+        self,
+        best: ScoredAction,
+        feasible: list[ScoredAction],
+        rules: preference_parser.ParsedRules,
+        memory: driver_memory.DriverMemory,
+        ctx: DecisionContext,
+        cargo_items: list[dict[str, Any]],
+    ) -> ScoredAction | None:
+        """T3: 距回家截止≤4h且best是take_order时审核。"""
+        if best.action != "take_order":
+            return None
+        if rules.home_rule is None:
+            return None
+
+        hr = rules.home_rule
+        home_by_min = hr.home_by_hour * 60
+        current_mod = ctx.current_minutes % 1440
+        time_until_home = home_by_min - current_mod
+        if time_until_home < 0:
+            time_until_home += 1440
+
+        if time_until_home > config.LLM_HOME_CRITICAL_HOURS * 60:
+            return None
+
+        dist_to_home = geo_utils.haversine_km(ctx.current_lat, ctx.current_lng, hr.lat, hr.lng)
+        if dist_to_home <= hr.radius_km:
+            return None
+
+        cargo_id = best.params.get("cargo_id", "")
+        cargo_info = self._find_cargo_info(cargo_items, cargo_id)
+        if not cargo_info:
+            return None
+
+        end_lat = float(cargo_info.get("end_lat", 0))
+        end_lng = float(cargo_info.get("end_lng", 0))
+        dist_end_to_home = geo_utils.haversine_km(end_lat, end_lng, hr.lat, hr.lng)
+        cost_time = int(cargo_info.get("cost_time_minutes", 0) or 0)
+        travel_home_min = dist_end_to_home / (config.DEFAULT_REPOSITION_SPEED_KMH / 60.0)
+
+        prompt = (
+            f"当前时间：{geo_utils.hour_of_day(ctx.current_minutes)}:{ctx.current_minutes % 60:02d}\n"
+            f"必须{hr.home_by_hour}:00前到家\n"
+            f"距到家截止还有{time_until_home}分钟\n"
+            f"当前距家{dist_to_home:.0f}km\n"
+            f"推荐接单用时{cost_time}分钟，完单后距家{dist_end_to_home:.0f}km（约{travel_home_min:.0f}分钟车程）\n"
+            f"接单后总用时预估：{cost_time + travel_home_min:.0f}分钟\n"
+            f"回家违规罚金：¥{hr.penalty_amount}\n\n"
+            f"问题：接单后还能按时到家吗？\n"
+            f"请回答ACCEPT或REJECT"
+        )
+
+        response = self._call_llm_for_decision(ctx.driver_id, memory, prompt)
+        self._logger.info(
+            "R7-T3 LLM回家审核 driver=%s time_left=%dmin dist=%.0fkm response=%s",
+            ctx.driver_id, time_until_home, dist_to_home, response[:80],
+        )
+
+        if "REJECT" in response.upper():
+            # 优先选reposition回家，其次wait
+            best_repo = max(
+                (c for c in feasible if c.action == "reposition" and c.feasible),
+                key=lambda c: c.score,
+                default=None,
+            )
+            if best_repo and best_repo.score > 0:
+                best_repo.note = f"llm_home_reject({best_repo.note})"
+                return best_repo
+            best_wait = max(
+                (c for c in feasible if c.action == "wait" and c.feasible),
+                key=lambda c: c.score,
+                default=None,
+            )
+            if best_wait:
+                best_wait.note = f"llm_home_reject({best_wait.note})"
+                return best_wait
+
+        return None
+
+    def _t4_score_arbitration(
+        self,
+        best: ScoredAction,
+        feasible: list[ScoredAction],
+        rules: preference_parser.ParsedRules,
+        memory: driver_memory.DriverMemory,
+        ctx: DecisionContext,
+        cargo_items: list[dict[str, Any]],
+    ) -> ScoredAction | None:
+        """T4: top-1和top-2评分接近且动作类型不同时，让LLM仲裁。"""
+        if len(feasible) < 2:
+            return None
+
+        ranked = sorted(feasible, key=lambda c: c.score, reverse=True)
+        top1, top2 = ranked[0], ranked[1]
+
+        if top1.action == top2.action:
+            return None
+        if top1.score <= 0:
+            return None
+
+        gap = abs(top1.score - top2.score)
+        if gap / max(abs(top1.score), 1.0) > config.LLM_SCORE_CLOSE_RATIO:
+            return None
+
+        sim_day = ctx.current_minutes // 1440
+        active_days = len(memory.daily_active)
+
+        def _describe(c: ScoredAction) -> str:
+            if c.action == "take_order":
+                cid = c.params.get("cargo_id", "?")
+                info = self._find_cargo_info(cargo_items, str(cid))
+                if info:
+                    return f"接单cargo={cid}（用时{info.get('cost_time_minutes',0)}min, 距离{info.get('distance_km',0):.0f}km）评分{c.score:.0f}"
+                return f"接单cargo={cid} 评分{c.score:.0f}"
+            elif c.action == "wait":
+                return f"等待{c.params.get('duration_minutes',0)}分钟 评分{c.score:.0f}"
+            else:
+                return f"空驶到({c.params.get('latitude',0):.2f},{c.params.get('longitude',0):.2f}) 评分{c.score:.0f}"
+
+        prompt = (
+            f"两个选择评分非常接近（差距{gap:.0f}，比例{gap / max(abs(top1.score), 1.0):.1%}）：\n"
+            f"选项A: {_describe(top1)}\n"
+            f"选项B: {_describe(top2)}\n\n"
+            f"上下文：第{sim_day + 1}天，已活跃{active_days}天\n"
+            f"请选择更优方案：A或B"
+        )
+
+        response = self._call_llm_for_decision(ctx.driver_id, memory, prompt)
+        self._logger.info(
+            "R7-T4 LLM仲裁 driver=%s A=%s(%.0f) B=%s(%.0f) response=%s",
+            ctx.driver_id, top1.action, top1.score, top2.action, top2.score, response[:80],
+        )
+
+        if "B" in response.upper() and "A" not in response.upper()[:response.upper().find("B")] if "B" in response.upper() else False:
+            top2.note = f"llm_arbitration_B({top2.note})"
+            return top2
+
+        return None
+
+    def _find_cargo_info(
+        self,
+        cargo_items: list[dict[str, Any]],
+        cargo_id: str,
+    ) -> dict[str, Any] | None:
+        """从cargo_items中查找指定cargo_id的信息。"""
+        for item in cargo_items:
+            cargo = item.get("cargo") or {}
+            cid = str(cargo.get("cargo_id", "")).strip()
+            if cid == cargo_id:
+                end = cargo.get("end") or {}
+                return {
+                    "cost_time_minutes": cargo.get("cost_time_minutes", 0),
+                    "distance_km": item.get("distance_km", 0),
+                    "end_lat": end.get("lat", 0),
+                    "end_lng": end.get("lng", 0),
+                    "price": cargo.get("price", 0),
+                }
+        return None
 
 
 # 列出可供外部导出的名字，保证 ``from agent.model_decision_service import *`` 不会泄露内部状态。
