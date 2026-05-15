@@ -428,6 +428,28 @@ def score_take_order(
         if phase == "early_approach":
             dist_to_pick = geo_utils.haversine_km(end_lat, end_lng, event.pickup_lat, event.pickup_lng)
             cur_dist_to_pick = geo_utils.haversine_km(ctx.current_lat, ctx.current_lng, event.pickup_lat, event.pickup_lng)
+            # P0: 强制回家策略——事件开始前 24h 内，若司机不在家/接人点附近，硬阻拦所有接单
+            time_to_event = event.start_minutes - ctx.current_minutes
+            near_pickup = cur_dist_to_pick <= event.radius_km
+            near_home = geo_utils.haversine_km(ctx.current_lat, ctx.current_lng, event.home_lat, event.home_lng) <= event.radius_km
+            if 0 < time_to_event <= config.TIMED_EVENT_HOME_MANDATORY_WINDOW_MINUTES and not near_pickup and not near_home:
+                return ScoredAction(
+                    action="take_order",
+                    params={"cargo_id": cargo_id},
+                    score=-HARD_CONSTRAINT_PENALTY,
+                    feasible=False,
+                    note="timed_event_mandatory_home",
+                )
+            # P0: 提前完单限制——事件开始前 48h 内，只允许接在事件开始前能完工的订单
+            if 0 < time_to_event <= config.TIMED_EVENT_PRECOMPLETION_WINDOW_MINUTES:
+                if finish_minutes > event.start_minutes:
+                    return ScoredAction(
+                        action="take_order",
+                        params={"cargo_id": cargo_id},
+                        score=-HARD_CONSTRAINT_PENALTY,
+                        feasible=False,
+                        note="timed_event_precompletion_block",
+                    )
             if dist_to_pick > cur_dist_to_pick + 30:
                 penalty = float(event.penalty_amount or 3000.0) * 0.3
                 breakdown["timed_event_order_penalty"] = breakdown.get("timed_event_order_penalty", 0.0) - penalty
@@ -686,9 +708,6 @@ def score_take_order(
         if finish_minutes + minutes_to_home_from_end <= end_day * 1440 + home_by_min:
             can_reach_home_by_deadline = True
         end_in_home = _is_in_circle(end_lat, end_lng, rules.home_rule)
-        # 若接单后当天无法在截止前回到家附近，一律拒绝该订单。
-        # 评测按「当天最后一个 step_end 之前位置距离家 > radius」判违规，且每天罚金高（D009 单日 900 元 / 上限 6300）。
-        # 既往 12 小时阈值过宽，会放行清晨即可预判违规的订单——这里改为严格判定。
         if not can_reach_home_by_deadline and not end_in_home:
             return ScoredAction(
                 action="take_order",
@@ -1007,10 +1026,12 @@ def score_wait(
             covered = min(duration_minutes, deficit)
             unit = float(rest.penalty_amount or 200.0)
             rest_gain += unit * (covered / max(1, deficit))
+            # P2: 长时间 wait 完全覆盖 deficit 时给予额外奖励，避免多次短wait代替一次长wait
+            if duration_minutes >= deficit:
+                rest_gain += unit * 0.3
             # 当天即将结束但仍未满足休息要求时，给予额外的紧急增益
             remaining_today = 1440 - cur_md
             if remaining_today < deficit * 2 and duration_minutes >= deficit:
-                # 紧急度与剩余时间成反比：剩余越少越紧急
                 urgency = min(2.0, deficit / max(1, remaining_today - deficit))
                 rest_gain += unit * (0.5 + urgency * 0.5)
     if rest_gain > 0:
@@ -1112,7 +1133,9 @@ def score_wait(
             remaining = max(0, event.stay_until_minutes - ctx.current_minutes)
             covered = min(duration_minutes, remaining)
             if covered > 0:
-                breakdown["timed_event_home_gain"] = covered * event.absence_penalty_per_minute
+                # P0: stay 阶段 wait 增益加码（×3.0），确保司机留在家中
+                multiplier = config.TIMED_EVENT_STAY_GAIN_MULTIPLIER if phase == "stay" else 1.0
+                breakdown["timed_event_home_gain"] = covered * event.absence_penalty_per_minute * multiplier
                 note_parts.append("event_home_stay")
         elif phase == "stay" and not near_home:
             # stay阶段远离家：wait施加每分钟缺席惩罚，促使选择reposition回家

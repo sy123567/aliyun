@@ -197,6 +197,16 @@ TIMED_EVENT_FIXED_GAIN_MULTIPLIER = 1.2
 
 TIMED_EVENT_STAY_CHUNK_MINUTES = 12 * 60
 TIMED_EVENT_LONG_STAY_MAX_MINUTES = 4 * 24 * 60
+
+TIMED_EVENT_HOME_MANDATORY_WINDOW_MINUTES = 24 * 60
+"""事件开始前 N 分钟内，若司机不在家附近，硬阻拦所有 take_order，强制回家。"""
+
+TIMED_EVENT_PRECOMPLETION_WINDOW_MINUTES = 48 * 60
+"""事件开始前 N 分钟内，只允许接在事件开始前能完工的订单。"""
+
+TIMED_EVENT_STAY_GAIN_MULTIPLIER = 3.0
+"""stay 阶段 wait 增益倍数：确保司机留在家中不外出。"""
+
 TIMED_EVENT_APPROACH_GAIN_MULTIPLIER = 1.6
 TIMED_EVENT_START_BUFFER_MINUTES = 30
 TIMED_EVENT_PICKUP_OVERSTAY_MULTIPLIER = 2.0
@@ -204,6 +214,12 @@ HOME_RULE_PREP_WINDOW_MINUTES = 6 * 60
 HOME_RULE_TARGET_GAIN_MULTIPLIER = 2.0
 HOME_RULE_REACHABILITY_MULTIPLIER = 2.0
 HOME_RULE_AWAY_WAIT_PENALTY_MULTIPLIER = 2.0
+
+HOME_RULE_AFTERNOON_BLOCK_HOUR = 14
+"""下午 N 点后且距家>200km 时开始阻拦新订单（D009 回家规则优化）。"""
+
+HOME_RULE_AFTERNOON_BLOCK_DISTANCE_KM = 200.0
+"""下午阻拦距离阈值：超过此距离开始阻拦。"""
 NO_DRIVE_ACTIVE_PENALTY_MULTIPLIER = 2.0
 NO_DRIVE_SAFETY_BUFFER_MINUTES = 45
 """安全裕量：订单/空驶预计完成时间 + 该值若触碰禁行窗则拒绝。保持 master 45 min 默认值。
@@ -220,3 +236,15 @@ NO_DRIVE_SOFT_PENALTY_THRESHOLD = 120.0
 """禁行窗「软 / 严」划分阈值：单日罚金 ≤ 该值的 no_drive_window 走软偏好逻辑（仅接受软罚、不启用双重裕量、不硬拒）。
 D004 「中午 12–13 不接」单日罚金 ¥100（上限 ¥3,000）是典型软偏好：硬拒该窗会让 agent 错失 30×单价¥1,000+ 的订单。
 反之 D003 「凌晨 2–5 不接」¥200/天、D005/D007 夜禁均 ¥200+/天是严偏好，应硬拒。阈值 120 能区分 D004(100) 与 D003/D005(200)。"""
+
+
+# ---------------- 月度休息日优化参数（第四轮） ----------------
+
+MONTHLY_DAY_OFF_LOW_R_THRESHOLD = 2
+"""R ≤ 该值视为低 R 值司机，适用更激进的月度休息日策略。"""
+
+MONTHLY_DAY_OFF_MID_MONTH_DAY = 15
+"""月中检查点：低R值司机在此日前必须至少休息1天，否则提高urgency系数。"""
+
+MONTHLY_DAY_OFF_LOW_R_EARLY_URGENCY_TRIGGER = 0.05
+"""低R值司机的早期urgency触发阈值（普通司机为0.1）。"""
