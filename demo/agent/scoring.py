@@ -110,7 +110,7 @@ def resolve_adaptive_weights(
     - 偏好即将违规： preference_risk ×3。
     - 货源稀缺（可见货源<5）： pickup_deadhead ×0.5、reposition_gain ×1.5。
     - 夜间时段： time_cost ×0.3（鼓励夜间休息）。
-    - 收入节奏落后： income ×1.12、future_value ×1.3（鼓励积极接单）。
+    - 收入节奏落后： income ×1.05、future_value ×1.1（鼓励积极接单）。
     """
     weights = config.DEFAULT_WEIGHTS
 
@@ -135,7 +135,7 @@ def resolve_adaptive_weights(
 
     # 收入节奏自适应：落后目标时提升 income 和 future_value 权重
     sim_day = ctx.current_minutes // 1440
-    if sim_day >= 2:  # 至少第3天才有足够数据判断节奏
+    if sim_day >= 5:  # 至少第6天才有足够数据判断节奏（避免早期数据不足时误触发）
         active_days = memory.days_active_count()
         if active_days > 0:
             avg_daily = memory.total_gross_income / active_days
