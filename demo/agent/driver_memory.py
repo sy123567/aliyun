@@ -146,7 +146,7 @@ class DriverMemory:
         return bucket.sum_price_per_minute / bucket.samples
 
     def hotspot_value(self, latitude: float, longitude: float) -> float:
-        """返回查询点附近 9 宫格的平均“元/分钟”收益，作为未来机会估计。"""
+        """返回查询点附近 9 宫格的平均"元/分钟"收益，作为未来机会估计。"""
         key = geo_utils.grid_key(latitude, longitude)
         total_yield = 0.0
         total_samples = 0
@@ -160,6 +160,17 @@ class DriverMemory:
         if total_samples <= 0:
             return 0.0
         return total_yield / total_samples
+
+    def hotspot_density(self, latitude: float, longitude: float) -> float:
+        """返回查询点附近 9 宫格的货源密度（样本数归一化），反映区域货源丰富程度。"""
+        key = geo_utils.grid_key(latitude, longitude)
+        total_samples = 0
+        for di in (-1, 0, 1):
+            for dj in (-1, 0, 1):
+                cell = self.hotspots.get((key[0] + di, key[1] + dj))
+                if cell is not None:
+                    total_samples += cell.samples
+        return min(1.0, total_samples / 50.0)
 
     def absorb_history_records(self, records: list[dict[str, Any]]) -> None:
         """从 ``query_decision_history`` 记录中累计当日和月度统计。"""
