@@ -286,8 +286,8 @@ LLM_CRITICAL_PENALTY_THRESHOLD = 5000.0
 LLM_MONTH_END_CRITICAL_DAYS = 5
 """月末剩余天数 ≤ 该值时视为关键期，强制 LLM 参与决策。"""
 
-LLM_STRATEGY_WEIGHT_REST_BOOST = 2.0
-"""LLM 策略建议休息时，preference_risk 权重乘数。"""
+LLM_STRATEGY_WEIGHT_REST_BOOST = 1.3
+"""LLM 策略建议休息时，preference_risk 权重乘数。原倲2.0过于激进，导致过度休息。"""
 
-LLM_STRATEGY_WEIGHT_INCOME_BOOST = 1.3
+LLM_STRATEGY_WEIGHT_INCOME_BOOST = 1.2
 """LLM 策略建议冲收入时，income 权重乘数。"""

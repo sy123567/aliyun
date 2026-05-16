@@ -48,10 +48,16 @@ _DECISION_SYSTEM_PROMPT = (
 )
 
 _STRATEGY_SYSTEM_PROMPT = (
-    "你是货运调度策略规划AI。根据司机当前状态，为今天制定最优策略。\n"
+    "你是货运调度策略规划AI。核心目标：最大化司机31天月度净收入（毛收入-罚金）。\n"
+    "重要原则：\n"
+    "1. 收入优先：大多数情况应选income或balanced，只要还有工作时间就应积极接单\n"
+    "2. rest_today仅在满足以下条件时设true：月休息日缺口>0且剩余天数<=缺口天数*2\n"
+    "3. penalty_control仅在罚分已超5000元或特定规则即将触发大额罚款时使用\n"
+    "4. 300000元是理论上限而非必须达成的目标，日均收入9000-12000元属正常水平\n"
+    "5. weight_adjustments保持在0.8-1.5范围内，避免极端调整\n"
     "输出严格JSON格式，禁止markdown和多余文本。\n"
     "Schema:\n"
-    '{"priority": "rest|income|penalty_control|balanced",'
+    '{"priority": "income|balanced|penalty_control|rest",'
     ' "rest_today": true/false,'
     ' "reason": "简短原因",'
     ' "income_target_today": 建议今日目标收入(元),'
@@ -258,11 +264,9 @@ class ModelDecisionService:
         )
 
         avg_daily = memory.total_gross_income / max(1, active_days)
-        target_remaining = max(0, 300000 - memory.total_gross_income)
         parts.append(
             f"日均毛收入:{avg_daily:.0f}元 "
-            f"剩余目标:{target_remaining:.0f}元 "
-            f"需日均:{target_remaining / max(1, days_remaining):.0f}元"
+            f"正常日均水平:9000-12000元"
         )
 
         penalty_info = []
@@ -312,7 +316,7 @@ class ModelDecisionService:
         if hour_values:
             parts.append(f"高收益时段:{','.join(hour_values[:6])}")
 
-        parts.append("请分析以上信息，为今天制定最优策略。")
+        parts.append("请分析以上信息，为今天制定最优策略。注意：多数情况应选income或balanced积极接单。")
 
         caller = self._make_llm_caller(driver_id, memory)
         try:
@@ -516,13 +520,12 @@ class ModelDecisionService:
         if memory.consecutive_wait_count > 0:
             parts.append(f"连续等待{memory.consecutive_wait_count}次")
 
-        # 当日策略提示
+        # 当日策略提示（仅显示优先级，不传递rest_today避免过度偏向休息）
         strategy = memory.daily_strategy.get(sim_day)
         if strategy:
             priority = strategy.get("priority", "")
             reason = str(strategy.get("reason", ""))[:40]
-            rest_today = strategy.get("rest_today", False)
-            parts.append(f"今日策略:{priority}{'(休息日)' if rest_today else ''} {reason}")
+            parts.append(f"今日策略:{priority} {reason}")
 
         # 接单成功率
         sr = memory.cargo_success_rate()

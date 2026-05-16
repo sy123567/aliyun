@@ -165,7 +165,7 @@ def apply_strategy_weights(
             if raw is not None:
                 try:
                     factor = float(raw)
-                    factor = max(0.5, min(3.0, factor))
+                    factor = max(0.8, min(1.5, factor))
                     scale_kwargs[field_name] = scale_kwargs.get(field_name, 1.0) * factor
                 except (TypeError, ValueError):
                     pass
