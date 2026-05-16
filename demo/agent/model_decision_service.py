@@ -204,7 +204,8 @@ class ModelDecisionService:
         candidates = ranked[:top_n]
 
         # 评分系统已有明显最优时跳过 LLM（节省 token）
-        if top_n >= 2 and candidates[0].score > 0 and candidates[0].score > candidates[1].score * 1.5:
+        # Run6发现: 1.5x阈值导致LLM介入太频繁，有时覆盖最优选择→提高到2.0x
+        if top_n >= 2 and candidates[0].score > 0 and candidates[0].score > candidates[1].score * 2.0:
             return None
 
         prompt = self._build_decision_prompt(driver_id, memory, rules, ctx, candidates)
@@ -237,7 +238,8 @@ class ModelDecisionService:
             selected = candidates[idx]
             top_score = candidates[0].score
             # 防止 LLM 选择分数远低于最优的候选
-            if top_score > 0 and selected.score < top_score * 0.8:
+            # Run6发现: 0.8阈值太松，20%差距在高收入货=数千元损失→收紧到0.9
+            if top_score > 0 and selected.score < top_score * 0.9:
                 self._logger.info(
                     "LLM决策被拒(分数过低) driver=%s 选=%d/%d score=%.0f < 80%%*top=%.0f",
                     driver_id, idx + 1, top_n, selected.score, top_score,

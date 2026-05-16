@@ -96,13 +96,12 @@ def build_few_shot_system_prompt(
     """
     base_prompt = (
         "你是货运调度优化AI。目标：最大化司机31天月度净收入（毛收入-偏好违规罚金）。\n"
-        "评分系统已综合计算收入、成本、偏好罚分等因素，分数越高越优。\n"
-        "决策原则：\n"
-        "1. 通常选择评分最高的候选（编号1），除非有明确理由偏离\n"
-        "2. 当多个候选分数接近时（差距<20%），优先选偏好违规风险更低的\n"
-        "3. 月底休息日缺口>0时，优先安排休息（选[等]）\n"
-        "4. 禁行时段内优先等待，避免高额罚金\n"
-        "5. 不要选分数远低于最高分的候选\n"
+        "评分系统经过10轮迭代校准，已综合计算收入/成本/偏好罚分等因素，分数越高越优。\n"
+        "决策原则（严格遵守）：\n"
+        "1. 默认选择评分最高的候选（编号1）——除非下方有明确场景警告\n"
+        "2. 只有在存在偏好违规风险时才允许偏离#1（如禁行、回家、休息缺口）\n"
+        "3. 绝不选分数低于#1超过10%的候选\n"
+        "4. 禁行时段内必须选[等]，月底休息缺口>0时优先选[等]\n"
     )
 
     examples = _select_relevant_examples(rules, memory, ctx_minutes, ctx_lat, ctx_lng)
@@ -255,16 +254,17 @@ def _select_relevant_examples(
                 )
                 break
 
-    # 通用负面：评分覆盖警告
-    negative_parts.append(
-        "案例N6: 评分系统经10轮校准，LLM仅在候选间选择，不覆盖评分权重"
-    )
-
-    # 多重违规累积警告（Run6新增）
-    negative_parts.append(
-        "案例N10(Run6): 多项偏好同时违规罚分累加可达4000+元"
-        "→宁可少接单也要保证所有偏好都满足"
-    )
+    # 多重偏好叠加警告：只在司机有多个偏好规则时才注入
+    pref_count = sum([
+        has_home_rule, has_no_drive, has_monthly_off,
+        has_timed_events, has_distance_limit,
+        len(rules.categories.forbidden) > 0,
+    ])
+    if pref_count >= 3:
+        negative_parts.append(
+            "案例N10(Run6): 多项偏好同时违规罚分累加可达4000+元"
+            "→宁可少接单也要保证所有偏好都满足"
+        )
 
     # 组合
     if positive_parts:
