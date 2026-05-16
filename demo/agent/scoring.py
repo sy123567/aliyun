@@ -56,9 +56,6 @@ _WEIGHT_MAP: dict[str, str] = {
     "preferred_cargo_conflict_penalty": "preference_risk",
     "timed_event_approach_gain": "preference_risk",
     "daily_rest_risk_penalty": "preference_risk",
-    "income_efficiency_bonus": "income",
-    "income_efficiency_penalty": "income",
-    "deadhead_ratio_penalty": "pickup_deadhead",
 }
 
 
@@ -110,7 +107,6 @@ def resolve_adaptive_weights(
     - 偏好即将违规： preference_risk ×3。
     - 货源稀缺（可见货源<5）： pickup_deadhead ×0.5、reposition_gain ×1.5。
     - 夜间时段： time_cost ×0.3（鼓励夜间休息）。
-    - 收入节奏落后： income ×1.12、future_value ×1.3（鼓励积极接单）。
     """
     weights = config.DEFAULT_WEIGHTS
 
@@ -132,18 +128,6 @@ def resolve_adaptive_weights(
     hour = geo_utils.hour_of_day(ctx.current_minutes)
     if hour >= config.NIGHT_HOUR_START or hour < config.NIGHT_HOUR_END:
         weights = weights.scaled(time_cost=0.3)
-
-    # 收入节奏自适应：落后目标时提升 income 和 future_value 权重
-    sim_day = ctx.current_minutes // 1440
-    if sim_day >= 2:  # 至少第3天才有足够数据判断节奏
-        active_days = memory.days_active_count()
-        if active_days > 0:
-            avg_daily = memory.total_gross_income / active_days
-            if avg_daily < config.PACE_TARGET_DAILY_INCOME:
-                weights = weights.scaled(
-                    income=config.PACE_BEHIND_INCOME_BOOST,
-                    future_value=config.PACE_BEHIND_FUTURE_VALUE_BOOST,
-                )
 
     return weights
 
@@ -625,25 +609,6 @@ def score_take_order(
     waiting_penalty = ctx.opportunity_cost_per_minute * 0.5 * waiting_minutes
     breakdown["waiting_penalty"] = -waiting_penalty
 
-    # 收入效率评估：奖励高 yuan/km 货源，惩罚低效货源
-    if distance_total > 0 and income > 0:
-        yuan_per_km = income / distance_total
-        if yuan_per_km > config.INCOME_EFFICIENCY_BONUS_THRESHOLD:
-            excess = yuan_per_km - config.INCOME_EFFICIENCY_BONUS_THRESHOLD
-            breakdown["income_efficiency_bonus"] = excess * config.INCOME_EFFICIENCY_BONUS_PER_UNIT
-        elif yuan_per_km < config.INCOME_EFFICIENCY_PENALTY_THRESHOLD:
-            shortfall = config.INCOME_EFFICIENCY_PENALTY_THRESHOLD - yuan_per_km
-            breakdown["income_efficiency_penalty"] = -shortfall * config.INCOME_EFFICIENCY_PENALTY_PER_UNIT
-
-    # 空驶/运距比惩罚：空驶距离占运距过大时施加额外惩罚
-    if haul_km > 10 and distance_pickup_km > 0:
-        dh_ratio = distance_pickup_km / haul_km
-        if dh_ratio > config.DEADHEAD_HAUL_RATIO_THRESHOLD:
-            excess_dh_km = distance_pickup_km - haul_km * config.DEADHEAD_HAUL_RATIO_THRESHOLD
-            breakdown["deadhead_ratio_penalty"] = -(
-                ctx.cost_per_km * excess_dh_km * config.DEADHEAD_HAUL_RATIO_PENALTY_COEFF
-            )
-
     # v2: 接单成功率折扣与连续失败避让
     # 原理：接单失败会浪费 ~21 分钟（扫描+尝试+重试），需在评分时预期原本。
     if not income_voided_by_horizon and income > 0:
@@ -1007,15 +972,13 @@ def score_take_order(
                         note="monthly_day_off_cross_day_block",
                     )
 
-    # 未来位置价值：卸货点的热点收益 + 到达时段的在线模式信号 + 货源密度
+    # 未来位置价值：卸货点的热点收益 + 到达时段的在线模式信号
     arrival_hour = geo_utils.hour_of_day(finish_minutes)
     hour_signal = memory.hour_pattern_value(arrival_hour)
     horizon_minutes_ahead = min(120, max(60, occupied_minutes // 2))
-    hotspot_val = memory.hotspot_value(end_lat, end_lng)
-    density_val = memory.hotspot_density(end_lat, end_lng) * config.FUTURE_VALUE_DENSITY_WEIGHT
     future_value = (
-        hotspot_val + 0.5 * hour_signal + density_val
-    ) * horizon_minutes_ahead * config.FUTURE_VALUE_HORIZON_MULTIPLIER
+        memory.hotspot_value(end_lat, end_lng) + 0.5 * hour_signal
+    ) * horizon_minutes_ahead
     if future_value > 0:
         breakdown["future_location_value"] = future_value
 

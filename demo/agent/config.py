@@ -68,9 +68,6 @@ DEFAULT_REPOSITION_SPEED_KMH = 60.0
 DEFAULT_OPPORTUNITY_COST_PER_MINUTE = 0.5
 """时间机会成本基准：元/分钟，约合 30 元/小时。"""
 
-DEFAULT_COST_PER_KM = 1.5
-"""每公里行驶成本基准（元/km），含油费、折旧、过路费等。"""
-
 HORIZON_OVERFLOW_PENALTY = 5_000.0
 """候选完成时间超过仿真上界时的惩罚分。"""
 
@@ -269,42 +266,6 @@ MONTHLY_DAY_OFF_LATE_MONTH_DAY = 20
 
 MONTHLY_DAY_OFF_FORCE_REST_DAY = 25
 """R6-P1: 强制休息检查日（0-indexed），day≥此值且deficit≥1时给极高wait增益。"""
-
-
-# ---------------- 收入效率优化参数 ----------------
-
-INCOME_EFFICIENCY_BONUS_THRESHOLD = 4.5
-"""yuan/km 超过此值的货源获得效率奖励，鼓励选择高单价货。"""
-
-INCOME_EFFICIENCY_BONUS_PER_UNIT = 40.0
-"""每超过阈值 1 yuan/km 的奖励金额（元）。"""
-
-INCOME_EFFICIENCY_PENALTY_THRESHOLD = 2.5
-"""yuan/km 低于此值的货源受到效率惩罚，避免低效运输。"""
-
-INCOME_EFFICIENCY_PENALTY_PER_UNIT = 30.0
-"""每低于阈值 1 yuan/km 的惩罚金额（元）。"""
-
-DEADHEAD_HAUL_RATIO_THRESHOLD = 0.8
-"""空驶/运距比超过此值时施加额外惩罚（如空驶50km接30km运单，比值1.67远超0.8）。"""
-
-DEADHEAD_HAUL_RATIO_PENALTY_COEFF = 0.3
-"""空驶比惩罚系数：penalty = cost_per_km × 超额空驶km × 此系数。"""
-
-FUTURE_VALUE_HORIZON_MULTIPLIER = 1.5
-"""未来位置价值放大系数，提高卸货点市场价值在决策中的权重。"""
-
-FUTURE_VALUE_DENSITY_WEIGHT = 0.3
-"""热点货源密度在未来价值估算中的权重。"""
-
-PACE_TARGET_DAILY_INCOME = 8500.0
-"""目标日均收入（元），用于计算收入节奏偏差。保守设定避免过度激进。"""
-
-PACE_BEHIND_INCOME_BOOST = 1.12
-"""落后收入节奏时，income 权重提升倍率。"""
-
-PACE_BEHIND_FUTURE_VALUE_BOOST = 1.3
-"""落后收入节奏时，future_value 权重提升倍率，鼓励移向高价值区域。"""
 
 
 # ---------------- LLM 增强决策参数 ----------------
