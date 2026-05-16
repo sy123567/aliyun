@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import logging
 import math
+import re
 from typing import Any
 
 from simkit.ports import SimulationApiPort
@@ -30,6 +31,17 @@ _TOP_ORDER_CANDIDATES = config.TOP_ORDER_CANDIDATES
 _TOP_REPOSITION_TARGETS = config.TOP_REPOSITION_TARGETS
 _MIN_WAIT_FALLBACK_MINUTES = config.MIN_WAIT_FALLBACK_MINUTES
 _TOP_LOG_CANDIDATES = 5
+
+_DECISION_SYSTEM_PROMPT = (
+    "你是货运调度优化AI。目标：最大化司机31天月度净收入（毛收入-偏好违规罚金）。\n"
+    "决策原则：\n"
+    "1. 优先选择收入高、空驶短的订单\n"
+    "2. 严格遵守禁行时段和距离限制，避免高额罚金\n"
+    "3. 月底前确保休息日天数达标，缺口大时主动安排休息\n"
+    "4. 夜间或货源稀缺时可适当等待\n"
+    "5. 考虑接单后的位置是否有利于后续接单\n"
+    "仅回复最优候选编号（如：2），不要解释。"
+)
 
 
 class ModelDecisionService:
@@ -130,6 +142,13 @@ class ModelDecisionService:
             return action_validator.safe_wait(_MIN_WAIT_FALLBACK_MINUTES, note="no_feasible_candidate")
 
         best = max(feasible, key=lambda c: c.score)
+
+        # R10: LLM 辅助决策——当有多个可行候选时让 LLM 做最终选择
+        if len(feasible) > 1:
+            llm_choice = self._llm_select_action(driver_id, memory, rules, ctx, feasible)
+            if llm_choice is not None:
+                best = llm_choice
+
         allowed_cargo_ids: set[str] | None = None
         if best.action == "take_order":
             allowed_cargo_ids = {
@@ -163,6 +182,123 @@ class ModelDecisionService:
             memory.token_used,
         )
         return validated
+
+    # ---------------- LLM 辅助决策（R10） ----------------
+
+    def _llm_select_action(
+        self,
+        driver_id: str,
+        memory: driver_memory.DriverMemory,
+        rules: preference_parser.ParsedRules,
+        ctx: DecisionContext,
+        feasible: list[ScoredAction],
+    ) -> ScoredAction | None:
+        """使用 LLM 从可行候选中选择最优动作；失败时返回 None 回退评分系统。"""
+        if not memory.can_call_model(expected_tokens=5000):
+            return None
+
+        ranked = sorted(feasible, key=lambda c: c.score, reverse=True)
+        top_n = min(5, len(ranked))
+        candidates = ranked[:top_n]
+
+        # 评分系统已有明显最优时跳过 LLM（节省 token）
+        if top_n >= 2 and candidates[0].score > 0 and candidates[0].score > candidates[1].score * 3:
+            return None
+
+        prompt = self._build_decision_prompt(driver_id, memory, rules, ctx, candidates)
+        caller = self._make_llm_caller(driver_id, memory)
+        try:
+            resp = caller({
+                "messages": [
+                    {"role": "system", "content": _DECISION_SYSTEM_PROMPT},
+                    {"role": "user", "content": prompt},
+                ],
+                "temperature": 0.3,
+                "max_tokens": 100,
+                "enable_thinking": False,
+            })
+        except Exception as exc:  # noqa: BLE001
+            self._logger.warning("LLM决策调用异常 driver=%s err=%s", driver_id, exc)
+            return None
+
+        if not resp:
+            return None
+        choices = resp.get("choices", [])
+        if not choices:
+            return None
+        msg = choices[0].get("message") or {}
+        content = str(msg.get("content", "")).strip()
+
+        idx = self._parse_choice(content, top_n)
+        if idx is not None:
+            selected = candidates[idx]
+            self._logger.info(
+                "LLM决策 driver=%s 选=%d/%d action=%s score=%.0f (top1=%s %.0f)",
+                driver_id, idx + 1, top_n, selected.action, selected.score,
+                candidates[0].action, candidates[0].score,
+            )
+            return selected
+
+        self._logger.warning("LLM决策解析失败 driver=%s resp=%s", driver_id, content[:80])
+        return None
+
+    def _build_decision_prompt(
+        self,
+        driver_id: str,
+        memory: driver_memory.DriverMemory,
+        rules: preference_parser.ParsedRules,
+        ctx: DecisionContext,
+        candidates: list[ScoredAction],
+    ) -> str:
+        sim_day = ctx.current_minutes // 1440
+        hour = geo_utils.hour_of_day(ctx.current_minutes)
+        md = geo_utils.minute_of_day(ctx.current_minutes)
+        minute = md % 60
+        days_remaining = max(0, config.AGENT_HORIZON_DAYS - 1 - sim_day)
+
+        parts: list[str] = []
+        parts.append(f"{driver_id} 第{sim_day + 1}/31天 {hour:02d}:{minute:02d} 剩{days_remaining}天")
+        parts.append(
+            f"收入:{memory.total_gross_income:.0f}元 "
+            f"空驶:{memory.total_deadhead_km:.0f}km "
+            f"{memory.total_completed_orders}单"
+        )
+
+        if rules.monthly_day_off is not None:
+            req = rules.monthly_day_off.required_days or 0
+            done = max(0, sim_day + 1 - memory.days_active_count())
+            deficit = max(0, req - done)
+            parts.append(f"休息日:需{req}已{done}缺{deficit}")
+
+        if memory.consecutive_wait_count > 0:
+            parts.append(f"连续等待{memory.consecutive_wait_count}次")
+
+        parts.append("")
+        for i, c in enumerate(candidates):
+            top_bd = sorted(c.breakdown.items(), key=lambda kv: abs(kv[1]), reverse=True)[:4]
+            bd_str = " ".join(f"{k}={v:+.0f}" for k, v in top_bd)
+            if c.action == "take_order":
+                cid = str(c.params.get("cargo_id", "?"))[:12]
+                parts.append(f"{i + 1}.[接]{cid} 分={c.score:.0f} {bd_str}")
+            elif c.action == "wait":
+                dur = c.params.get("duration_minutes", 0)
+                parts.append(f"{i + 1}.[等]{dur}分 分={c.score:.0f} {bd_str}")
+            elif c.action == "reposition":
+                lat = c.params.get("latitude", 0)
+                lng = c.params.get("longitude", 0)
+                parts.append(f"{i + 1}.[移]→({lat:.1f},{lng:.1f}) 分={c.score:.0f} {bd_str}")
+
+        parts.append("选最优编号:")
+        return "\n".join(parts)
+
+    @staticmethod
+    def _parse_choice(content: str, max_idx: int) -> int | None:
+        """从 LLM 回复中提取候选编号（1-indexed → 0-indexed）。"""
+        for m in re.finditer(r"\d+", content):
+            idx = int(m.group()) - 1
+            if 0 <= idx < max_idx:
+                return idx
+        return None
 
     # ---------------- 历史记忆同步 ----------------
 
