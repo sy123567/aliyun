@@ -21,7 +21,7 @@ from typing import Any
 
 from simkit.ports import SimulationApiPort
 
-from . import action_validator, config, driver_memory, geo_utils, preference_parser, scoring
+from . import action_validator, config, driver_memory, few_shot_examples, geo_utils, preference_parser, scoring
 from .scoring import DecisionContext, ScoredAction
 
 _LOGGER = logging.getLogger("agent.decision_service")
@@ -32,7 +32,8 @@ _TOP_REPOSITION_TARGETS = config.TOP_REPOSITION_TARGETS
 _MIN_WAIT_FALLBACK_MINUTES = config.MIN_WAIT_FALLBACK_MINUTES
 _TOP_LOG_CANDIDATES = 5
 
-_DECISION_SYSTEM_PROMPT = (
+# 静态兜底 prompt，在 few-shot 模块不可用时使用
+_DECISION_SYSTEM_PROMPT_FALLBACK = (
     "你是货运调度优化AI。目标：最大化司机31天月度净收入（毛收入-偏好违规罚金）。\n"
     "评分系统已综合计算收入、成本、偏好罚分等因素，分数越高越优。\n"
     "决策原则：\n"
@@ -203,15 +204,17 @@ class ModelDecisionService:
         candidates = ranked[:top_n]
 
         # 评分系统已有明显最优时跳过 LLM（节省 token）
-        if top_n >= 2 and candidates[0].score > 0 and candidates[0].score > candidates[1].score * 1.5:
+        # Run6发现: 1.5x阈值导致LLM介入太频繁，有时覆盖最优选择→提高到2.0x
+        if top_n >= 2 and candidates[0].score > 0 and candidates[0].score > candidates[1].score * 2.0:
             return None
 
         prompt = self._build_decision_prompt(driver_id, memory, rules, ctx, candidates)
+        system_prompt = self._build_system_prompt(rules, memory, ctx)
         caller = self._make_llm_caller(driver_id, memory)
         try:
             resp = caller({
                 "messages": [
-                    {"role": "system", "content": _DECISION_SYSTEM_PROMPT},
+                    {"role": "system", "content": system_prompt},
                     {"role": "user", "content": prompt},
                 ],
                 "temperature": 0.3,
@@ -235,7 +238,8 @@ class ModelDecisionService:
             selected = candidates[idx]
             top_score = candidates[0].score
             # 防止 LLM 选择分数远低于最优的候选
-            if top_score > 0 and selected.score < top_score * 0.8:
+            # Run6发现: 0.8阈值太松，20%差距在高收入货=数千元损失→收紧到0.9
+            if top_score > 0 and selected.score < top_score * 0.9:
                 self._logger.info(
                     "LLM决策被拒(分数过低) driver=%s 选=%d/%d score=%.0f < 80%%*top=%.0f",
                     driver_id, idx + 1, top_n, selected.score, top_score,
@@ -305,8 +309,30 @@ class ModelDecisionService:
                 lng = c.params.get("longitude", 0)
                 parts.append(f"{i + 1}.[移]→({lat:.1f},{lng:.1f}) 分={c.score:.0f} {bd_str}")
 
+        # 注入情境提示（来自 few-shot 模块）
+        hint = few_shot_examples.build_situation_hint(
+            rules, memory, ctx.current_minutes, ctx.current_lat, ctx.current_lng,
+        )
+        if hint:
+            parts.append(hint)
+
         parts.append("选最优编号:")
         return "\n".join(parts)
+
+    def _build_system_prompt(
+        self,
+        rules: preference_parser.ParsedRules,
+        memory: driver_memory.DriverMemory,
+        ctx: DecisionContext,
+    ) -> str:
+        """构建含 few-shot 示例的 system prompt；失败时回退到静态 prompt。"""
+        try:
+            return few_shot_examples.build_few_shot_system_prompt(
+                rules, memory, ctx.current_minutes, ctx.current_lat, ctx.current_lng,
+            )
+        except Exception as exc:  # noqa: BLE001
+            self._logger.warning("few-shot prompt构建失败，回退静态prompt: %s", exc)
+            return _DECISION_SYSTEM_PROMPT_FALLBACK
 
     @staticmethod
     def _parse_choice(content: str, max_idx: int) -> int | None:
