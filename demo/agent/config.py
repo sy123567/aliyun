@@ -266,3 +266,28 @@ MONTHLY_DAY_OFF_LATE_MONTH_DAY = 20
 
 MONTHLY_DAY_OFF_FORCE_REST_DAY = 25
 """R6-P1: 强制休息检查日（0-indexed），day≥此值且deficit≥1时给极高wait增益。"""
+
+
+# ---------------- LLM 增强决策参数 ----------------
+
+LLM_SKIP_SCORE_RATIO = 1.5
+"""评分系统最优候选分数 > 次优 × 该倍率时跳过 LLM，节省 token。
+与 PR#11 保持一致，避免 LLM 过度参与导致覆盖评分系统的优质决策。"""
+
+LLM_SCORE_FLOOR_RATIO = 0.8
+"""LLM 选择的候选分数不得低于最高分 × 该比率，防止灾难性覆盖。"""
+
+LLM_STRATEGY_EXPECTED_TOKENS = 3000
+"""每日策略规划预估 token 消耗。"""
+
+LLM_CRITICAL_PENALTY_THRESHOLD = 5000.0
+"""累计罚分超过该值时视为关键状态，强制 LLM 参与决策。"""
+
+LLM_MONTH_END_CRITICAL_DAYS = 5
+"""月末剩余天数 ≤ 该值时视为关键期，强制 LLM 参与决策。"""
+
+LLM_STRATEGY_WEIGHT_REST_BOOST = 1.3
+"""LLM 策略建议休息时，preference_risk 权重乘数。原倲2.0过于激进，导致过度休息。"""
+
+LLM_STRATEGY_WEIGHT_INCOME_BOOST = 1.2
+"""LLM 策略建议冲收入时，income 权重乘数。"""

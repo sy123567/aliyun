@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import math
 import re
@@ -41,7 +42,27 @@ _DECISION_SYSTEM_PROMPT = (
     "3. 月底休息日缺口>0时，优先安排休息（选[等]）\n"
     "4. 禁行时段内优先等待，避免高额罚金\n"
     "5. 不要选分数远低于最高分的候选\n"
+    "6. 关注当日策略建议，结合整体收入和罚分情况做出最优选择\n"
+    "7. 高价值熟货和家事约定是最高优先级，务必确保不错过\n"
     "仅回复最优候选编号（如：2），不要解释。"
+)
+
+_STRATEGY_SYSTEM_PROMPT = (
+    "你是货运调度策略规划AI。核心目标：最大化司机31天月度净收入（毛收入-罚金）。\n"
+    "重要原则：\n"
+    "1. 收入优先：大多数情况应选income或balanced，只要还有工作时间就应积极接单\n"
+    "2. rest_today仅在满足以下条件时设true：月休息日缺口>0且剩余天数<=缺口天数*2\n"
+    "3. penalty_control仅在罚分已超5000元或特定规则即将触发大额罚款时使用\n"
+    "4. 300000元是理论上限而非必须达成的目标，日均收入9000-12000元属正常水平\n"
+    "5. weight_adjustments保持在0.8-1.5范围内，避免极端调整\n"
+    "输出严格JSON格式，禁止markdown和多余文本。\n"
+    "Schema:\n"
+    '{"priority": "income|balanced|penalty_control|rest",'
+    ' "rest_today": true/false,'
+    ' "reason": "简短原因",'
+    ' "income_target_today": 建议今日目标收入(元),'
+    ' "top_risks": ["风险1", "风险2"],'
+    ' "weight_adjustments": {"income": 1.0, "preference_risk": 1.0, "time_cost": 1.0}}'
 )
 
 
@@ -115,6 +136,9 @@ class ModelDecisionService:
         )
         ctx.visible_cargo_count = len(cargo_items)
 
+        # LLM 每日策略规划：在每天首次决策时生成策略（仅作为决策提示上下文，不修改评分权重）
+        self._ensure_daily_strategy(driver_id, memory, rules, ctx)
+
         order_candidates = self._build_order_candidates(cargo_items, rules, memory, ctx)
         has_good_order = any(c.feasible and c.score > 0 for c in order_candidates)
 
@@ -184,7 +208,175 @@ class ModelDecisionService:
         )
         return validated
 
-    # ---------------- LLM 辅助决策（R10） ----------------
+    # ---------------- LLM 每日策略规划 ----------------
+
+    def _ensure_daily_strategy(
+        self,
+        driver_id: str,
+        memory: driver_memory.DriverMemory,
+        rules: preference_parser.ParsedRules,
+        ctx: DecisionContext,
+    ) -> dict[str, Any] | None:
+        """每日首次决策时调用 LLM 生成当日策略；缓存在 memory 中避免重复调用。"""
+        sim_day = ctx.current_minutes // 1440
+        if sim_day == memory.last_strategy_day:
+            return memory.daily_strategy.get(sim_day)
+
+        if not memory.can_call_model(expected_tokens=config.LLM_STRATEGY_EXPECTED_TOKENS):
+            return None
+
+        strategy = self._generate_daily_strategy(driver_id, memory, rules, ctx)
+        if strategy is not None:
+            memory.daily_strategy[sim_day] = strategy
+            memory.last_strategy_day = sim_day
+            self._logger.info(
+                "LLM每日策略 driver=%s day=%d priority=%s rest=%s reason=%s",
+                driver_id, sim_day + 1,
+                strategy.get("priority", "?"),
+                strategy.get("rest_today", "?"),
+                str(strategy.get("reason", ""))[:60],
+            )
+        else:
+            memory.last_strategy_day = sim_day
+        return strategy
+
+    def _generate_daily_strategy(
+        self,
+        driver_id: str,
+        memory: driver_memory.DriverMemory,
+        rules: preference_parser.ParsedRules,
+        ctx: DecisionContext,
+    ) -> dict[str, Any] | None:
+        """调用 LLM 生成当日策略。"""
+        sim_day = ctx.current_minutes // 1440
+        days_remaining = max(0, config.AGENT_HORIZON_DAYS - 1 - sim_day)
+        active_days = memory.days_active_count()
+        rest_days_done = max(0, sim_day - active_days)
+
+        parts: list[str] = []
+        parts.append(f"{driver_id} 第{sim_day + 1}/31天 剩{days_remaining}天")
+        parts.append(
+            f"累计:毛收入{memory.total_gross_income:.0f}元 "
+            f"完成{memory.total_completed_orders}单 "
+            f"空驶{memory.total_deadhead_km:.0f}km"
+        )
+
+        avg_daily = memory.total_gross_income / max(1, active_days)
+        parts.append(
+            f"日均毛收入:{avg_daily:.0f}元 "
+            f"正常日均水平:9000-12000元"
+        )
+
+        penalty_info = []
+        for rule_id, amount in sorted(memory.preference_penalty_accum.items(), key=lambda kv: kv[1], reverse=True)[:5]:
+            penalty_info.append(f"{rule_id}:{amount:.0f}元")
+        if penalty_info:
+            parts.append(f"累计罚分:{','.join(penalty_info)}")
+        total_penalty = sum(memory.preference_penalty_accum.values())
+        parts.append(f"总罚分:{total_penalty:.0f}元")
+
+        if rules.monthly_day_off is not None:
+            req = rules.monthly_day_off.required_days or 0
+            deficit = max(0, req - rest_days_done)
+            parts.append(
+                f"月休息:需{req}天已{rest_days_done}天缺{deficit}天 "
+                f"活跃{active_days}天"
+            )
+
+        for rest in rules.rest_rules:
+            parts.append(f"每日休息要求:{rest.required_minutes}分钟 罚{rest.penalty_amount}元/天")
+
+        no_drive_info = []
+        for w in rules.no_drive_windows:
+            no_drive_info.append(f"{w.start_minute // 60}:00-{w.end_minute // 60}:00罚{w.penalty_amount}元/天")
+        if no_drive_info:
+            parts.append(f"禁行时段:{','.join(no_drive_info[:3])}")
+
+        for event in rules.timed_stay_events:
+            phase = scoring.timed_event_phase(event, memory, ctx)
+            if phase != "done":
+                event_day = event.start_minutes // 1440
+                parts.append(
+                    f"家事约定:第{event_day + 1}天开始 "
+                    f"当前阶段={phase} 罚{event.absence_penalty_per_minute}元/分钟"
+                )
+
+        for limit in rules.distance_limits:
+            if limit.kind == "monthly_deadhead":
+                over = max(0, memory.total_deadhead_km - limit.max_km)
+                parts.append(f"月空驶限制:{limit.max_km}km 已用{memory.total_deadhead_km:.0f}km 超额{over:.0f}km")
+
+        hour_values = []
+        for h in range(24):
+            v = memory.hour_pattern_value(h)
+            if v > 0:
+                hour_values.append(f"{h}时={v:.1f}")
+        if hour_values:
+            parts.append(f"高收益时段:{','.join(hour_values[:6])}")
+
+        parts.append("请分析以上信息，为今天制定最优策略。注意：多数情况应选income或balanced积极接单。")
+
+        caller = self._make_llm_caller(driver_id, memory)
+        try:
+            resp = caller({
+                "messages": [
+                    {"role": "system", "content": _STRATEGY_SYSTEM_PROMPT},
+                    {"role": "user", "content": "\n".join(parts)},
+                ],
+                "response_format": {"type": "json_object"},
+                "temperature": 0.2,
+                "max_tokens": 300,
+                "enable_thinking": False,
+            })
+        except Exception as exc:  # noqa: BLE001
+            self._logger.warning("LLM策略规划异常 driver=%s err=%s", driver_id, exc)
+            return None
+
+        if not resp:
+            return None
+        choices = resp.get("choices", [])
+        if not choices:
+            return None
+        msg = choices[0].get("message") or {}
+        content = str(msg.get("content", "")).strip()
+        try:
+            strategy = json.loads(content)
+            if not isinstance(strategy, dict):
+                return None
+            if "priority" not in strategy:
+                return None
+            return strategy
+        except (json.JSONDecodeError, TypeError):
+            self._logger.warning("LLM策略解析失败 driver=%s resp=%s", driver_id, content[:100])
+            return None
+
+    # ---------------- LLM 辅助决策（R10 增强） ----------------
+
+    def _is_critical_situation(
+        self,
+        memory: driver_memory.DriverMemory,
+        rules: preference_parser.ParsedRules,
+        ctx: DecisionContext,
+    ) -> bool:
+        """判断是否处于关键决策时刻，需要强制 LLM 参与。"""
+        sim_day = ctx.current_minutes // 1440
+        days_remaining = max(0, config.AGENT_HORIZON_DAYS - 1 - sim_day)
+        if days_remaining <= config.LLM_MONTH_END_CRITICAL_DAYS:
+            return True
+        total_penalty = sum(memory.preference_penalty_accum.values())
+        if total_penalty >= config.LLM_CRITICAL_PENALTY_THRESHOLD:
+            return True
+        if rules.monthly_day_off is not None:
+            active_days = memory.days_active_count()
+            rest_done = max(0, sim_day - active_days)
+            deficit = max(0, rules.monthly_day_off.required_days - rest_done)
+            if deficit > 0 and days_remaining <= deficit * 3:
+                return True
+        for event in rules.timed_stay_events:
+            phase = scoring.timed_event_phase(event, memory, ctx)
+            if phase in {"early_approach", "approaching", "pickup", "late_pickup", "home", "late_home"}:
+                return True
+        return False
 
     def _llm_select_action(
         self,
@@ -202,9 +394,12 @@ class ModelDecisionService:
         top_n = min(5, len(ranked))
         candidates = ranked[:top_n]
 
+        critical = self._is_critical_situation(memory, rules, ctx)
+
         # 评分系统已有明显最优时跳过 LLM（节省 token）
-        if top_n >= 2 and candidates[0].score > 0 and candidates[0].score > candidates[1].score * 1.5:
-            return None
+        if top_n >= 2 and candidates[0].score > 0:
+            if candidates[0].score > candidates[1].score * config.LLM_SKIP_SCORE_RATIO:
+                return None
 
         prompt = self._build_decision_prompt(driver_id, memory, rules, ctx, candidates)
         caller = self._make_llm_caller(driver_id, memory)
@@ -234,17 +429,17 @@ class ModelDecisionService:
         if idx is not None:
             selected = candidates[idx]
             top_score = candidates[0].score
-            # 防止 LLM 选择分数远低于最优的候选
-            if top_score > 0 and selected.score < top_score * 0.8:
+            if top_score > 0 and selected.score < top_score * config.LLM_SCORE_FLOOR_RATIO:
                 self._logger.info(
-                    "LLM决策被拒(分数过低) driver=%s 选=%d/%d score=%.0f < 80%%*top=%.0f",
-                    driver_id, idx + 1, top_n, selected.score, top_score,
+                    "LLM决策被拒(分数过低) driver=%s 选=%d/%d score=%.0f < %.0f%%*top=%.0f",
+                    driver_id, idx + 1, top_n, selected.score,
+                    config.LLM_SCORE_FLOOR_RATIO * 100, top_score,
                 )
                 return None
             self._logger.info(
-                "LLM决策 driver=%s 选=%d/%d action=%s score=%.0f (top1=%s %.0f)",
+                "LLM决策 driver=%s 选=%d/%d action=%s score=%.0f (top1=%s %.0f) critical=%s",
                 driver_id, idx + 1, top_n, selected.action, selected.score,
-                candidates[0].action, candidates[0].score,
+                candidates[0].action, candidates[0].score, critical,
             )
             return selected
 
@@ -273,13 +468,39 @@ class ModelDecisionService:
             f"{memory.total_completed_orders}单"
         )
 
+        # 收入轨迹分析
+        avg_daily = memory.total_gross_income / max(1, memory.days_active_count()) if memory.days_active_count() > 0 else 0
+        target_pace = 300000 / 31
+        actual_pace = memory.total_gross_income / max(1, sim_day + 1)
+        pace_diff = actual_pace - target_pace
+        parts.append(f"日均:{avg_daily:.0f}元 节奏:{'+' if pace_diff >= 0 else ''}{pace_diff:.0f}元/天")
+
+        # 罚分累计
+        total_penalty = sum(memory.preference_penalty_accum.values())
+        if total_penalty > 0:
+            penalty_parts = []
+            for rule_id, amount in sorted(
+                memory.preference_penalty_accum.items(),
+                key=lambda kv: kv[1], reverse=True,
+            )[:3]:
+                penalty_parts.append(f"{rule_id}:{amount:.0f}")
+            parts.append(f"罚分:{total_penalty:.0f}元({','.join(penalty_parts)})")
+
         if rules.monthly_day_off is not None:
             req = rules.monthly_day_off.required_days or 0
-            done = max(0, sim_day + 1 - memory.days_active_count())
+            active_days = memory.days_active_count()
+            done = max(0, sim_day + 1 - active_days)
             deficit = max(0, req - done)
             parts.append(f"休息日:需{req}已{done}缺{deficit}")
             if deficit > 0 and days_remaining <= 5:
                 parts.append(f"⚠月末休息紧急:缺{deficit}天仅剩{days_remaining}天")
+
+        # 每日休息状态
+        for rest in rules.rest_rules:
+            today_rest = memory.longest_rest_today(ctx.current_minutes)
+            deficit = rest.required_minutes - today_rest
+            if deficit > 0:
+                parts.append(f"今日休息:已{today_rest}分 需{rest.required_minutes}分 缺{deficit}分")
 
         no_drive_info = []
         for w in rules.no_drive_windows:
@@ -287,12 +508,31 @@ class ModelDecisionService:
         if no_drive_info:
             parts.append(f"禁行:{','.join(no_drive_info[:2])}")
 
+        # 定时事件状态
+        for event in rules.timed_stay_events:
+            phase = scoring.timed_event_phase(event, memory, ctx)
+            if phase != "done" and phase != "early":
+                event_day = event.start_minutes // 1440
+                parts.append(f"家事:{phase} 第{event_day + 1}天 罚{event.absence_penalty_per_minute}元/分")
+
         if memory.consecutive_wait_count > 0:
             parts.append(f"连续等待{memory.consecutive_wait_count}次")
 
+        # 当日策略提示（仅显示优先级，不传递rest_today避免过度偏向休息）
+        strategy = memory.daily_strategy.get(sim_day)
+        if strategy:
+            priority = strategy.get("priority", "")
+            reason = str(strategy.get("reason", ""))[:40]
+            parts.append(f"今日策略:{priority} {reason}")
+
+        # 接单成功率
+        sr = memory.cargo_success_rate()
+        if sr < 1.0:
+            parts.append(f"接单成功率:{sr:.0%}")
+
         parts.append("")
         for i, c in enumerate(candidates):
-            top_bd = sorted(c.breakdown.items(), key=lambda kv: abs(kv[1]), reverse=True)[:4]
+            top_bd = sorted(c.breakdown.items(), key=lambda kv: abs(kv[1]), reverse=True)[:5]
             bd_str = " ".join(f"{k}={v:+.0f}" for k, v in top_bd)
             if c.action == "take_order":
                 cid = str(c.params.get("cargo_id", "?"))[:12]

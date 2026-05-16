@@ -100,6 +100,10 @@ class DriverMemory:
 
     timed_event_flags: set[str] = field(default_factory=set)
 
+    # LLM 每日策略：day_index -> 策略字典
+    daily_strategy: dict[int, dict[str, Any]] = field(default_factory=dict)
+    last_strategy_day: int = -1
+
     def update_token(self, delta: int) -> None:
         if delta > 0:
             self.token_used += int(delta)
