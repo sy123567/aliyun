@@ -34,12 +34,13 @@ _TOP_LOG_CANDIDATES = 5
 
 _DECISION_SYSTEM_PROMPT = (
     "你是货运调度优化AI。目标：最大化司机31天月度净收入（毛收入-偏好违规罚金）。\n"
+    "评分系统已综合计算收入、成本、偏好罚分等因素，分数越高越优。\n"
     "决策原则：\n"
-    "1. 优先选择收入高、空驶短的订单\n"
-    "2. 严格遵守禁行时段和距离限制，避免高额罚金\n"
-    "3. 月底前确保休息日天数达标，缺口大时主动安排休息\n"
-    "4. 夜间或货源稀缺时可适当等待\n"
-    "5. 考虑接单后的位置是否有利于后续接单\n"
+    "1. 通常选择评分最高的候选（编号1），除非有明确理由偏离\n"
+    "2. 当多个候选分数接近时（差距<20%），优先选偏好违规风险更低的\n"
+    "3. 月底休息日缺口>0时，优先安排休息（选[等]）\n"
+    "4. 禁行时段内优先等待，避免高额罚金\n"
+    "5. 不要选分数远低于最高分的候选\n"
     "仅回复最优候选编号（如：2），不要解释。"
 )
 
@@ -202,7 +203,7 @@ class ModelDecisionService:
         candidates = ranked[:top_n]
 
         # 评分系统已有明显最优时跳过 LLM（节省 token）
-        if top_n >= 2 and candidates[0].score > 0 and candidates[0].score > candidates[1].score * 3:
+        if top_n >= 2 and candidates[0].score > 0 and candidates[0].score > candidates[1].score * 1.5:
             return None
 
         prompt = self._build_decision_prompt(driver_id, memory, rules, ctx, candidates)
@@ -232,6 +233,14 @@ class ModelDecisionService:
         idx = self._parse_choice(content, top_n)
         if idx is not None:
             selected = candidates[idx]
+            top_score = candidates[0].score
+            # 防止 LLM 选择分数远低于最优的候选
+            if top_score > 0 and selected.score < top_score * 0.8:
+                self._logger.info(
+                    "LLM决策被拒(分数过低) driver=%s 选=%d/%d score=%.0f < 50%%*top=%.0f",
+                    driver_id, idx + 1, top_n, selected.score, top_score,
+                )
+                return None
             self._logger.info(
                 "LLM决策 driver=%s 选=%d/%d action=%s score=%.0f (top1=%s %.0f)",
                 driver_id, idx + 1, top_n, selected.action, selected.score,
@@ -269,6 +278,14 @@ class ModelDecisionService:
             done = max(0, sim_day + 1 - memory.days_active_count())
             deficit = max(0, req - done)
             parts.append(f"休息日:需{req}已{done}缺{deficit}")
+            if deficit > 0 and days_remaining <= 5:
+                parts.append(f"⚠月末休息紧急:缺{deficit}天仅剩{days_remaining}天")
+
+        no_drive_info = []
+        for w in rules.no_drive_windows:
+            no_drive_info.append(f"{w.start_minute // 60}:00-{w.end_minute // 60}:00罚{w.penalty_amount}元/天")
+        if no_drive_info:
+            parts.append(f"禁行:{','.join(no_drive_info[:2])}")
 
         if memory.consecutive_wait_count > 0:
             parts.append(f"连续等待{memory.consecutive_wait_count}次")

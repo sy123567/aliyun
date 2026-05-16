@@ -137,7 +137,6 @@ def _is_preference_near_violation(rules: ParsedRules, memory: DriverMemory) -> b
     if not memory.preference_penalty_accum:
         return False
     for entry in memory.preference_penalty_accum.values():
-        # 仅当某项累计 >= 1 万元时认为“即将违规”（penalty_cap 改造后补充更准确判断）。
         if entry >= 10_000.0:
             return True
     return False
