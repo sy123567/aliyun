@@ -270,9 +270,9 @@ MONTHLY_DAY_OFF_FORCE_REST_DAY = 25
 
 # ---------------- LLM 增强决策参数 ----------------
 
-LLM_SKIP_SCORE_RATIO = 1.3
+LLM_SKIP_SCORE_RATIO = 1.5
 """评分系统最优候选分数 > 次优 × 该倍率时跳过 LLM，节省 token。
-原值 1.5(PR#11)→1.3，让 LLM 参与更多决策。"""
+与 PR#11 保持一致，避免 LLM 过度参与导致覆盖评分系统的优质决策。"""
 
 LLM_SCORE_FLOOR_RATIO = 0.8
 """LLM 选择的候选分数不得低于最高分 × 该比率，防止灾难性覆盖。"""

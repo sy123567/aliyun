@@ -136,10 +136,8 @@ class ModelDecisionService:
         )
         ctx.visible_cargo_count = len(cargo_items)
 
-        # LLM 每日策略规划：在每天首次决策时生成策略，影响权重调整
-        strategy = self._ensure_daily_strategy(driver_id, memory, rules, ctx)
-        if strategy:
-            ctx.weights = scoring.apply_strategy_weights(ctx.weights, strategy)
+        # LLM 每日策略规划：在每天首次决策时生成策略（仅作为决策提示上下文，不修改评分权重）
+        self._ensure_daily_strategy(driver_id, memory, rules, ctx)
 
         order_candidates = self._build_order_candidates(cargo_items, rules, memory, ctx)
         has_good_order = any(c.feasible and c.score > 0 for c in order_candidates)
@@ -398,8 +396,8 @@ class ModelDecisionService:
 
         critical = self._is_critical_situation(memory, rules, ctx)
 
-        # 评分系统已有明显最优时跳过 LLM（节省 token），但关键时刻不跳过
-        if not critical and top_n >= 2 and candidates[0].score > 0:
+        # 评分系统已有明显最优时跳过 LLM（节省 token）
+        if top_n >= 2 and candidates[0].score > 0:
             if candidates[0].score > candidates[1].score * config.LLM_SKIP_SCORE_RATIO:
                 return None
 
