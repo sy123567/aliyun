@@ -151,6 +151,33 @@ def _apply_adaptive_weights(breakdown: dict[str, float], weights: config.Scoring
         breakdown[key] = breakdown[key] * getattr(weights, weight_name)
 
 
+def apply_strategy_weights(
+    weights: config.ScoringWeights,
+    strategy: dict[str, Any],
+) -> config.ScoringWeights:
+    """根据 LLM 每日策略输出返回微调后的新权重对象（frozen dataclass）。"""
+    scale_kwargs: dict[str, float] = {}
+    priority = str(strategy.get("priority", "")).lower()
+    adj = strategy.get("weight_adjustments")
+    if isinstance(adj, dict):
+        for field_name in ("income", "preference_risk", "time_cost"):
+            raw = adj.get(field_name)
+            if raw is not None:
+                try:
+                    factor = float(raw)
+                    factor = max(0.5, min(3.0, factor))
+                    scale_kwargs[field_name] = scale_kwargs.get(field_name, 1.0) * factor
+                except (TypeError, ValueError):
+                    pass
+    if priority == "rest":
+        scale_kwargs["preference_risk"] = scale_kwargs.get("preference_risk", 1.0) * config.LLM_STRATEGY_WEIGHT_REST_BOOST
+    elif priority == "income":
+        scale_kwargs["income"] = scale_kwargs.get("income", 1.0) * config.LLM_STRATEGY_WEIGHT_INCOME_BOOST
+    if scale_kwargs:
+        return weights.scaled(**scale_kwargs)
+    return weights
+
+
 # ---------------- 工具：偏好检查 ----------------
 
 
