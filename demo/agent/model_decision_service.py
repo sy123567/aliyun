@@ -237,7 +237,7 @@ class ModelDecisionService:
             # 防止 LLM 选择分数远低于最优的候选
             if top_score > 0 and selected.score < top_score * 0.8:
                 self._logger.info(
-                    "LLM决策被拒(分数过低) driver=%s 选=%d/%d score=%.0f < 50%%*top=%.0f",
+                    "LLM决策被拒(分数过低) driver=%s 选=%d/%d score=%.0f < 80%%*top=%.0f",
                     driver_id, idx + 1, top_n, selected.score, top_score,
                 )
                 return None
