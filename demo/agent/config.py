@@ -65,8 +65,8 @@ MIN_WAIT_FALLBACK_MINUTES = 30
 DEFAULT_REPOSITION_SPEED_KMH = 60.0
 """与仿真器一致的空驶速度（仅用于本地估算，真正速度以接口为准）。"""
 
-DEFAULT_OPPORTUNITY_COST_PER_MINUTE = 0.5
-"""时间机会成本基准：元/分钟，约合 30 元/小时。"""
+DEFAULT_OPPORTUNITY_COST_PER_MINUTE = 1.0
+"""时间机会成本基准：元/分钟（参数搜索优化：0.5→1.0）。"""
 
 HORIZON_OVERFLOW_PENALTY = 5_000.0
 """候选完成时间超过仿真上界时的惩罚分。"""
@@ -143,26 +143,26 @@ CARGO_SUCCESS_RATE_MIN_ATTEMPTS = 4
 CARGO_SUCCESS_RATE_FLOOR = 0.4
 """成功率折扣下限：即使长期失败也保留 40% 的预期收入，避免完全放弃接单。"""
 
-CARGO_FAILURE_ATTEMPT_COST_YUAN = 80.0
-"""单次 take_order 失败的固定隐性成本（10 分钟扫描 + 1 分钟尝试 + 重试机会损失）。"""
+CARGO_FAILURE_ATTEMPT_COST_YUAN = 40.0
+"""单次 take_order 失败的固定隐性成本（参数搜索优化：80→40元）。"""
 
-STAGNATION_WAIT_THRESHOLD = 3
-"""连续 wait 次数 > 该阈值后开始增长惩罚，迫使智能体尝试 reposition。"""
+STAGNATION_WAIT_THRESHOLD = 6
+"""连续 wait 次数 > 该阈值后开始增长惩罚（参数搜索优化：3→6）。"""
 
-STAGNATION_WAIT_PENALTY_PER_STEP = 120.0
-"""每多一次连续 wait 增加的额外惩罚（元）；与休息收益对冲。"""
+STAGNATION_WAIT_PENALTY_PER_STEP = 160.0
+"""每多一次连续 wait 增加的额外惩罚（参数搜索优化：120→160元）。"""
 
 STAGNATION_FAIL_PENALTY_PER_STEP = 60.0
 """每次连续 take_order 失败给后续 take_order 候选增加的额外悲观折扣。"""
 
-PICKUP_DEADHEAD_SOFT_THRESHOLD_KM = 20.0
-"""接单空驶距离软惩罚起点；超过则按距离差线性加罚，覆盖 80% 司机偏好上限。"""
+PICKUP_DEADHEAD_SOFT_THRESHOLD_KM = 35.0
+"""接单空驶距离软惩罚起点（参数搜索优化：20→35km）。"""
 
 PICKUP_DEADHEAD_HARD_THRESHOLD_KM = 50.0
 """接单空驶距离硬惩罚起点（原值），与软罚共同形成两段式罚函数。"""
 
-PICKUP_DEADHEAD_SOFT_COEFF = 0.5
-"""软空驶罚相对于行驶成本的折算系数（小于 1 避免与已有 distance_cost 重复计）。"""
+PICKUP_DEADHEAD_SOFT_COEFF = 1.0
+"""软空驶罚相对于行驶成本的折算系数（参数搜索优化：0.5→1.0）。"""
 
 HORIZON_OVERFLOW_INCOME_VOIDED = True
 """完工时间超过仿真上界时，是否清零收入项（与 ``income_eligible=false`` 仿真行为一致）。"""
@@ -172,7 +172,7 @@ PREFERRED_CARGO_APPROACH_WINDOW_MINUTES = 8 * 60
 PREFERRED_CARGO_GIVEUP_WINDOW_MINUTES = 6 * 60
 """熟货上架时间过后 N 分钟内仍未接到，则视为放弃，停止远距离追逐避免里程浪费。"""
 
-PREFERRED_CARGO_BONUS_MULTIPLIER = 1.2
+PREFERRED_CARGO_BONUS_MULTIPLIER = 1.3
 PREFERRED_CARGO_PREPOSITION_WINDOW_MINUTES = 48 * 60
 """熟货提前预定位窗口：扩大到48小时确保高价值熟货有充分预定位时间。"""
 PREFERRED_CARGO_ARRIVAL_BUFFER_MINUTES = 45
@@ -224,16 +224,14 @@ HOME_RULE_TARGET_GAIN_MULTIPLIER = 2.0
 HOME_RULE_REACHABILITY_MULTIPLIER = 2.0
 HOME_RULE_AWAY_WAIT_PENALTY_MULTIPLIER = 2.0
 
-HOME_RULE_AFTERNOON_BLOCK_HOUR = 14
-"""下午 N 点后且距家>200km 时开始阻拦新订单（D009 回家规则优化）。"""
+HOME_RULE_AFTERNOON_BLOCK_HOUR = 12
+"""下午 N 点后且距家>200km 时开始阻拦新订单（参数搜索优化：14→12点）。"""
 
 HOME_RULE_AFTERNOON_BLOCK_DISTANCE_KM = 200.0
 """下午阻拦距离阈值：超过此距离开始阻拦。"""
 NO_DRIVE_ACTIVE_PENALTY_MULTIPLIER = 2.0
-NO_DRIVE_SAFETY_BUFFER_MINUTES = 45
-"""安全裕量：订单/空驶预计完成时间 + 该值若触碰禁行窗则拒绝。保持 master 45 min 默认值。
-注：实验发现走高（60/90 min）+ 系数（1.10/1.15×）会过度收紧、导致 D003 凌晨 / D007 夜禁
-本可安全完成的订单也被拒，整体净收益反而下降；故保留 45 min 不动。"""
+NO_DRIVE_SAFETY_BUFFER_MINUTES = 30
+"""安全裕量：订单/空驶预计完成时间 + 该值若触碰禁行窗则拒绝（参数搜索优化：45→30min）。"""
 
 HAUL_TIME_OVERESTIMATE_RATIO = 1.0
 """haversine 估算的 haul/pickup 时间比真实仿真低估约 10–15% 的事实虽然存在，
@@ -249,8 +247,8 @@ D004 「中午 12–13 不接」单日罚金 ¥100（上限 ¥3,000）是典型�
 
 # ---------------- 月度休息日优化参数（第四/五/六轮） ----------------
 
-MONTHLY_DAY_OFF_SPACING_COEFF = 0.4
-"""月度休息日spacing惩罚系数（R4=0.3, R5=0.4温和增加）。"""
+MONTHLY_DAY_OFF_SPACING_COEFF = 0.8
+"""月度休息日spacing惩罚系数（参数搜索优化：0.4→0.8）。"""
 
 MONTHLY_DAY_OFF_MONTH_END_DAYS = 5
 """月末集中休息触发：剩余天数 ≤ 该值且deficit=1时，给予更高wait增益。"""
