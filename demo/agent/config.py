@@ -264,3 +264,30 @@ MONTHLY_DAY_OFF_LATE_MONTH_DAY = 20
 
 MONTHLY_DAY_OFF_FORCE_REST_DAY = 25
 """R6-P1: 强制休息检查日（0-indexed），day≥此值且deficit≥1时给极高wait增益。"""
+
+
+# ---------------- 接单策略优化参数 ----------------
+
+DEST_MARKET_QUALITY_RADIUS_KM = 80.0
+"""目的地货源市场评估半径：统计卸货点附近此范围内的货源密度和质量。"""
+
+DEST_MARKET_QUALITY_MAX_BONUS = 50.0
+"""目的地市场质量加成上限（元）。"""
+
+DEST_MARKET_QUALITY_MAX_PENALTY = 30.0
+"""目的地市场质量惩罚上限（元），当目的地附近无货时施加。"""
+
+HOMEWARD_BONUS_START_HOUR = 14
+"""下午N点后开始给予回家方向加成（仅对有home_rule的司机）。"""
+
+HOMEWARD_BONUS_MAX_YUAN = 80.0
+"""回家方向加成上限（元），按距离进展和时间紧迫度缩放。"""
+
+DYNAMIC_OPP_COST_MIN_DAYS = 3
+"""动态机会成本启用前的最小天数（避免早期数据不足）。"""
+
+DYNAMIC_OPP_COST_FLOOR = 0.7
+"""动态机会成本下限（元/分钟）。"""
+
+DYNAMIC_OPP_COST_CEIL = 1.5
+"""动态机会成本上限（元/分钟）。"""
