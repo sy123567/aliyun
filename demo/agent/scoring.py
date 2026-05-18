@@ -997,8 +997,13 @@ def build_wait_durations(rules: ParsedRules, ctx: DecisionContext, memory: Drive
         )
         if needs_off_today:
             long_durations.add(max(1, 1440 - cur_md))
-        elif cur_md <= 90:
-            durations.add(max(1, 24 * 60 - cur_md))
+        elif not today_already_active:
+            # V4: 当天尚未接单且有休息日缺口时，生成全天等待候选
+            # 仅当罚金>=4000元时才值得放弃一天收入来休息（D002=6000 适用）
+            days_off_deficit = days_off_required - days_off_so_far
+            penalty_amt = float(rules.monthly_day_off.penalty_amount or 3000.0)
+            if days_off_deficit > 0 and penalty_amt >= 4000:
+                long_durations.add(max(1, 1440 - cur_md))
     # 回家窗口或夜间禁行：休息至次日 6:00 / 8:00
     for window in rules.no_drive_windows:
         cur_md = geo_utils.minute_of_day(ctx.current_minutes)
@@ -1255,21 +1260,22 @@ def score_wait(
                 urgency = deficit_after_today_if_active / max(1, days_remaining + 1)
                 ideal_spacing = config.AGENT_HORIZON_DAYS / max(1, days_off_required)
                 proactive_rest = (past_off_days == 0 and sim_day >= ideal_spacing * 0.8)
-                if urgency >= 0.1 and duration_minutes >= 60:
+                if urgency >= 0.03 and duration_minutes >= 60:
                     cur_md_off = geo_utils.minute_of_day(ctx.current_minutes)
                     remaining_today = max(60, 1440 - cur_md_off)
                     base = float(rules.monthly_day_off.penalty_amount or 3000.0)
                     ratio = min(1.0, duration_minutes / float(remaining_today))
-                    coeff = min(1.0, urgency) * 1.0
+                    # V3: 提高最低系数以确保休息日增益能与接单收入竞争
+                    coeff = max(0.4, min(1.0, urgency)) * 1.5
                     if urgency >= 0.3:
-                        coeff = min(2.0, urgency) * 1.5
+                        coeff = min(2.0, urgency) * 2.0
                     pacing_gain = base * coeff * ratio
                     if pacing_gain > 0:
                         breakdown["monthly_day_off_pacing_gain"] = pacing_gain
                         note_parts.append(f"day_off_pacing(urg={urgency:.2f})")
                 elif proactive_rest and duration_minutes >= 60:
                     base = float(rules.monthly_day_off.penalty_amount or 3000.0)
-                    breakdown["monthly_day_off_pacing_gain"] = base * 0.4
+                    breakdown["monthly_day_off_pacing_gain"] = base * 0.6
                     note_parts.append("day_off_proactive")
                 # R5-P1: 月末集中休息增益——剩余≤5天且deficit=1时给更高增益
                 elif deficit_after_today_if_active == 1 and days_remaining <= config.MONTHLY_DAY_OFF_MONTH_END_DAYS and duration_minutes >= 60:
