@@ -363,7 +363,7 @@ def _eval_dest_market_quality(
                 total_yield += cell[1] * cell[0]
 
     if total_count == 0:
-        return -min(config.DEST_MARKET_QUALITY_MAX_PENALTY, config.DEST_MARKET_QUALITY_MAX_PENALTY)
+        return -config.DEST_MARKET_QUALITY_MAX_PENALTY
 
     avg_yield = total_yield / total_count
     if ctx.dest_market_avg_yield <= 0:
