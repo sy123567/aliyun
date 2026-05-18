@@ -997,8 +997,13 @@ def build_wait_durations(rules: ParsedRules, ctx: DecisionContext, memory: Drive
         )
         if needs_off_today:
             long_durations.add(max(1, 1440 - cur_md))
-        elif cur_md <= 90:
-            durations.add(max(1, 24 * 60 - cur_md))
+        elif not today_already_active:
+            # V4: 当天尚未接单且有休息日缺口时，生成全天等待候选
+            # 仅当罚金>=4000元时才值得放弃一天收入来休息（D002=6000 适用）
+            days_off_deficit = days_off_required - days_off_so_far
+            penalty_amt = float(rules.monthly_day_off.penalty_amount or 3000.0)
+            if days_off_deficit > 0 and penalty_amt >= 4000:
+                long_durations.add(max(1, 1440 - cur_md))
     # 回家窗口或夜间禁行：休息至次日 6:00 / 8:00
     for window in rules.no_drive_windows:
         cur_md = geo_utils.minute_of_day(ctx.current_minutes)
