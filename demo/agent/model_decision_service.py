@@ -213,16 +213,12 @@ class ModelDecisionService:
         top_n = min(5, len(ranked))
         candidates = ranked[:top_n]
 
-        # V3: 智能LLM调用门控——仅在LLM能产生价值时调用
+        # V4: LLM门控——评分明确时跳过，close/跨类型时调用
         if top_n >= 2:
-            # 门控1: 评分系统已有明显最优时跳过（5x阈值）
-            if candidates[0].score > 0 and candidates[0].score > candidates[1].score * 5.0:
+            score_diff = abs(candidates[0].score - candidates[1].score)
+            if candidates[0].score > 0 and candidates[0].score > candidates[1].score * 3.0:
                 return None
-            # 门控2: 前两名动作类型相同时跳过（LLM无法区分同类候选的细微差异）
-            if candidates[0].action == candidates[1].action:
-                return None
-            # 门控3: 绝对分差过小时跳过（差距<50元不值得LLM介入）
-            if abs(candidates[0].score - candidates[1].score) < 50:
+            if score_diff > 500:
                 return None
 
         prompt = self._build_decision_prompt(driver_id, memory, rules, ctx, candidates)
