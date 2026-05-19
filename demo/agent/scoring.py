@@ -753,25 +753,31 @@ def score_take_order(
         breakdown["avoid_category_penalty"] = -avoid_pen
         note_parts.append("avoid_category")
 
-    # 偏好：距离限制——超限即硬拦截
+    # 偏好：距离限制——硬性过滤 + 软惩罚
     pref_penalty = 0.0
     for limit in rules.distance_limits:
         if limit.kind == "haul" and haul_km > limit.max_km:
-            return ScoredAction(
-                action="take_order",
-                params={"cargo_id": cargo_id},
-                score=-HARD_CONSTRAINT_PENALTY,
-                feasible=False,
-                note=f"haul_distance_exceed_limit_{limit.max_km}km",
-            )
+            if haul_km > limit.max_km * 1.2:
+                return ScoredAction(
+                    action="take_order",
+                    params={"cargo_id": cargo_id},
+                    score=-HARD_CONSTRAINT_PENALTY,
+                    feasible=False,
+                    note=f"haul_distance_exceed_limit_{limit.max_km}km",
+                )
+            over_ratio = (haul_km - limit.max_km) / max(1.0, limit.max_km)
+            pref_penalty += float(limit.penalty_amount or 100.0) * (1.0 + over_ratio * 3.0)
         elif limit.kind == "pickup" and distance_pickup_km > limit.max_km:
-            return ScoredAction(
-                action="take_order",
-                params={"cargo_id": cargo_id},
-                score=-HARD_CONSTRAINT_PENALTY,
-                feasible=False,
-                note=f"pickup_deadhead_exceed_limit_{limit.max_km}km",
-            )
+            if distance_pickup_km > limit.max_km * 1.2:
+                return ScoredAction(
+                    action="take_order",
+                    params={"cargo_id": cargo_id},
+                    score=-HARD_CONSTRAINT_PENALTY,
+                    feasible=False,
+                    note=f"pickup_deadhead_exceed_limit_{limit.max_km}km",
+                )
+            over_ratio = (distance_pickup_km - limit.max_km) / max(1.0, limit.max_km)
+            pref_penalty += float(limit.penalty_amount or 100.0) * (1.0 + over_ratio * 3.0)
         elif limit.kind == "monthly_deadhead":
             # 月度空驶赶路上限：按「新增超额公里数 × 单价」计软惩罚，不硬阻拦。
             # 评测仅按累计 over_km × 单价（≈10 元/km）扣分；硬阻拦会让司机在累计稍超即停摆。
@@ -866,12 +872,8 @@ def score_take_order(
     # 偏好：首单时间
     if rules.first_order_rule is not None and memory.daily_orders_today(ctx.current_minutes) == 0:
         first_take_minute = geo_utils.minute_of_day(ctx.current_minutes)
-        deadline_min = rules.first_order_rule.before_hour * 60
-        unit = float(rules.first_order_rule.penalty_amount or 200.0)
-        if first_take_minute >= deadline_min:
-            breakdown["first_order_late_penalty"] = -unit * 3.0
-        elif first_take_minute >= deadline_min - 120:
-            breakdown["first_order_early_bonus"] = unit * 0.5
+        if first_take_minute >= rules.first_order_rule.before_hour * 60:
+            breakdown["first_order_late_penalty"] = -float(rules.first_order_rule.penalty_amount or 200.0)
 
     # 偏好：回家约束——接单可能错过回家窗
     if rules.home_rule is not None:
@@ -994,7 +996,8 @@ def score_take_order(
             remaining_after = 1440 - finish_md if not crosses_day else 0
             available_now = 1440 - cur_md
             unit = float(rest.penalty_amount or 200.0)
-            if available_now >= deficit and (crosses_day or remaining_after < deficit * 1.5):
+            if available_now >= deficit and (crosses_day or remaining_after < deficit):
+                # 接单前还可以完成 deficit，接单后不再可能 → 硬阻拦
                 return ScoredAction(
                     action="take_order",
                     params={"cargo_id": cargo_id},
@@ -1002,11 +1005,12 @@ def score_take_order(
                     feasible=False,
                     note="daily_rest_blocked",
                 )
-            if remaining_after < deficit * 2.0:
-                breakdown["daily_rest_risk_penalty"] = -unit * 4.0
+            if remaining_after < deficit * 1.3:
+                # 余量紧张：强软惩罚（覆盖单日上限）
+                breakdown["daily_rest_risk_penalty"] = -unit * 2.5
                 note_parts.append("rest_risk_tight")
-            elif remaining_after < deficit * 3.0:
-                breakdown["daily_rest_risk_penalty"] = -unit * 2.0
+            elif remaining_after < deficit * 2.0:
+                breakdown["daily_rest_risk_penalty"] = -unit * 1.0
                 note_parts.append("rest_risk")
 
     # 月度休息日：评测按 step_end 所在日判「成交接单活跃日」，所以此处需预估该订单 step_end 所落日。
@@ -1015,7 +1019,8 @@ def score_take_order(
         finish_day_str = geo_utils.date_str(max(0, finish_minutes - 1))
         projected_active = set(memory.daily_active)
         projected_active.add(finish_day_str)
-        max_active = config.AGENT_HORIZON_DAYS - rules.monthly_day_off.required_days
+        eval_horizon = min(config.AGENT_HORIZON_DAYS, 30)
+        max_active = eval_horizon - rules.monthly_day_off.required_days
         if len(projected_active) > max_active:
             return ScoredAction(
                 action="take_order",
@@ -1036,7 +1041,7 @@ def score_take_order(
             active_so_far_to = len(memory.daily_active)
             past_off_days_to = max(0, sim_day_to - active_so_far_to)
             deficit_after = R - past_off_days_to
-            days_left_after_today_to = max(0, config.AGENT_HORIZON_DAYS - 1 - sim_day_to)
+            days_left_after_today_to = max(0, eval_horizon - 1 - sim_day_to)
             if deficit_after > 0:
                 urgency = deficit_after / max(1, days_left_after_today_to + 1)
                 if urgency >= 0.5:
@@ -1061,7 +1066,7 @@ def score_take_order(
                         coeff *= 1.5
                     breakdown["monthly_day_off_urgency_penalty"] = -base_pen * coeff
                     note_parts.append(f"day_off_urgency(urg={urgency:.2f})")
-                ideal_spacing = config.AGENT_HORIZON_DAYS / max(1, R)
+                ideal_spacing = eval_horizon / max(1, R)
                 if past_off_days_to == 0 and sim_day_to >= ideal_spacing:
                     base_pen = float(rules.monthly_day_off.penalty_amount or 3000.0)
                     breakdown["monthly_day_off_spacing_penalty"] = -base_pen * config.MONTHLY_DAY_OFF_SPACING_COEFF
@@ -1079,7 +1084,7 @@ def score_take_order(
                 sim_day_to = ctx.current_minutes // 1440
                 active_so_far_to = len(memory.daily_active)
                 projected_active_count = active_so_far_to + 2
-                max_active_days = config.AGENT_HORIZON_DAYS - R
+                max_active_days = eval_horizon - R
                 if projected_active_count > max_active_days:
                     return ScoredAction(
                         action="take_order",
@@ -1147,11 +1152,12 @@ def build_wait_durations(rules: ParsedRules, ctx: DecisionContext, memory: Drive
         date_today = geo_utils.date_str(ctx.current_minutes)
         today_already_active = date_today in memory.daily_active
         active_so_far = memory.days_active_count()
-        max_active = config.AGENT_HORIZON_DAYS - rules.monthly_day_off.required_days
+        eval_horizon_bw = min(config.AGENT_HORIZON_DAYS, 30)
+        max_active = eval_horizon_bw - rules.monthly_day_off.required_days
         # 必须休息日：今日剩余分钟都加为超长 wait 候选，让 agent 一次性吃满整天。
         # 该检查依据「现有活跃日数 + 今日可能变为活跃」；仅在必须未活跃日时赋予超长 wait
         days_off_required = rules.monthly_day_off.required_days
-        days_remaining = max(0, config.AGENT_HORIZON_DAYS - 1 - ctx.current_minutes // 1440)
+        days_remaining = max(0, eval_horizon_bw - 1 - ctx.current_minutes // 1440)
         days_off_so_far = max(0, ctx.current_minutes // 1440 - active_so_far)
         needs_off_today = (
             not today_already_active
@@ -1167,7 +1173,7 @@ def build_wait_durations(rules: ParsedRules, ctx: DecisionContext, memory: Drive
             # 仅当罚金>=4000元时才值得放弃一天收入来休息（D002=6000 适用）
             days_off_deficit = days_off_required - days_off_so_far
             penalty_amt = float(rules.monthly_day_off.penalty_amount or 3000.0)
-            if days_off_deficit > 0 and penalty_amt >= 4000:
+            if days_off_deficit > 0 and penalty_amt >= 2500:
                 long_durations.add(max(1, 1440 - cur_md))
     # 回家窗口或夜间禁行：休息至次日 6:00 / 8:00
     for window in rules.no_drive_windows:
@@ -1248,12 +1254,14 @@ def score_wait(
             covered = min(duration_minutes, deficit)
             unit = float(rest.penalty_amount or 200.0)
             rest_gain += unit * (covered / max(1, deficit))
+            # P2: 长时间 wait 完全覆盖 deficit 时给予额外奖励，避免多次短wait代替一次长wait
             if duration_minutes >= deficit:
-                rest_gain += unit * 0.5
+                rest_gain += unit * 0.3
+            # 当天即将结束但仍未满足休息要求时，给予额外的紧急增益
             remaining_today = 1440 - cur_md
-            if remaining_today < deficit * 3 and duration_minutes >= deficit:
-                urgency = min(3.0, deficit / max(1, remaining_today - deficit))
-                rest_gain += unit * (1.0 + urgency * 1.0)
+            if remaining_today < deficit * 2 and duration_minutes >= deficit:
+                urgency = min(2.0, deficit / max(1, remaining_today - deficit))
+                rest_gain += unit * (0.5 + urgency * 0.5)
     if rest_gain > 0:
         breakdown["rest_preference_gain"] = rest_gain
         note_parts.append("rest_gain")
@@ -1394,10 +1402,11 @@ def score_wait(
         date_today = geo_utils.date_str(ctx.current_minutes)
         today_already_active = date_today in memory.daily_active
         active_so_far = memory.days_active_count()
-        max_active = config.AGENT_HORIZON_DAYS - rules.monthly_day_off.required_days
+        eval_horizon_w = min(config.AGENT_HORIZON_DAYS, 30)
+        max_active = eval_horizon_w - rules.monthly_day_off.required_days
         days_off_required = rules.monthly_day_off.required_days
         sim_day = (ctx.current_minutes // (24 * 60))
-        days_remaining = max(0, config.AGENT_HORIZON_DAYS - 1 - sim_day)
+        days_remaining = max(0, eval_horizon_w - 1 - sim_day)
         days_off_so_far = max(0, sim_day - active_so_far)
         needs_off_today = (
             not today_already_active
@@ -1421,7 +1430,7 @@ def score_wait(
             deficit_after_today_if_active = days_off_required - past_off_days
             if deficit_after_today_if_active > 0 and days_remaining >= 0:
                 urgency = deficit_after_today_if_active / max(1, days_remaining + 1)
-                ideal_spacing = config.AGENT_HORIZON_DAYS / max(1, days_off_required)
+                ideal_spacing = eval_horizon_w / max(1, days_off_required)
                 proactive_rest = (past_off_days == 0 and sim_day >= ideal_spacing * 0.8)
                 if urgency >= 0.03 and duration_minutes >= 60:
                     cur_md_off = geo_utils.minute_of_day(ctx.current_minutes)
@@ -1741,7 +1750,7 @@ def score_reposition(
         finish_day_str_repo = geo_utils.date_str(max(0, end_minutes - 1))
         projected_active_repo = set(memory.daily_active)
         projected_active_repo.add(finish_day_str_repo)
-        max_active_repo = config.AGENT_HORIZON_DAYS - rules.monthly_day_off.required_days
+        max_active_repo = min(config.AGENT_HORIZON_DAYS, 30) - rules.monthly_day_off.required_days
         if len(projected_active_repo) > max_active_repo:
             return ScoredAction(
                 action="reposition",
