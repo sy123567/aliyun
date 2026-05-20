@@ -46,6 +46,7 @@ def _apply_config_overrides(params: dict) -> None:
     scoring.HORIZON_OVERFLOW_PENALTY = config.HORIZON_OVERFLOW_PENALTY
     scoring.DEFAULT_REPOSITION_SPEED_KMH = config.DEFAULT_REPOSITION_SPEED_KMH
     scoring.HARD_CONSTRAINT_PENALTY = config.HARD_CONSTRAINT_PENALTY
+    config.EVALUATION_HORIZON_DAYS = min(config.AGENT_HORIZON_DAYS, 30)
 
     # 同步 driver_memory 模块级常量
     from agent import driver_memory
