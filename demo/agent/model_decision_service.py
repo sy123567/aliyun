@@ -107,16 +107,6 @@ class ModelDecisionService:
 
         self._update_hotspots(memory, cargo_items, sim_minutes)
 
-        # 动态机会成本：基于司机历史收益率和当前货源可见性自适应
-        ctx.opportunity_cost_per_minute = scoring.compute_dynamic_opportunity_cost(
-            memory, sim_minutes, len(cargo_items),
-        )
-
-        # 目的地货源市场质量预计算：2-step lookahead
-        dest_map, dest_avg = scoring.build_dest_market_map(cargo_items)
-        ctx.dest_market_map = dest_map
-        ctx.dest_market_avg_yield = dest_avg
-
         # 自适应权重（文档 8.4 节）：根据月末/夜间/稀缺/违规预警调位
         ctx.weights = scoring.resolve_adaptive_weights(
             rules=rules,
