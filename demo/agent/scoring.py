@@ -56,8 +56,6 @@ _WEIGHT_MAP: dict[str, str] = {
     "preferred_cargo_conflict_penalty": "preference_risk",
     "timed_event_approach_gain": "preference_risk",
     "daily_rest_risk_penalty": "preference_risk",
-    "dest_market_quality": "future_value",
-    "homeward_bonus": "preference_risk",
 }
 
 
@@ -91,9 +89,6 @@ class DecisionContext:
     opportunity_cost_per_minute: float = DEFAULT_OPPORTUNITY_COST_PER_MINUTE
     weights: config.ScoringWeights = config.DEFAULT_WEIGHTS
     visible_cargo_count: int = 0
-    # 目的地货源市场质量预计算：grid_key -> (cargo_count, avg_yield)
-    dest_market_map: dict[tuple[int, int], tuple[int, float]] = field(default_factory=dict)
-    dest_market_avg_yield: float = 0.0
 
 
 # ---------------- 自适应权重 ----------------
@@ -298,149 +293,6 @@ def _project_rule_to_minutes(day_start: int, rule_start: int, rule_end: int) -> 
     end_today = day_start + 24 * 60
     second_end = day_start + 24 * 60 + (rule_end - 24 * 60)
     return [(day_start + rule_start, end_today), (end_today, second_end)]
-
-
-# ---------------- 接单策略辅助函数 ----------------
-
-
-def build_dest_market_map(
-    cargo_items: list[dict[str, Any]],
-) -> tuple[dict[tuple[int, int], tuple[int, float]], float]:
-    """从实时货源列表构建目的地市场质量地图。
-
-    扫描所有货源的装货点（origin），按网格聚合货源数量和平均收益率（yuan/min）。
-    用于评估：若接某单送达到某区域，该区域下一步能接到什么质量的货。
-
-    Returns:
-        (grid_map, overall_avg_yield)
-        grid_map: {grid_key: (cargo_count, avg_yuan_per_min)}
-        overall_avg_yield: 全部货源的平均 yuan/min
-    """
-    grid_agg: dict[tuple[int, int], list[float]] = {}
-    all_yields: list[float] = []
-    for item in cargo_items:
-        cargo = item.get("cargo") or {}
-        start = cargo.get("start") or {}
-        try:
-            lat = float(start["lat"])
-            lng = float(start["lng"])
-        except (KeyError, TypeError, ValueError):
-            continue
-        price = float(cargo.get("price") or 0.0)
-        minutes = max(1, int(cargo.get("cost_time_minutes") or 60))
-        if price <= 0:
-            continue
-        yield_val = price / minutes
-        key = geo_utils.grid_key(lat, lng)
-        grid_agg.setdefault(key, []).append(yield_val)
-        all_yields.append(yield_val)
-
-    if not all_yields:
-        return {}, 0.0
-
-    overall_avg = sum(all_yields) / len(all_yields)
-    grid_map: dict[tuple[int, int], tuple[int, float]] = {}
-    for key, yields in grid_agg.items():
-        grid_map[key] = (len(yields), sum(yields) / len(yields))
-    return grid_map, overall_avg
-
-
-def _eval_dest_market_quality(
-    dest_key: tuple[int, int],
-    ctx: "DecisionContext",
-) -> float:
-    """评估目的地附近的货源市场质量，返回加成/惩罚值。
-
-    查找目的地 9 宫格内的货源密度和平均收益率，与全局平均比较。
-    """
-    total_count = 0
-    total_yield = 0.0
-    for di in (-1, 0, 1):
-        for dj in (-1, 0, 1):
-            cell = ctx.dest_market_map.get((dest_key[0] + di, dest_key[1] + dj))
-            if cell is not None:
-                total_count += cell[0]
-                total_yield += cell[1] * cell[0]
-
-    if total_count == 0:
-        return -config.DEST_MARKET_QUALITY_MAX_PENALTY
-
-    avg_yield = total_yield / total_count
-    if ctx.dest_market_avg_yield <= 0:
-        return 0.0
-
-    ratio = avg_yield / ctx.dest_market_avg_yield
-    if ratio > 1.0:
-        return min(config.DEST_MARKET_QUALITY_MAX_BONUS, (ratio - 1.0) * config.DEST_MARKET_QUALITY_MAX_BONUS * 2)
-    elif ratio < 0.8:
-        return -min(config.DEST_MARKET_QUALITY_MAX_PENALTY, (0.8 - ratio) * config.DEST_MARKET_QUALITY_MAX_PENALTY * 3)
-    return 0.0
-
-
-def _calc_homeward_bonus(
-    cur_lat: float, cur_lng: float,
-    end_lat: float, end_lng: float,
-    home_rule: "HomeRule",
-    current_minutes: int,
-) -> float:
-    """计算回家方向加成：下午时段奖励朝家方向的订单。
-
-    加成 = min(MAX, homeward_progress_km * time_factor * penalty_factor)
-    - homeward_progress_km: 卸货点比当前位置更靠近家的距离(km)
-    - time_factor: 从 HOMEWARD_BONUS_START_HOUR 线性递增到 1.0 (at 22:00)
-    - penalty_factor: 按 home_rule.penalty_amount 缩放
-    """
-    hour = geo_utils.hour_of_day(current_minutes)
-    if hour < config.HOMEWARD_BONUS_START_HOUR:
-        return 0.0
-
-    cur_dist_home = geo_utils.haversine_km(cur_lat, cur_lng, home_rule.lat, home_rule.lng)
-    end_dist_home = geo_utils.haversine_km(end_lat, end_lng, home_rule.lat, home_rule.lng)
-    homeward_progress = cur_dist_home - end_dist_home
-
-    if homeward_progress <= 0:
-        return 0.0
-
-    time_factor = min(1.0, (hour - config.HOMEWARD_BONUS_START_HOUR) / 8.0)
-    penalty_factor = min(1.0, float(home_rule.penalty_amount or 600) / 600.0)
-
-    bonus = homeward_progress * 0.3 * time_factor * penalty_factor
-    return min(config.HOMEWARD_BONUS_MAX_YUAN, bonus)
-
-
-def compute_dynamic_opportunity_cost(
-    memory: "DriverMemory",
-    current_minutes: int,
-    visible_cargo_count: int,
-) -> float:
-    """根据司机历史收益率和当前货源可见性动态计算机会成本。
-
-    逻辑：
-    1. 前 N 天使用默认值（数据不足）
-    2. 之后基于日均收入/工作分钟数计算实际收益率
-    3. 用货源可见性修正：货多时偏高，货少时偏低
-    4. 结果裁剪到 [FLOOR, CEIL] 范围
-    """
-    sim_day = current_minutes // 1440
-    if sim_day < config.DYNAMIC_OPP_COST_MIN_DAYS:
-        return config.DEFAULT_OPPORTUNITY_COST_PER_MINUTE
-
-    active_days = memory.days_active_count()
-    if active_days <= 0:
-        return config.DEFAULT_OPPORTUNITY_COST_PER_MINUTE
-
-    avg_daily_income = memory.total_gross_income / active_days
-    work_minutes_per_day = 14 * 60
-    base_rate = avg_daily_income / work_minutes_per_day
-
-    cargo_factor = 1.0
-    if visible_cargo_count >= 30:
-        cargo_factor = 1.1
-    elif visible_cargo_count < 5:
-        cargo_factor = 0.8
-
-    dynamic_cost = base_rate * cargo_factor
-    return max(config.DYNAMIC_OPP_COST_FLOOR, min(config.DYNAMIC_OPP_COST_CEIL, dynamic_cost))
 
 
 # ---------------- 接单评分 ----------------
@@ -1102,27 +954,6 @@ def score_take_order(
     ) * horizon_minutes_ahead
     if future_value > 0:
         breakdown["future_location_value"] = future_value
-
-    # 目的地货源市场质量：基于实时货源列表的 2-step lookahead
-    if ctx.dest_market_map:
-        dest_key = geo_utils.grid_key(end_lat, end_lng)
-        dest_quality = _eval_dest_market_quality(dest_key, ctx)
-        if dest_quality != 0.0:
-            breakdown["dest_market_quality"] = dest_quality
-            if dest_quality > 0:
-                note_parts.append("dest_rich")
-            else:
-                note_parts.append("dest_poor")
-
-    # 回家方向加成：下午时段对有 home_rule 的司机，奖励朝家方向的订单
-    if rules.home_rule is not None:
-        homeward_bonus = _calc_homeward_bonus(
-            ctx.current_lat, ctx.current_lng, end_lat, end_lng,
-            rules.home_rule, ctx.current_minutes,
-        )
-        if homeward_bonus > 0:
-            breakdown["homeward_bonus"] = homeward_bonus
-            note_parts.append("homeward")
 
     _apply_adaptive_weights(breakdown, ctx.weights)
     score = sum(breakdown.values())
