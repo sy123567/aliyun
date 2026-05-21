@@ -188,6 +188,11 @@ class DriverMemory:
 
         elapsed = int(record.get("step_elapsed_minutes", 0))
         action_exec = int(record.get("action_exec_cost_minutes", elapsed))
+        # 动作起始绝对分钟（用于跨日归属）。take_order/reposition 的 action_start 是
+        # query_scan 之后的真实驾驶开始时刻；评测脚本以 [action_start, action_end] 跨过的
+        # 每个自然日都计入「活跃日」（_active_minutes_by_day）。
+        action_start_minutes = max(0, sim_minutes_after - action_exec)
+        date_action_start = geo_utils.date_str(action_start_minutes)
 
         if action_name == "take_order":
             accepted = bool(result.get("accepted", False))
@@ -197,21 +202,24 @@ class DriverMemory:
             if accepted:
                 self.cargo_success_count += 1
                 self.consecutive_failed_take_orders = 0
-                self.daily_orders[date_today] += 1
-                self.daily_active.add(date_today)
+                # 评测「日订单计数」与「首单时间」以 action_start 所在日为准；跨午夜的
+                # 长单（如 23:50 接单 03:00 卸车）只算开工那天，而不是落货那天。
+                self.daily_orders[date_action_start] += 1
+                self._mark_active_days(action_start_minutes, sim_minutes_after)
                 self.total_completed_orders += 1
                 self.total_haul_km += float(result.get("haul_distance_km", 0.0) or 0.0)
                 self.total_deadhead_km += float(result.get("pickup_deadhead_km", 0.0) or 0.0)
-                if date_today not in self.daily_first_take_minute_of_day:
-                    minute_at_start = max(0, sim_minutes_after - action_exec)
-                    self.daily_first_take_minute_of_day[date_today] = geo_utils.minute_of_day(minute_at_start)
+                if date_action_start not in self.daily_first_take_minute_of_day:
+                    self.daily_first_take_minute_of_day[date_action_start] = geo_utils.minute_of_day(
+                        action_start_minutes
+                    )
             else:
                 # 接单失败（cargo_id 已失效等）：累计连续失败供 take_order 评分避让
                 self.consecutive_failed_take_orders += 1
             self.pending_rest_streak_minutes = 0
             self.pending_rest_streak_date = date_today
         elif action_name == "reposition":
-            self.daily_active.add(date_today)
+            self._mark_active_days(action_start_minutes, sim_minutes_after)
             self.total_deadhead_km += float(result.get("distance_km", 0.0) or 0.0)
             self.consecutive_wait_count = 0  # 空驶打断停滞
             self.consecutive_failed_take_orders = 0  # 位置变了，失败史失效
@@ -224,6 +232,23 @@ class DriverMemory:
             self.consecutive_wait_count += 1
         else:
             return
+
+    def _mark_active_days(self, action_start_minutes: int, action_end_minutes: int) -> None:
+        """将 [action_start, action_end] 跨过的每个自然日均加入 daily_active。
+
+        评测脚本 ``_active_minutes_by_day`` 会把动作横跨的每个自然日都计为活跃；
+        agent 仅记录落货日会让月度休息日预算偏乐观（典型场景：跨午夜的长单让
+        agent 以为「次日还没活跃」从而错失实际已被评测计入的休息额度）。
+        """
+        if action_end_minutes <= action_start_minutes:
+            self.daily_active.add(geo_utils.date_str(action_start_minutes))
+            return
+        cursor = action_start_minutes
+        while cursor < action_end_minutes:
+            day_idx = cursor // 1440
+            next_day_start = (day_idx + 1) * 1440
+            self.daily_active.add(geo_utils.date_str(cursor))
+            cursor = next_day_start
 
     def _extend_rest_streak(self, date_today: str, duration_minutes: int) -> None:
         if duration_minutes <= 0:
