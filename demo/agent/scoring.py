@@ -173,12 +173,16 @@ def preferred_cargo_ready(rule: PreferredCargoRule, current_minutes: int) -> boo
 def preferred_cargo_preposition_ready(rule: PreferredCargoRule, current_minutes: int) -> bool:
     if rule.available_minutes is None:
         return True
-    # 高价值熟货(>=5000)放宽预定位和放弃窗口
+    # 高价值熟货(>=5000)：预定位窗收紧到 12h。
+    # 老版本的 72h 让 D009 司机 2 天前就开始向 ¥10000 熟货点跑，过夜在外吃 ¥900 回家罚。
+    # 12h 配合 23-08 的 no_drive_window：日 D−1 20:43 还不开窗，日 D 02:43 开窗时
+    # 司机正在 no_drive，须等到 08:00 才能出发；190km 行程 + 缓冲足以在上架时间前抵达。
+    # 仅适用于 ≥5000 元的硬重单；普通熟货沿用 48h 默认。
     preposition_window = config.PREFERRED_CARGO_PREPOSITION_WINDOW_MINUTES
     giveup_window = config.PREFERRED_CARGO_GIVEUP_WINDOW_MINUTES
     if rule.penalty_amount and rule.penalty_amount >= 5000:
-        preposition_window = max(preposition_window, 72 * 60)   # 72小时预定位
-        giveup_window = max(giveup_window, 12 * 60)              # 12小时放弃窗口
+        preposition_window = 12 * 60                           # 12 小时预定位（原 72h）
+        giveup_window = max(giveup_window, 12 * 60)            # 12 小时放弃窗口
     lower = rule.available_minutes - preposition_window
     upper = rule.available_minutes + giveup_window
     return lower <= current_minutes <= upper
@@ -887,6 +891,9 @@ def score_take_order(
     # B.1 月度休息日 urgency 软惩罚：当下还没碰硬阈值，但若把今天「烧成」活跃日
         # 后续 pigeonhole 越来越紧 → 给本单一个递增软惩罚，鼓励在 wait/reposition 之间
         # 做更优选择（典型：D002 月末缺 1 天 ¥6k）。
+        # NOTE: PR#21 把上方硬阻拦改成「跨天逐日 add」时，原本一次性算出的 finish_day_str
+        # 被一起删掉，但下面的 B.1 软惩罚仍要用「订单落货那天」做判断，故在此重新计算。
+        finish_day_str = geo_utils.date_str(max(0, finish_minutes - 1))
         today_str = geo_utils.date_str(ctx.current_minutes)
         today_already_active_to = today_str in memory.daily_active
         finishes_today = finish_day_str == today_str
@@ -1458,6 +1465,26 @@ def score_reposition(
                 wait_gap = max(0, preferred.available_minutes - arrival_minutes)
                 if wait_gap > config.PREFERRED_CARGO_MAX_WAIT_MINUTES:
                     gain *= 0.5
+                # 非必要的过夜外宿压制：
+                #   司机有 home_rule、目标远离家圈、抵达后当晚无法在 home_by_hour 前返家、
+                #   且货上架仍距当下 > 12h —— 则压低预定位增益，避免抢跑 1-2 天导致重复
+                #   home_rule 罚（典型如 D009 走 ¥10000 熟货抢早一天就丢 ¥900 回家罚）。
+                if (
+                    rules.home_rule is not None
+                    and not _is_in_circle(target_lat, target_lng, rules.home_rule)
+                ):
+                    dist_target_to_home = geo_utils.haversine_km(
+                        target_lat, target_lng, rules.home_rule.lat, rules.home_rule.lng
+                    )
+                    return_minutes = geo_utils.distance_to_minutes(
+                        dist_target_to_home, ctx.reposition_speed_km_per_hour
+                    )
+                    end_day_today = arrival_minutes // 1440
+                    home_by_min_today = end_day_today * 1440 + rules.home_rule.home_by_hour * 60
+                    time_to_cargo = preferred.available_minutes - ctx.current_minutes
+                    if arrival_minutes + return_minutes > home_by_min_today and time_to_cargo > 12 * 60:
+                        gain *= 0.1
+                        note_parts.append("preferred_cargo_defer_overnight")
             breakdown["preferred_cargo_position_gain"] = gain
             note_parts.append("preferred_cargo_target")
 
