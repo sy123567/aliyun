@@ -30,6 +30,9 @@ def _resolve_agent_horizon_days() -> int:
 AGENT_HORIZON_DAYS = _resolve_agent_horizon_days()
 """智能体内部假设的仿真总天数；默认 31 天。本地测试可通过环境变量 ``AGENT_HORIZON_DAYS=1`` 等覆盖。"""
 
+EVALUATION_HORIZON_DAYS = min(AGENT_HORIZON_DAYS, 30)
+"""收益评测对月度偏好只统计的天数窗口。"""
+
 AGENT_HORIZON_MINUTES = AGENT_HORIZON_DAYS * 24 * 60
 """智能体假设的仿真上界（分钟），用于 score_take_order 的 income_eligible 预判。"""
 

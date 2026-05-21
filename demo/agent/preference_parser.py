@@ -30,9 +30,9 @@ _NUM_PATTERN = re.compile(r"(\d+(?:\.\d+)?)")
 # 主要为了覆盖 D004 的「中午 12 点至下午 1 点」这种跨中午、依赖上/下午标记才能正确解析的表达。
 # 原版只拍「数字 + 点/时」，会把「下午 1 点」当作 1 点，导致 D004 每天出一次 12-13 违规、全月 ¥3,000。
 _HOUR_RANGE_PATTERN = re.compile(
-    r"(上午|中午|下午|晚上|凌晨|早上)?\s*(\d{1,2})\s*(?:点|时|:00)?\s*"
+    r"(上午|中午|下午|晚上|晚|凌晨|早上|早)?\s*(\d{1,2})\s*(?:点|时|:00)?\s*"
     r"(?:至|到|-|~|—)\s*"
-    r"(?:次日\s*)?(上午|中午|下午|晚上|凌晨|早上)?\s*(\d{1,2})\s*(?:点|时|:00)?"
+    r"(?:次日\s*)?(上午|中午|下午|晚上|晚|凌晨|早上|早)?\s*(\d{1,2})\s*(?:点|时|:00)?"
 )
 _LATLNG_PATTERN = re.compile(r"[（(]\s*(\d{1,3}(?:\.\d+)?)\s*[，,]\s*(\d{1,3}(?:\.\d+)?)\s*[)）]")
 _WALL_TIME_ZH_PATTERN = re.compile(r"(\d{4})年(\d{1,2})月(\d{1,2})日\s*(\d{1,2})(?::|点)(\d{2})?")
@@ -244,7 +244,7 @@ def _convert_period_hour(period: str | None, hour: int) -> int:
 
     例：下午 1 点 -> 13，晚上 11 点 -> 23。「中午 12」 / 「凌晨 12」 保持 12 / 0。
     """
-    if period in ("下午", "晚上"):
+    if period in ("下午", "晚上", "晚"):
         if 1 <= hour <= 11:
             return hour + 12
         return hour  # 12 点 / 超过 12 不变
@@ -255,7 +255,7 @@ def _convert_period_hour(period: str | None, hour: int) -> int:
     if period == "中午":
         # 「中午 11/12/13 点」保持原值，避免过度修正。
         return hour
-    if period in ("上午", "早上"):
+    if period in ("上午", "早上", "早"):
         if hour == 12:
             return 0
         return hour
@@ -407,11 +407,11 @@ def _try_parse_single(item: dict[str, Any], rules: ParsedRules) -> bool:
         return True
 
     # 3. 每日连续休息 N 小时 / 分钟
-    if ("休息" in content or "歇" in content or "停车" in content) and "每天" in content:
+    if ("休息" in content or "歇" in content or "停车" in content) and ("每天" in content or "每晚" in content):
+        is_no_drive_context = "不接单" in content
         rng = _extract_hour_range(content)
         nums = _extract_numbers(content)
         created = False
-        # 如果文本同时包含时间范围，也生成 no_drive_window，防止休息规则"吞掉"禁行窗
         if rng is not None:
             start_hour, end_hour = rng
             start_min = start_hour * 60
@@ -427,15 +427,15 @@ def _try_parse_single(item: dict[str, Any], rules: ParsedRules) -> bool:
                     penalty_cap=penalty_cap,
                 )
             )
-            # 休息时长用窗口长度而非文本第一个数字（避免把"23"当成23小时）
-            window_minutes = end_min - start_min
-            rules.rest_rules.append(
-                RestRule(
-                    required_minutes=window_minutes,
-                    penalty_amount=penalty_amount,
-                    penalty_cap=penalty_cap,
+            if not is_no_drive_context:
+                window_minutes = end_min - start_min
+                rules.rest_rules.append(
+                    RestRule(
+                        required_minutes=window_minutes,
+                        penalty_amount=penalty_amount,
+                        penalty_cap=penalty_cap,
+                    )
                 )
-            )
             created = True
         elif nums:
             value = nums[0]
