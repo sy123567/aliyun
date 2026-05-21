@@ -751,6 +751,34 @@ def parse_preferences(
             rules.unparsed.append(item)
             rules.parse_failure_count += 1
 
+    # 阶段 3：home_rule → no_drive_window 强制补全。
+    # LLM 偶尔会只产出 home_rule 而漏掉对应的 no_drive_window（即「23 点到家 + 23-08 不接不空跑」拆
+    # 成两条规则只输出第一条），导致 score_take_order 的禁行硬阻拦失效，agent 半夜接到 ¥4 万大单。
+    # 安全网：若 home_rule 存在且 penalty 超过软阈值，但 rules.no_drive_windows 里没有覆盖该
+    # 时段的窗口，则在此补建一个。
+    if rules.home_rule is not None and rules.home_rule.penalty_amount:
+        hb = rules.home_rule.home_by_hour
+        nu = rules.home_rule.no_drive_until_hour
+        if hb is not None and nu is not None and hb != nu:
+            sm = hb * 60
+            em = nu * 60
+            if nu <= hb:
+                em = (nu + 24) * 60
+            already = any(
+                w.start_minute == sm and w.end_minute == em
+                for w in rules.no_drive_windows
+            )
+            if not already:
+                rules.no_drive_windows.append(
+                    TimeWindowRule(
+                        start_minute=sm,
+                        end_minute=em,
+                        raw="(synthesized from home_rule)",
+                        penalty_amount=rules.home_rule.penalty_amount,
+                        penalty_cap=rules.home_rule.penalty_cap or 0.0,
+                    )
+                )
+
     return rules
 
 

@@ -728,14 +728,8 @@ def score_take_order(
     # 偏好：首单时间
     if rules.first_order_rule is not None and memory.daily_orders_today(ctx.current_minutes) == 0:
         first_take_minute = geo_utils.minute_of_day(ctx.current_minutes)
-        deadline_md = rules.first_order_rule.before_hour * 60
-        unit_penalty = float(rules.first_order_rule.penalty_amount or 200.0)
-        if first_take_minute >= deadline_md:
-            breakdown["first_order_late_penalty"] = -unit_penalty
-        elif first_take_minute >= deadline_md - 120:
-            # 接近截止 2 小时内的"首单"加小额奖励，鼓励接受次优订单避免 ¥200 晚单罚。
-            # 仅在 [deadline-2h, deadline) 触发以避免一大早就抢劣质单。
-            breakdown["first_order_early_bonus"] = unit_penalty * 0.4
+        if first_take_minute >= rules.first_order_rule.before_hour * 60:
+            breakdown["first_order_late_penalty"] = -float(rules.first_order_rule.penalty_amount or 200.0)
 
     # 偏好：回家约束——接单可能错过回家窗
     if rules.home_rule is not None:
@@ -897,6 +891,9 @@ def score_take_order(
     # B.1 月度休息日 urgency 软惩罚：当下还没碰硬阈值，但若把今天「烧成」活跃日
         # 后续 pigeonhole 越来越紧 → 给本单一个递增软惩罚，鼓励在 wait/reposition 之间
         # 做更优选择（典型：D002 月末缺 1 天 ¥6k）。
+        # NOTE: PR#21 把上方硬阻拦改成「跨天逐日 add」时，原本一次性算出的 finish_day_str
+        # 被一起删掉，但下面的 B.1 软惩罚仍要用「订单落货那天」做判断，故在此重新计算。
+        finish_day_str = geo_utils.date_str(max(0, finish_minutes - 1))
         today_str = geo_utils.date_str(ctx.current_minutes)
         today_already_active_to = today_str in memory.daily_active
         finishes_today = finish_day_str == today_str
