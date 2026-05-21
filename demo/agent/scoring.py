@@ -133,11 +133,30 @@ def resolve_adaptive_weights(
 
 
 def _is_preference_near_violation(rules: ParsedRules, memory: DriverMemory) -> bool:
-    """检测是否接近 penalty_cap 阈值，应提高偏好风险权重。"""
+    """检测是否接近 penalty_cap 阈值，应提高偏好风险权重。
+
+    PR#21/22 经验：硬编码 10,000 阈值无法适应不同司机的 penalty_cap 差异。
+    改为收集所有规则的 penalty_cap，当任一累计罚金达到对应 cap 的 85% 时触发。
+    """
     if not memory.preference_penalty_accum:
         return False
-    for entry in memory.preference_penalty_accum.values():
-        if entry >= 10_000.0:
+    caps: dict[str, float] = {}
+    for limit in rules.distance_limits:
+        if limit.penalty_cap is not None and limit.penalty_cap > 0:
+            caps[f"dist_{limit.kind}"] = float(limit.penalty_cap)
+    if rules.monthly_day_off is not None and rules.monthly_day_off.penalty_cap is not None:
+        caps["monthly_day_off"] = float(rules.monthly_day_off.penalty_cap)
+    if rules.home_rule is not None and rules.home_rule.penalty_cap is not None:
+        caps["home_rule"] = float(rules.home_rule.penalty_cap)
+    for window in rules.no_drive_windows:
+        if window.penalty_cap is not None and window.penalty_cap > 0:
+            caps[f"nodrive_{window.start_minute}"] = float(window.penalty_cap)
+    for rule_id, accum in memory.preference_penalty_accum.items():
+        cap = caps.get(rule_id)
+        if cap is not None and cap > 0:
+            if accum >= cap * config.PREF_RISK_NEAR_VIOLATION_RATIO:
+                return True
+        elif accum >= 10_000.0:
             return True
     return False
 
@@ -1038,6 +1057,16 @@ def build_wait_durations(rules: ParsedRules, ctx: DecisionContext, memory: Drive
                 durations.add(min(deficit, remaining_today))
             # 同时保留全额 deficit 时长供夜间休息用
             durations.add(max(deficit, 30))
+    # 首单截止前生成唤醒候选：避免 wait 跨过 first_order deadline 而吃到晚单罚
+    if rules.first_order_rule is not None:
+        cur_md = geo_utils.minute_of_day(ctx.current_minutes)
+        deadline_md = rules.first_order_rule.before_hour * 60
+        if cur_md < deadline_md:
+            gap = deadline_md - cur_md
+            if gap > 30:
+                durations.add(gap - 30)
+            if gap > 60:
+                durations.add(gap - 60)
     if rules.home_rule is not None:
         cur_md = geo_utils.minute_of_day(ctx.current_minutes)
         target = rules.home_rule.no_drive_until_hour * 60
@@ -1170,6 +1199,19 @@ def score_wait(
     if preferred_wait_gain > 0:
         breakdown["preferred_cargo_wait_gain"] = preferred_wait_gain
         note_parts.append("preferred_cargo_wait")
+
+    # 首单截止时间感知：wait 跨过 first_order deadline 时施加软惩罚
+    # PR#22 经验：固定+¥80 激励被回退，改为在 wait 侧惩罚——让长 wait 相对短 wait 更贵，
+    # 从而间接鼓励在截止前接单（若有可接单的话）。
+    if rules.first_order_rule is not None and memory.daily_orders_today(ctx.current_minutes) == 0:
+        cur_md_fo = geo_utils.minute_of_day(ctx.current_minutes)
+        deadline_fo = rules.first_order_rule.before_hour * 60
+        end_md_fo = geo_utils.minute_of_day(end_minutes)
+        crosses_day_fo = end_minutes // 1440 > ctx.current_minutes // 1440
+        if cur_md_fo < deadline_fo and (end_md_fo >= deadline_fo or crosses_day_fo):
+            fo_penalty = float(rules.first_order_rule.penalty_amount or 200.0)
+            breakdown["first_order_deadline_wait_penalty"] = -fo_penalty * 0.5
+            note_parts.append("first_order_wait_cross")
 
     # 机会成本
     if has_good_order:
@@ -1390,13 +1432,21 @@ def score_reposition(
     breakdown["reposition_time_cost"] = -ctx.opportunity_cost_per_minute * minutes
 
     end_minutes = ctx.current_minutes + minutes
-    # 空驶同样受禁行窗约束：任何重叠都视为当天违规
+    # 空驶同样受禁行窗约束（PR#22 经验：与 take_order 对齐软/硬分离逻辑）
     # 回家空驶允许穿越 home_rule 自身的禁出窗（司机必须赶回家）
     target_is_home = (
         rules.home_rule is not None
         and _is_in_circle(target_lat, target_lng, rules.home_rule)
     )
     for window in rules.no_drive_windows:
+        window_penalty = float(window.penalty_amount or 0.0)
+        is_soft_window = 0 < window_penalty <= config.NO_DRIVE_SOFT_PENALTY_THRESHOLD
+        if is_soft_window:
+            real_overlap = _hits_no_drive_window(ctx.current_minutes, end_minutes, window)
+            if real_overlap > 0:
+                breakdown["no_drive_window_soft_penalty"] = breakdown.get("no_drive_window_soft_penalty", 0.0) - window_penalty
+                note_parts.append("no_drive_soft_window")
+            continue
         buffered_end = end_minutes + config.NO_DRIVE_SAFETY_BUFFER_MINUTES
         overlap = _hits_no_drive_window(ctx.current_minutes, buffered_end, window)
         if overlap > 0:
@@ -1416,6 +1466,21 @@ def score_reposition(
         if arrival_hour >= rules.home_rule.home_by_hour and not _is_in_circle(target_lat, target_lng, rules.home_rule):
             breakdown["home_rule_penalty"] = -float(rules.home_rule.penalty_amount or 600.0)
             note_parts.append("miss_home")
+        # PR#22 经验：基于实际行程时间判断空驶后能否按时回家。
+        # 非回家空驶：计算从目标点到家的行程时间，若到达目标后已来不及在 home_by_hour 前回家，
+        # 施加渐进惩罚（而非等到已过 home_by_hour 才反应）。
+        elif not _is_in_circle(target_lat, target_lng, rules.home_rule):
+            dist_target_home = geo_utils.haversine_km(target_lat, target_lng, rules.home_rule.lat, rules.home_rule.lng)
+            minutes_target_to_home = geo_utils.distance_to_minutes(dist_target_home, ctx.reposition_speed_km_per_hour)
+            home_by_abs = (end_minutes // 1440) * 1440 + rules.home_rule.home_by_hour * 60
+            slack_after_repo = home_by_abs - (end_minutes + minutes_target_to_home)
+            if slack_after_repo < 0:
+                breakdown["home_rule_penalty"] = -float(rules.home_rule.penalty_amount or 600.0)
+                note_parts.append("repo_miss_home_travel")
+            elif slack_after_repo <= 60:
+                severity = max(0.3, 1.0 - slack_after_repo / 60.0)
+                breakdown["home_rule_tight_slack_penalty"] = -float(rules.home_rule.penalty_amount or 600.0) * severity
+                note_parts.append("repo_home_tight_slack")
 
     # 增益：目标点热点 + 必到 + 回家
     hotspot_gain = memory.hotspot_value(target_lat, target_lng) * minutes
@@ -1606,11 +1671,15 @@ def score_reposition(
                     note="daily_rest_blocked_reposition",
                 )
 
-    # 月度休息日：必须休息日时禁止空驶。按空驶完成日预估。
+    # 月度休息日：必须休息日时禁止空驶。
+    # PR#21 经验：评测按 [action_start, action_end] 跨过的每个自然日都计入活跃日，
+    # 空驶同理——长距离空驶跨午夜会让两天都变为活跃日。
     if rules.monthly_day_off is not None:
-        finish_day_str_repo = geo_utils.date_str(max(0, end_minutes - 1))
         projected_active_repo = set(memory.daily_active)
-        projected_active_repo.add(finish_day_str_repo)
+        cur_day_idx_repo = ctx.current_minutes // 1440
+        end_day_idx_repo = max(cur_day_idx_repo, max(0, end_minutes - 1) // 1440)
+        for di_repo in range(cur_day_idx_repo, end_day_idx_repo + 1):
+            projected_active_repo.add(geo_utils.date_str(di_repo * 1440))
         max_active_repo = config.EVALUATION_HORIZON_DAYS - rules.monthly_day_off.required_days
         if len(projected_active_repo) > max_active_repo:
             return ScoredAction(
