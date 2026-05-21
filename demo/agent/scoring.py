@@ -865,12 +865,15 @@ def score_take_order(
                 breakdown["daily_rest_risk_penalty"] = -unit * 1.0
                 note_parts.append("rest_risk")
 
-    # 月度休息日：评测按 step_end 所在日判「成交接单活跃日」，所以此处需预估该订单 step_end 所落日。
-    # 当接单后预计成为活跃的日集合超出 max_active 阈值 → 硬阻拦（D006/D007/D008 必须有 N 整天不接单）。
+    # 月度休息日：评测按 [action_start, action_end] 跨过的每个自然日都计入「活跃日」，
+    # 所以此处需把订单从今天到完工那天所跨过的全部自然日都纳入预估，避免跨午夜长单
+    # 让 agent 以为「明天还可休息」（D008/D010 典型场景）。
     if rules.monthly_day_off is not None:
-        finish_day_str = geo_utils.date_str(max(0, finish_minutes - 1))
         projected_active = set(memory.daily_active)
-        projected_active.add(finish_day_str)
+        cur_day_idx = ctx.current_minutes // 1440
+        end_day_idx = max(cur_day_idx, max(0, finish_minutes - 1) // 1440)
+        for di in range(cur_day_idx, end_day_idx + 1):
+            projected_active.add(geo_utils.date_str(di * 1440))
         eval_horizon = config.EVALUATION_HORIZON_DAYS
         max_active = eval_horizon - rules.monthly_day_off.required_days
         if len(projected_active) > max_active:
