@@ -267,3 +267,33 @@ MONTHLY_DAY_OFF_LATE_MONTH_DAY = 20
 
 MONTHLY_DAY_OFF_FORCE_REST_DAY = 25
 """R6-P1: 强制休息检查日（0-indexed），day≥此值且deficit≥1时给极高wait增益。"""
+
+
+# ---------------- PR#24 经验驱动优化参数 ----------------
+
+INCOME_EFFICIENCY_MIN_ORDERS = 5
+"""司机完成至少 N 单后才启用收入效率加成（避免样本不足导致偏差）。"""
+
+INCOME_EFFICIENCY_BONUS_CAP = 80.0
+"""收入效率加成上限（元），防止单因素过度影响评分。"""
+
+HOTSPOT_DECAY_HALF_LIFE_MINUTES = 8 * 60
+"""热点网格数据半衰期（分钟），越久远的观测权重越低。"""
+
+REPOSITION_LONG_DISTANCE_THRESHOLD_KM = 150.0
+"""非优先目标空驶超过此距离时施加额外时间成本惩罚。"""
+
+REPOSITION_LONG_DISTANCE_PENALTY_MULTIPLIER = 0.5
+"""远距离空驶额外时间成本乘数。"""
+
+ANTI_STAGNATION_MILD_THRESHOLD = 3
+"""轻度反停滞：连续 wait ≥ 此值且无明确收益时，对长 wait 施加温和惩罚。"""
+
+ANTI_STAGNATION_MILD_PENALTY_PER_STEP = 30.0
+"""轻度反停滞惩罚系数（远低于正式阈值 160，仅作为微调信号）。"""
+
+NIGHT_WAIT_TO_DAWN_HOUR = 6
+"""夜间等待候选的目标时刻（小时），用于覆盖无明确 no_drive_window 的司机。"""
+
+MIN_NON_PRIORITY_REPOSITION_SLOTS = 2
+"""空驶候选中至少保留 N 个非优先目标名额，确保市场探索多样性。"""

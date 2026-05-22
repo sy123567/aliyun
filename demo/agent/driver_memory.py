@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import math as _math
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any
@@ -142,20 +143,28 @@ class DriverMemory:
         return bucket.sum_price_per_minute / bucket.samples
 
     def hotspot_value(self, latitude: float, longitude: float) -> float:
-        """返回查询点附近 9 宫格的平均“元/分钟”收益，作为未来机会估计。"""
+        """返回查询点附近 9 宫格的加权“元/分钟”收益，作为未来机会估计。
+
+        PR#24: 增加时间衰减——近期观测权重更高，避免用过时数据做空驶决策。
+        """
         key = geo_utils.grid_key(latitude, longitude)
         total_yield = 0.0
-        total_samples = 0
+        total_weight = 0.0
+        half_life = config.HOTSPOT_DECAY_HALF_LIFE_MINUTES
+        current_time = max(self.last_status_minutes, 1)
         for di in (-1, 0, 1):
             for dj in (-1, 0, 1):
                 cell = self.hotspots.get((key[0] + di, key[1] + dj))
                 if cell is None or cell.samples == 0:
                     continue
-                total_yield += cell.sum_price_per_minute
-                total_samples += cell.samples
-        if total_samples <= 0:
+                age = max(0, current_time - cell.last_seen_minutes)
+                decay = _math.exp(-0.693 * age / half_life) if half_life > 0 else 1.0
+                weight = cell.samples * decay
+                total_yield += cell.sum_price_per_minute * decay
+                total_weight += weight
+        if total_weight <= 0:
             return 0.0
-        return total_yield / total_samples
+        return total_yield / total_weight
 
     def absorb_history_records(self, records: list[dict[str, Any]]) -> None:
         """从 ``query_decision_history`` 记录中累计当日和月度统计。"""
