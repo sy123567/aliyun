@@ -117,8 +117,13 @@ def resolve_adaptive_weights(
         weights = weights.scaled(horizon_risk=2.0, future_value=0.5)
 
     # 偏好即将违规
+    # PR#24: 月后半段偏好风险更高，因剩余可纠正时间更少
     if _is_preference_near_violation(rules, memory):
-        weights = weights.scaled(preference_risk=3.0)
+        sim_day = ctx.current_minutes // (24 * 60)
+        if sim_day >= config.MONTHLY_DAY_OFF_LATE_MONTH_DAY:
+            weights = weights.scaled(preference_risk=5.0)
+        else:
+            weights = weights.scaled(preference_risk=3.0)
 
     # 货源稀缺
     if visible_cargo_count < config.SCARCE_CARGO_THRESHOLD:
@@ -975,6 +980,25 @@ def score_take_order(
                         note="monthly_day_off_cross_day_block",
                     )
 
+    # 收入效率加成：优先选择收入/时间比更高的订单
+    # PR#24 经验：简单的效率信号比 PR#17 的复杂机会成本更安全。
+    if (
+        occupied_minutes > 0
+        and income > 0
+        and not income_voided_by_horizon
+        and memory.total_completed_orders >= config.INCOME_EFFICIENCY_MIN_ORDERS
+    ):
+        yuan_per_min = income / occupied_minutes
+        avg_yuan_per_min = memory.total_gross_income / max(1.0, sum(
+            1 for _ in memory.daily_active
+        ) * 14.0 * 60.0)
+        if avg_yuan_per_min > 0 and yuan_per_min > avg_yuan_per_min * 1.2:
+            efficiency_bonus = min(
+                config.INCOME_EFFICIENCY_BONUS_CAP,
+                (yuan_per_min - avg_yuan_per_min) * occupied_minutes * 0.05,
+            )
+            breakdown["income_efficiency_bonus"] = efficiency_bonus
+
     # 未来位置价值：卸货点的热点收益 + 到达时段的在线模式信号
     arrival_hour = geo_utils.hour_of_day(finish_minutes)
     hour_signal = memory.hour_pattern_value(arrival_hour)
@@ -1098,6 +1122,15 @@ def build_wait_durations(rules: ParsedRules, ctx: DecisionContext, memory: Drive
             remaining = max(1, event.stay_until_minutes - ctx.current_minutes)
             durations.add(min(config.TIMED_EVENT_STAY_CHUNK_MINUTES, remaining))
             long_durations.add(min(config.TIMED_EVENT_LONG_STAY_MAX_MINUTES, remaining))
+    # PR#24: 夜间等待到天亮候选——覆盖无明确 no_drive_window 的司机，
+    # 避免在低货源的夜间时段反复短 wait + 空驶消耗。
+    cur_md_night = geo_utils.minute_of_day(ctx.current_minutes)
+    if cur_md_night >= 22 * 60 or cur_md_night < config.NIGHT_WAIT_TO_DAWN_HOUR * 60:
+        dawn_target = config.NIGHT_WAIT_TO_DAWN_HOUR * 60
+        dawn_wait = (dawn_target - cur_md_night) % (24 * 60)
+        if dawn_wait > 0:
+            durations.add(dawn_wait)
+
     return sorted(
         {d for d in durations if 1 <= d <= 12 * 60}
         | {d for d in long_durations if 1 <= d <= config.TIMED_EVENT_LONG_STAY_MAX_MINUTES}
@@ -1278,6 +1311,21 @@ def score_wait(
         stagnation_penalty = excess * config.STAGNATION_WAIT_PENALTY_PER_STEP
         breakdown["stagnation_penalty"] = -stagnation_penalty
         note_parts.append(f"stagnation={memory.consecutive_wait_count}")
+    # PR#24: 轻度反停滞——在正式阈值之前给予温和信号，
+    # 让长 wait 相对短 wait 更贵，促进 agent 更频繁地重新评估市场。
+    elif (
+        config.ANTI_STAGNATION_MILD_THRESHOLD
+        <= memory.consecutive_wait_count
+        <= config.STAGNATION_WAIT_THRESHOLD
+        and rest_gain <= 0
+        and no_drive_gain <= 0
+        and not in_timed_stay
+        and duration_minutes > 120
+    ):
+        mild_excess = memory.consecutive_wait_count - config.ANTI_STAGNATION_MILD_THRESHOLD + 1
+        mild_penalty = mild_excess * config.ANTI_STAGNATION_MILD_PENALTY_PER_STEP
+        breakdown["mild_stagnation_penalty"] = -mild_penalty
+        note_parts.append(f"mild_stagnation={memory.consecutive_wait_count}")
 
     # 月度休息日：必须休息日时给予完整罚金等额奖励，确保 wait 候选战胜其他动作。
     # 由于评测按 step_end 日判「成交接单」，需活跃日数预估到今日是否必须作为休息日
@@ -1430,6 +1478,31 @@ def score_reposition(
     # 成本：里程 + 时间
     breakdown["reposition_cost"] = -ctx.cost_per_km * distance_km
     breakdown["reposition_time_cost"] = -ctx.opportunity_cost_per_minute * minutes
+
+    # PR#24: 远距离非优先目标空驶额外成本——长距空驶消耗大量时间，
+    # 若目标不是家/事件/熟货等优先点，应更谨慎。
+    if distance_km > config.REPOSITION_LONG_DISTANCE_THRESHOLD_KM:
+        is_priority = False
+        if rules.home_rule is not None and _is_in_circle(target_lat, target_lng, rules.home_rule):
+            is_priority = True
+        if not is_priority:
+            for ev in rules.timed_stay_events:
+                if (
+                    geo_utils.haversine_km(target_lat, target_lng, ev.pickup_lat, ev.pickup_lng) <= ev.radius_km
+                    or geo_utils.haversine_km(target_lat, target_lng, ev.home_lat, ev.home_lng) <= ev.radius_km
+                ):
+                    is_priority = True
+                    break
+        if not is_priority:
+            for pref in rules.preferred_cargo:
+                pref_target = preferred_cargo_target(pref)
+                if pref_target and geo_utils.haversine_km(target_lat, target_lng, pref_target[0], pref_target[1]) <= 3.0:
+                    is_priority = True
+                    break
+        if not is_priority:
+            extra_time_cost = ctx.opportunity_cost_per_minute * minutes * config.REPOSITION_LONG_DISTANCE_PENALTY_MULTIPLIER
+            breakdown["long_reposition_penalty"] = -extra_time_cost
+            note_parts.append("long_reposition")
 
     end_minutes = ctx.current_minutes + minutes
     # 空驶同样受禁行窗约束（PR#22 经验：与 take_order 对齐软/硬分离逻辑）

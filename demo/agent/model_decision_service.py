@@ -605,24 +605,40 @@ class ModelDecisionService:
             priority_targets.append((rules.home_rule.lat, rules.home_rule.lng))
 
         # 当前位置已有可接好单时，避免无意义远距离空驶。
-        targets: list[tuple[float, float]] = list(priority_targets)
+        # PR#24: 保证非优先目标至少占 MIN_NON_PRIORITY_REPOSITION_SLOTS 个名额，
+        # 避免所有空驶候选都是优先目标而失去市场探索机会。
+        non_priority: list[tuple[float, float]] = []
         if not has_good_order:
-            targets.extend(self._reposition_targets_from_cargo(items, ctx))
-            targets.extend(self._reposition_targets_from_hotspots(memory, ctx))
-        # 去重
+            non_priority.extend(self._reposition_targets_from_cargo(items, ctx))
+            non_priority.extend(self._reposition_targets_from_hotspots(memory, ctx))
+        # 去重优先目标
         seen: set[tuple[float, float]] = set()
-        deduped: list[tuple[float, float]] = []
-        for t in targets:
+        deduped_priority: list[tuple[float, float]] = []
+        for t in priority_targets:
             key = (round(t[0], 3), round(t[1], 3))
             if key in seen:
                 continue
             if math.hypot(t[0] - ctx.current_lat, t[1] - ctx.current_lng) < 0.01:
                 continue
             seen.add(key)
-            deduped.append(t)
+            deduped_priority.append(t)
+        # 去重非优先目标
+        deduped_non_priority: list[tuple[float, float]] = []
+        for t in non_priority:
+            key = (round(t[0], 3), round(t[1], 3))
+            if key in seen:
+                continue
+            if math.hypot(t[0] - ctx.current_lat, t[1] - ctx.current_lng) < 0.01:
+                continue
+            seen.add(key)
+            deduped_non_priority.append(t)
+        min_non_priority = config.MIN_NON_PRIORITY_REPOSITION_SLOTS
+        max_priority_slots = max(0, _TOP_REPOSITION_TARGETS - min(min_non_priority, len(deduped_non_priority)))
+        deduped = deduped_priority[:max_priority_slots] + deduped_non_priority
+        deduped = deduped[:_TOP_REPOSITION_TARGETS]
         return [
             scoring.score_reposition(t[0], t[1], rules, memory, ctx)
-            for t in deduped[:_TOP_REPOSITION_TARGETS]
+            for t in deduped
         ]
 
     def _reposition_targets_from_cargo(
