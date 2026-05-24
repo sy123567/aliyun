@@ -297,3 +297,134 @@ NIGHT_WAIT_TO_DAWN_HOUR = 6
 
 MIN_NON_PRIORITY_REPOSITION_SLOTS = 2
 """空驶候选中至少保留 N 个非优先目标名额，确保市场探索多样性。"""
+
+
+# ---------------- 通用评分参数（从 scoring.py 提取的原硬编码值） ----------------
+
+# --- 接单评分 ---
+
+WAITING_PENALTY_RATIO = 0.5
+"""装货等待时间相对于机会成本的折算比例。"""
+
+AVOID_CATEGORY_DEFAULT_PENALTY = 300.0
+"""避免品类的默认软惩罚（元），当规则未提供 penalty_amount 时使用。"""
+
+AVOID_CATEGORY_PENALTY_RATIO = 0.4
+"""避免品类按规则罚金折算的比例。"""
+
+DISTANCE_LIMIT_HARD_RATIO = 1.2
+"""距离限制硬阻拦：超过限值 × 此比例时硬性过滤。"""
+
+DISTANCE_LIMIT_OVER_PENALTY_COEFF = 3.0
+"""距离限制软惩罚中，超额比例的放大系数。"""
+
+PREFERRED_CARGO_HIGH_VALUE_THRESHOLD = 5000.0
+"""高价值熟货阈值（元），超过此值使用更紧凑的预定位窗和更高优先级。"""
+
+PREFERRED_CARGO_HIGH_VALUE_PREPOSITION_HOURS = 12
+"""高价值熟货预定位窗口（小时），替代通用的 48h 窗口。"""
+
+PREFERRED_CARGO_HIGH_VALUE_ACTIVE_MULTIPLIER = 3.0
+"""高价值熟货在活跃窗口内的加成倍数。"""
+
+PREFERRED_CARGO_CONFLICT_HIGH_VALUE_MULTIPLIER = 2.0
+"""高价值熟货冲突惩罚额外倍数。"""
+
+HOME_RULE_TIGHT_SLACK_MINUTES = 90
+"""回家时间裕量阈值（分钟），低于此值时开始施加渐进式惩罚。"""
+
+TIMED_EVENT_EARLY_APPROACH_AWAY_KM = 30.0
+"""定时事件 early_approach 阶段，订单终点比当前更远的判断阈值（km）。"""
+
+TIMED_EVENT_EARLY_APPROACH_CLOSER_KM = 10.0
+"""定时事件 early_approach 阶段，订单终点比当前更近的判断阈值（km）。"""
+
+TIMED_EVENT_EARLY_APPROACH_AWAY_RATIO = 0.3
+"""定时事件 early_approach 阶段远离时的惩罚比例。"""
+
+TIMED_EVENT_EARLY_APPROACH_CLOSER_RATIO = 0.15
+"""定时事件 early_approach 阶段靠近时的增益比例。"""
+
+DAILY_REST_TIGHT_MULTIPLIER = 2.5
+"""每日休息余量紧张时的惩罚倍数。"""
+
+DAILY_REST_TIGHT_RATIO = 1.3
+"""每日休息余量紧张判断比例（remaining < deficit × 此比例）。"""
+
+DAILY_REST_MODERATE_RATIO = 2.0
+"""每日休息余量一般判断比例。"""
+
+MONTHLY_DAY_OFF_URGENCY_HARD_BLOCK_THRESHOLD = 0.5
+"""月度休息日 urgency 达到此值时硬阻拦。"""
+
+MONTHLY_DAY_OFF_URGENCY_HIGH_COEFF = 1.5
+"""高 urgency（>=0.3）时的惩罚系数乘数。"""
+
+MONTHLY_DAY_OFF_LATE_MONTH_COEFF = 1.5
+"""后半月 urgency 惩罚的额外倍数。"""
+
+INCOME_EFFICIENCY_THRESHOLD_RATIO = 1.2
+"""收入效率加成触发比例：yuan_per_min 超过平均值 × 此比例时启用。"""
+
+INCOME_EFFICIENCY_BONUS_RATIO = 0.05
+"""收入效率加成计算比例。"""
+
+INCOME_EFFICIENCY_AVG_WORK_HOURS = 14.0
+"""用于估算平均 yuan/min 的每日工作小时数假设。"""
+
+FUTURE_VALUE_HOUR_SIGNAL_WEIGHT = 0.5
+"""未来位置价值中小时模式信号的权重。"""
+
+FUTURE_VALUE_HORIZON_MAX_MINUTES = 120
+"""未来位置价值计算的最大时间窗口（分钟）。"""
+
+FUTURE_VALUE_HORIZON_MIN_MINUTES = 60
+"""未来位置价值计算的最小时间窗口（分钟）。"""
+
+# --- 等待评分 ---
+
+FIRST_ORDER_WAIT_PENALTY_RATIO = 0.5
+"""首单截止 wait 惩罚倍率。"""
+
+# --- 空驶评分 ---
+
+HOME_RULE_REPO_TIGHT_SLACK_MINUTES = 60
+"""空驶后回家 slack 阈值（分钟），低于此值时施加渐进惩罚。"""
+
+PREFERRED_CARGO_NEARBY_KM = 3.0
+"""判断空驶目标点是否靠近熟货上架点的距离阈值（km）。"""
+
+PREFERRED_CARGO_DEFER_OVERNIGHT_HOURS = 12
+"""熟货预定位过夜抑制：距上架时间 > 此小时数时抑制增益。"""
+
+PREFERRED_CARGO_DEFER_OVERNIGHT_GAIN_RATIO = 0.1
+"""熟货过夜抑制时增益的衰减比例。"""
+
+DEADHEAD_OVERCAP_SOFT_PENALTY = 50.0
+"""空驶里程 cap 已耗尽时的名义软成本（元）。"""
+
+DEADHEAD_PRIORITY_SOFT_PENALTY_MULTIPLIER = 3.0
+"""优先目标超空驶预算时的软惩罚乘数。"""
+
+# --- 自适应权重 ---
+
+ADAPTIVE_WEIGHT_MONTH_END_HORIZON_SCALE = 2.0
+"""月末模式 horizon_risk 缩放倍数。"""
+
+ADAPTIVE_WEIGHT_MONTH_END_FUTURE_SCALE = 0.5
+"""月末模式 future_value 缩放倍数。"""
+
+ADAPTIVE_WEIGHT_PREF_RISK_NORMAL_SCALE = 3.0
+"""偏好即将违规时 preference_risk 的正常缩放倍数。"""
+
+ADAPTIVE_WEIGHT_PREF_RISK_LATE_MONTH_SCALE = 5.0
+"""月后半段偏好即将违规时 preference_risk 的缩放倍数。"""
+
+ADAPTIVE_WEIGHT_SCARCE_PICKUP_SCALE = 0.5
+"""货源稀缺时 pickup_deadhead 的缩放倍数。"""
+
+ADAPTIVE_WEIGHT_SCARCE_REPOSITION_SCALE = 1.5
+"""货源稀缺时 reposition_gain 的缩放倍数。"""
+
+ADAPTIVE_WEIGHT_NIGHT_TIME_COST_SCALE = 0.3
+"""夜间时段 time_cost 的缩放倍数。"""
