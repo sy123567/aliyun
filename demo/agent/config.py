@@ -297,3 +297,42 @@ NIGHT_WAIT_TO_DAWN_HOUR = 6
 
 MIN_NON_PRIORITY_REPOSITION_SLOTS = 2
 """空驶候选中至少保留 N 个非优先目标名额，确保市场探索多样性。"""
+
+
+# ---------------- PR#27 经验驱动：失分精修参数 ----------------
+
+MONTHLY_DEADHEAD_PREEMPT_RATIO = 0.5
+"""月度空驶累计达到限额的该比例后开始施加渐增预警惩罚（PR#27: D003 提前预警起点）。"""
+
+MONTHLY_DEADHEAD_PREEMPT_MAX_COEFF = 0.6
+"""预警区间最高乘数：在 [PREEMPT_RATIO, 1.0] 区间内按线性比例从 0 → MAX_COEFF×pen_per_km 收取。"""
+
+MONTHLY_DEADHEAD_OVERCAP_RESIDUAL_COEFF = 0.5
+"""月度空驶 cap 已耗尽后，仍对新增超额公里数施加 per_km × 该系数 的残余信号（PR#27: 防 D003 1700km 失控）。"""
+
+SOFT_NODRIVE_DEFER_PROXIMITY_MINUTES = 90
+"""当前时刻距离软禁行窗口起始 ≤ 此分钟数（且尚未进入窗口）时，软罚乘数随接近程度递增（PR#27: D004 中午延后判断）。"""
+
+SOFT_NODRIVE_DEFER_INSIDE_MULTIPLIER = 2.5
+"""若当前时刻已落入软窗内、且即将开始的动作可被推迟到窗口结束后，软罚乘数（PR#27）。"""
+
+TIMED_EVENT_MULTIDAY_THRESHOLD_MINUTES = 24 * 60
+"""事件 stay 时长 ≥ 此值视为多日 stay，触发更深的提前回家强制窗（PR#27: D010 家事约定）。"""
+
+TIMED_EVENT_MULTIDAY_HOME_MANDATORY_WINDOW_MINUTES = 48 * 60
+"""多日 stay 事件的提前强制回家窗口（PR#27: 由默认 24h 扩到 48h，确保 D010 提前两天回家）。"""
+
+FIRST_ORDER_PROXIMITY_BOOST_WINDOW_MINUTES = 90
+"""首单截止前 N 分钟内，若当天尚未接单则对 take_order 施加软增益（PR#27: D004 首单晚开工）。"""
+
+FIRST_ORDER_PROXIMITY_BOOST_RATIO = 0.6
+"""首单截止前软增益占规则单日罚金的比例上限（PR#27）。"""
+
+FIRST_ORDER_WAIT_CROSS_MULTIPLIER = 1.0
+"""wait 跨过 first_order 截止时的罚金系数（PR#27: 由 0.5 提高到 1.0，让 wait 与 take_order 边际匹配）。"""
+
+DAILY_REST_RISK_EARLY_RATIO = 3.0
+"""每日休息余量预警触发线：remaining_after < deficit × 该比例 时施加软罚（PR#27: 由 2.0→3.0 提前）。"""
+
+DAILY_REST_RISK_TIGHT_RATIO = 1.5
+"""每日休息余量紧迫触发线：remaining_after < deficit × 该比例 时施加强软罚（PR#27: 由 1.3→1.5）。"""

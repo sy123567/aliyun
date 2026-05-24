@@ -179,6 +179,9 @@ class DriverMemory:
                 continue
             self._absorb_single_record(record)
             self.processed_until_step = step
+        # PR#27: 每次吸收后同步 preference_penalty_accum，让 _is_preference_near_violation
+        # 真正可用（之前该 dict 被读但从不被写，自适应权重升级永远不触发）。
+        self._refresh_preference_penalty_accum()
 
     def _absorb_single_record(self, record: dict[str, Any]) -> None:
         action = record.get("action", {}) or {}
@@ -270,6 +273,46 @@ class DriverMemory:
         prev = self.daily_longest_rest_minutes.get(date_today, 0)
         if self.pending_rest_streak_minutes > prev:
             self.daily_longest_rest_minutes[date_today] = self.pending_rest_streak_minutes
+
+    def _refresh_preference_penalty_accum(self) -> None:
+        """根据当前累计统计与规则估算各偏好的累计罚分（PR#27）。
+
+        覆盖最常爆 cap 的两类规则：
+        - ``dist_monthly_deadhead``：按 ``max(total_deadhead_km - max_km, 0) × penalty_amount`` 估算。
+        - ``home_rule``：按超过 ``home_by_hour`` 的活跃日数 × penalty_amount 估算（粗略上界，避免遗漏）。
+
+        其它规则（no_drive_windows、daily_rest）需要扫描行动序列才能精确估算，这里先不补充，
+        避免引入与 ``absorb`` 不一致的复杂度；后续若需要可在 ``_absorb_single_record`` 中精细化。
+        """
+        rules = self.rules
+        if rules is None:
+            return
+        # 月度空驶累计
+        for limit in getattr(rules, "distance_limits", []) or []:
+            if getattr(limit, "kind", "") != "monthly_deadhead":
+                continue
+            over_km = max(0.0, self.total_deadhead_km - float(limit.max_km))
+            if over_km <= 0:
+                self.preference_penalty_accum.pop("dist_monthly_deadhead", None)
+                continue
+            pen_per_km = float(limit.penalty_amount or 0.0)
+            paid = over_km * pen_per_km
+            if limit.penalty_cap is not None:
+                paid = min(paid, float(limit.penalty_cap))
+            self.preference_penalty_accum["dist_monthly_deadhead"] = paid
+        # 月度休息日：active_days 越接近 horizon - required_days 越紧。这里写入「已活跃天数」
+        # 作为软信号；_is_preference_near_violation 仍按 cap 阈值比较。
+        if getattr(rules, "monthly_day_off", None) is not None:
+            required = int(rules.monthly_day_off.required_days)
+            horizon = config.EVALUATION_HORIZON_DAYS
+            active = len(self.daily_active)
+            max_active = horizon - required
+            if max_active > 0 and active > 0:
+                # 把「实际活跃 / 最大允许活跃」映射到 cap 比例：当 active/max_active 接近 1 时，penalty 接近 cap。
+                cap = float(rules.monthly_day_off.penalty_cap or 0.0)
+                if cap > 0:
+                    ratio = min(1.0, active / max(1.0, max_active))
+                    self.preference_penalty_accum["monthly_day_off"] = ratio * cap
 
     def daily_orders_today(self, sim_minutes: int) -> int:
         return int(self.daily_orders.get(geo_utils.date_str(sim_minutes), 0))

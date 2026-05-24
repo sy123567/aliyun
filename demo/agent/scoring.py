@@ -323,6 +323,36 @@ def _project_rule_to_minutes(day_start: int, rule_start: int, rule_end: int) -> 
     return [(day_start + rule_start, end_today), (end_today, second_end)]
 
 
+def _soft_no_drive_defer_multiplier(window: TimeWindowRule, current_minutes: int) -> float:
+    """软禁行窗的「可延后性」乘数（PR#27）。
+
+    场景：D004「中午 12-13 不接」penalty=¥100/次、cap=¥3,000。一旦动作起点离窗口很近（窗前 90min 内）
+    或已落入窗内，等待到窗口结束几乎不损失收益，违规属于显然可避免的决策——给软罚加倍以反向偏好。
+    远离窗口（如 11:00 出发的长单 09:00-13:30 跨过）保留原罚金。
+
+    返回值范围 [1.0, SOFT_NODRIVE_DEFER_INSIDE_MULTIPLIER]。
+    """
+    cur_md = current_minutes % 1440
+    rule_start = window.start_minute
+    rule_end = window.end_minute
+    # 跨午夜窗：以原始 start_minute 为锚，cur 距 start 取最近的正向间距
+    if cur_md >= rule_start and cur_md < (rule_end if rule_end <= 1440 else 1440):
+        return float(config.SOFT_NODRIVE_DEFER_INSIDE_MULTIPLIER)
+    if rule_end > 1440 and cur_md < (rule_end - 1440):
+        return float(config.SOFT_NODRIVE_DEFER_INSIDE_MULTIPLIER)
+    # 窗前接近度：距 start_minute（取当日或次日的近未来）≤ PROXIMITY 分钟时线性放大。
+    if cur_md < rule_start:
+        gap = rule_start - cur_md
+    else:
+        gap = (rule_start + 1440) - cur_md
+    proximity = config.SOFT_NODRIVE_DEFER_PROXIMITY_MINUTES
+    if gap <= proximity:
+        # 越靠近窗口起点，越显然「应该等过去」，乘数从 1.0 线性升至 INSIDE_MULTIPLIER。
+        ratio = max(0.0, 1.0 - gap / max(1.0, proximity))
+        return 1.0 + ratio * (config.SOFT_NODRIVE_DEFER_INSIDE_MULTIPLIER - 1.0)
+    return 1.0
+
+
 # ---------------- 接单评分 ----------------
 
 
@@ -471,7 +501,13 @@ def score_take_order(
             time_to_event = event.start_minutes - ctx.current_minutes
             near_pickup = cur_dist_to_pick <= event.radius_km
             near_home = geo_utils.haversine_km(ctx.current_lat, ctx.current_lng, event.home_lat, event.home_lng) <= event.radius_km
-            if 0 < time_to_event <= config.TIMED_EVENT_HOME_MANDATORY_WINDOW_MINUTES and not near_pickup and not near_home:
+            # PR#27: 多日 stay 事件（≥24h，如 D010 3 天家事约定）扩展强制回家窗到 48h——
+            # 24h 太晚：若司机当前在距家 400km 处，留给「最近 24h」可能不够回家+休息。
+            stay_duration = max(0, event.stay_until_minutes - event.start_minutes)
+            mandatory_window = config.TIMED_EVENT_HOME_MANDATORY_WINDOW_MINUTES
+            if stay_duration >= config.TIMED_EVENT_MULTIDAY_THRESHOLD_MINUTES:
+                mandatory_window = max(mandatory_window, config.TIMED_EVENT_MULTIDAY_HOME_MANDATORY_WINDOW_MINUTES)
+            if 0 < time_to_event <= mandatory_window and not near_pickup and not near_home:
                 return ScoredAction(
                     action="take_order",
                     params={"cargo_id": cargo_id},
@@ -662,16 +698,35 @@ def score_take_order(
             # 月度空驶赶路上限：按「新增超额公里数 × 单价」计软惩罚，不硬阻拦。
             # 评测仅按累计 over_km × 单价（≈10 元/km）扣分；硬阻拦会让司机在累计稍超即停摆。
             # 原硬阻拦在 D003（限 100km）触发后导致全月 899 次 wait、3 单 → 改为软罚。
+            pen_per_km_t = float(limit.penalty_amount or 10.0)
             already_over = max(0.0, memory.total_deadhead_km - limit.max_km)
             new_total = memory.total_deadhead_km + distance_pickup_km
             new_over_km = max(0.0, max(0.0, new_total - limit.max_km) - already_over)
+            # PR#27: 预警阶段——累计空驶 ∈ [PREEMPT_RATIO × max_km, max_km] 时即开始施加
+            # 渐增软罚，避免临到限额才反应（D003 限额 100km 时往往一两单就冲破）。
+            preempt_threshold = limit.max_km * config.MONTHLY_DEADHEAD_PREEMPT_RATIO
+            if memory.total_deadhead_km < limit.max_km and new_total > preempt_threshold:
+                preempt_start = max(memory.total_deadhead_km, preempt_threshold)
+                preempt_end = min(new_total, limit.max_km)
+                preempt_km = max(0.0, preempt_end - preempt_start)
+                if preempt_km > 0:
+                    # 在 [PREEMPT_RATIO, 1.0] 区间内线性放大至 MAX_COEFF × pen_per_km。
+                    mid_ratio = (preempt_start + preempt_end) / 2.0 / max(1.0, limit.max_km)
+                    band = max(1e-6, 1.0 - config.MONTHLY_DEADHEAD_PREEMPT_RATIO)
+                    band_pos = max(0.0, min(1.0, (mid_ratio - config.MONTHLY_DEADHEAD_PREEMPT_RATIO) / band))
+                    coeff = config.MONTHLY_DEADHEAD_PREEMPT_MAX_COEFF * band_pos
+                    pref_penalty += pen_per_km_t * preempt_km * coeff
             if new_over_km > 0:
-                pen_per_km_t = float(limit.penalty_amount or 10.0)
                 cap_to = limit.penalty_cap
                 if cap_to is not None and pen_per_km_t > 0:
                     paid_so_far_to = min(already_over * pen_per_km_t, cap_to)
                     if paid_so_far_to >= cap_to * 0.95:
-                        # cap 已基本耗尽，跳过新增惩罚
+                        # cap 已基本耗尽：保留残余信号防止 D003 失控（1,694km 超额）——
+                        # 即使评测端不再扣分，新增公里仍是无收益里程，需轻惩反对。
+                        pref_penalty += (
+                            pen_per_km_t * new_over_km
+                            * config.MONTHLY_DEADHEAD_OVERCAP_RESIDUAL_COEFF
+                        )
                         continue
                     # 否则按「未耗尽部分」截断
                     cap_remaining_to = cap_to - paid_so_far_to
@@ -719,7 +774,13 @@ def score_take_order(
             # 软窗：用原始 estimate（不加裕量）检测重叠，重叠则按单日固定罚金计软价。
             real_overlap = _hits_no_drive_window(ctx.current_minutes, finish_minutes, window)
             if real_overlap > 0:
-                breakdown["no_drive_window_soft_penalty"] = breakdown.get("no_drive_window_soft_penalty", 0.0) - window_penalty
+                # PR#27: 加入「可延后性」加权——D004 中午 12-13 软窗每天 ¥100 × 30 次 = ¥3,000 顶到 cap，
+                # 多数违规源于「12:30 接单工时 60min」一类显然可延后的决策；若当前时刻就在窗内或窗前 90min，
+                # 把软罚乘以倍数以强化反向偏好；远离窗口的违规（如长单 11:00-13:30 跨过）保留原罚金。
+                multiplier = _soft_no_drive_defer_multiplier(window, ctx.current_minutes)
+                breakdown["no_drive_window_soft_penalty"] = (
+                    breakdown.get("no_drive_window_soft_penalty", 0.0) - window_penalty * multiplier
+                )
                 note_parts.append("no_drive_soft_window")
             continue
         buffered_finish = overestimated_finish + config.NO_DRIVE_SAFETY_BUFFER_MINUTES
@@ -752,8 +813,18 @@ def score_take_order(
     # 偏好：首单时间
     if rules.first_order_rule is not None and memory.daily_orders_today(ctx.current_minutes) == 0:
         first_take_minute = geo_utils.minute_of_day(ctx.current_minutes)
-        if first_take_minute >= rules.first_order_rule.before_hour * 60:
+        deadline_min_first = rules.first_order_rule.before_hour * 60
+        if first_take_minute >= deadline_min_first:
             breakdown["first_order_late_penalty"] = -float(rules.first_order_rule.penalty_amount or 200.0)
+        else:
+            # PR#27: 截止前 PROXIMITY 分钟内若仍未接单，给 take_order 软增益——
+            # 与 wait 侧的 first_order_deadline_wait_penalty 配合：take 比 wait 更优。
+            gap = deadline_min_first - first_take_minute
+            if 0 < gap <= config.FIRST_ORDER_PROXIMITY_BOOST_WINDOW_MINUTES:
+                boost_unit = float(rules.first_order_rule.penalty_amount or 200.0) * config.FIRST_ORDER_PROXIMITY_BOOST_RATIO
+                # 越接近截止，激励越强（gap 越小、boost 越大）
+                ratio_boost = 1.0 - gap / max(1.0, config.FIRST_ORDER_PROXIMITY_BOOST_WINDOW_MINUTES)
+                breakdown["first_order_proximity_bonus"] = boost_unit * ratio_boost
 
     # 偏好：回家约束——接单可能错过回家窗
     if rules.home_rule is not None:
@@ -885,11 +956,13 @@ def score_take_order(
                     feasible=False,
                     note="daily_rest_blocked",
                 )
-            if remaining_after < deficit * 1.3:
+            # PR#27: 预警与紧迫触发线均提前——D002/D006/D008/D010 累计 ¥900+ 休息罚，
+            # 多为「白天没意识到要留出连续休息段」导致夜里凑不齐。
+            if remaining_after < deficit * config.DAILY_REST_RISK_TIGHT_RATIO:
                 # 余量紧张：强软惩罚（覆盖单日上限）
                 breakdown["daily_rest_risk_penalty"] = -unit * 2.5
                 note_parts.append("rest_risk_tight")
-            elif remaining_after < deficit * 2.0:
+            elif remaining_after < deficit * config.DAILY_REST_RISK_EARLY_RATIO:
                 breakdown["daily_rest_risk_penalty"] = -unit * 1.0
                 note_parts.append("rest_risk")
 
@@ -1243,7 +1316,9 @@ def score_wait(
         crosses_day_fo = end_minutes // 1440 > ctx.current_minutes // 1440
         if cur_md_fo < deadline_fo and (end_md_fo >= deadline_fo or crosses_day_fo):
             fo_penalty = float(rules.first_order_rule.penalty_amount or 200.0)
-            breakdown["first_order_deadline_wait_penalty"] = -fo_penalty * 0.5
+            # PR#27: 原 ×0.5 让 wait 跨过截止比 take_order 还便宜（晚单仅 -¥200），
+            # 用 FIRST_ORDER_WAIT_CROSS_MULTIPLIER 让边际成本与 take_order 侧对齐。
+            breakdown["first_order_deadline_wait_penalty"] = -fo_penalty * config.FIRST_ORDER_WAIT_CROSS_MULTIPLIER
             note_parts.append("first_order_wait_cross")
 
     # 机会成本
@@ -1517,7 +1592,10 @@ def score_reposition(
         if is_soft_window:
             real_overlap = _hits_no_drive_window(ctx.current_minutes, end_minutes, window)
             if real_overlap > 0:
-                breakdown["no_drive_window_soft_penalty"] = breakdown.get("no_drive_window_soft_penalty", 0.0) - window_penalty
+                multiplier = _soft_no_drive_defer_multiplier(window, ctx.current_minutes)
+                breakdown["no_drive_window_soft_penalty"] = (
+                    breakdown.get("no_drive_window_soft_penalty", 0.0) - window_penalty * multiplier
+                )
                 note_parts.append("no_drive_soft_window")
             continue
         buffered_end = end_minutes + config.NO_DRIVE_SAFETY_BUFFER_MINUTES
@@ -1633,7 +1711,12 @@ def score_reposition(
         if phase == "early_approach":
             # R5-P0: 在强制回家窗口内，reposition回家/接人点给额外增益
             time_to_event = event.start_minutes - ctx.current_minutes
-            if 0 < time_to_event <= config.TIMED_EVENT_HOME_MANDATORY_WINDOW_MINUTES:
+            # PR#27: 多日 stay 事件扩展窗口与 take_order 对齐（48h），让司机更早被引导回家。
+            stay_duration_r = max(0, event.stay_until_minutes - event.start_minutes)
+            mandatory_window_r = config.TIMED_EVENT_HOME_MANDATORY_WINDOW_MINUTES
+            if stay_duration_r >= config.TIMED_EVENT_MULTIDAY_THRESHOLD_MINUTES:
+                mandatory_window_r = max(mandatory_window_r, config.TIMED_EVENT_MULTIDAY_HOME_MANDATORY_WINDOW_MINUTES)
+            if 0 < time_to_event <= mandatory_window_r:
                 dist_to_home_repo = geo_utils.haversine_km(target_lat, target_lng, event.home_lat, event.home_lng)
                 dist_to_pick_repo = geo_utils.haversine_km(target_lat, target_lng, event.pickup_lat, event.pickup_lng)
                 if dist_to_home_repo <= event.radius_km or dist_to_pick_repo <= event.radius_km:
@@ -1697,13 +1780,25 @@ def score_reposition(
     for limit in rules.distance_limits:
         if limit.kind == "monthly_deadhead":
             projected = memory.total_deadhead_km + distance_km
+            pen_per_km = float(limit.penalty_amount or 10.0)
+            # PR#27: 预警阶段对空驶同样生效——避免反复短空驶累计冲破限额。
+            preempt_threshold_r = limit.max_km * config.MONTHLY_DEADHEAD_PREEMPT_RATIO
+            if memory.total_deadhead_km < limit.max_km and projected > preempt_threshold_r:
+                preempt_start_r = max(memory.total_deadhead_km, preempt_threshold_r)
+                preempt_end_r = min(projected, limit.max_km)
+                preempt_km_r = max(0.0, preempt_end_r - preempt_start_r)
+                if preempt_km_r > 0:
+                    mid_ratio_r = (preempt_start_r + preempt_end_r) / 2.0 / max(1.0, limit.max_km)
+                    band_r = max(1e-6, 1.0 - config.MONTHLY_DEADHEAD_PREEMPT_RATIO)
+                    band_pos_r = max(0.0, min(1.0, (mid_ratio_r - config.MONTHLY_DEADHEAD_PREEMPT_RATIO) / band_r))
+                    coeff_r = config.MONTHLY_DEADHEAD_PREEMPT_MAX_COEFF * band_pos_r
+                    breakdown["monthly_deadhead_preempt_penalty"] = -pen_per_km * preempt_km_r * coeff_r
             if projected > limit.max_km:
-                 # B.2 cap-aware：评测端罚金有 penalty_cap 上限（D003 ¥2000），
+                # B.2 cap-aware：评测端罚金有 penalty_cap 上限（D003 ¥2000），
                 # 一旦累计惩罚已逼近上限，继续空驶的「边际罚分」≈0；过去硬阻拦让司机
                 # 后半月只能干等。这里在 cap 已基本耗尽时把硬阻拦降级为软惩罚，
                 # 由具体收益自行决定是否触发。
                 cap_reached = False
-                pen_per_km = float(limit.penalty_amount or 10.0)
                 if limit.penalty_cap is not None and pen_per_km > 0:
                     over_so_far_km = max(0.0, memory.total_deadhead_km - limit.max_km)
                     paid_so_far = min(over_so_far_km * pen_per_km, limit.penalty_cap)
@@ -1717,8 +1812,14 @@ def score_reposition(
                         note="monthly_deadhead_over_limit",
                     )
                 if cap_reached:
-                    # cap 已耗尽：仅施加名义软成本（路上时间成本由 expected_market_gain 自然权衡）
-                    breakdown["monthly_deadhead_overcap_penalty"] = -50.0
+                    # PR#27: cap 已耗尽，原仅 -¥50 名义罚不足以抑制 D003 反复空驶；
+                    # 改为按新增超额公里 × pen_per_km × OVERCAP_RESIDUAL_COEFF 计算残余信号，
+                    # 与 take_order 侧对齐，避免后半月长距离无收益空驶。
+                    new_over_km_repo = max(0.0, projected - limit.max_km) - max(
+                        0.0, memory.total_deadhead_km - limit.max_km
+                    )
+                    residual = max(50.0, pen_per_km * max(0.0, new_over_km_repo) * config.MONTHLY_DEADHEAD_OVERCAP_RESIDUAL_COEFF)
+                    breakdown["monthly_deadhead_overcap_penalty"] = -residual
                     note_parts.append("deadhead_overcap_soft")
                 else:
                     # 优先目标且 cap 未到：强软惩罚，由偏好增益自身决定是否抵消
