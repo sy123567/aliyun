@@ -1,0 +1,31 @@
+{
+  "month": "2026-03",
+  "simulate_time_seconds": 389.57,
+  "simulation_duration_days": 31,
+  "completed_steps": 1654,
+  "remaining_cargo_count": 0,
+  "driver_completed_steps": {
+    "D001": 243,
+    "D002": 107,
+    "D003": 206,
+    "D004": 108,
+    "D005": 194,
+    "D006": 129,
+    "D007": 218,
+    "D008": 153,
+    "D009": 168,
+    "D010": 128
+  },
+  "driver_result_files": {
+    "D001": "D:\\vs code\\ali\\demo\\results_llm\\actions_202603_D001_20260524_222628.jsonl",
+    "D002": "D:\\vs code\\ali\\demo\\results_llm\\actions_202603_D002_20260524_222628.jsonl",
+    "D003": "D:\\vs code\\ali\\demo\\results_llm\\actions_202603_D003_20260524_222628.jsonl",
+    "D004": "D:\\vs code\\ali\\demo\\results_llm\\actions_202603_D004_20260524_222628.jsonl",
+    "D005": "D:\\vs code\\ali\\demo\\results_llm\\actions_202603_D005_20260524_222628.jsonl",
+    "D006": "D:\\vs code\\ali\\demo\\results_llm\\actions_202603_D006_20260524_222628.jsonl",
+    "D007": "D:\\vs code\\ali\\demo\\results_llm\\actions_202603_D007_20260524_222628.jsonl",
+    "D008": "D:\\vs code\\ali\\demo\\results_llm\\actions_202603_D008_20260524_222628.jsonl",
+    "D009": "D:\\vs code\\ali\\demo\\results_llm\\actions_202603_D009_20260524_222628.jsonl",
+    "D010": "D:\\vs code\\ali\\demo\\results_llm\\actions_202603_D010_20260524_222628.jsonl"
+  }
+}

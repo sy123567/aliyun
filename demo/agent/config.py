@@ -307,8 +307,18 @@ MONTHLY_DEADHEAD_PREEMPT_RATIO = 0.5
 MONTHLY_DEADHEAD_PREEMPT_MAX_COEFF = 0.6
 """预警区间最高乘数：在 [PREEMPT_RATIO, 1.0] 区间内按线性比例从 0 → MAX_COEFF×pen_per_km 收取。"""
 
-MONTHLY_DEADHEAD_OVERCAP_RESIDUAL_COEFF = 0.5
-"""月度空驶 cap 已耗尽后，仍对新增超额公里数施加 per_km × 该系数 的残余信号（PR#27: 防 D003 1700km 失控）。"""
+MONTHLY_DEADHEAD_OVERCAP_RESIDUAL_COEFF = 0.0
+"""月度空驶 cap 已耗尽后，仍对新增超额公里数施加 per_km × 该系数 的残余信号。
+
+PR#27 设 0.5 防 D003 失控，但 PR#29 评测显示：cap 已饱和 ¥2,000 后，0.5 系数让
+agent 高估 pickup_dh 高的高价订单成本（pickup_dh=50km 时额外 ¥250），导致 D003 选短途单：
+- 12:42 基线：gross ¥40,381, 46 单, avg_haul 163km, dh 1,694km
+- 19:50 (PR#27): gross ¥29,654, 48 单, avg_haul 95km, dh 549km
+- 罚分两轮都是 cap ¥2,000；纯损失 -¥10,727 毛收入
+
+PR#29 二次验证：0.1 已把总净收入从 ¥245,471 拉回 ¥249,310，但 D003 gross 仍只有 ¥35,143，
+低于 12:42 基线 ¥40,381。评测端 cap 饱和后没有边际罚分，因此这里设为 0.0，与评测规则对齐；
+cap 前预警仍由 PREEMPT_RATIO/MAX_COEFF 保留。"""
 
 SOFT_NODRIVE_DEFER_PROXIMITY_MINUTES = 90
 """当前时刻距离软禁行窗口起始 ≤ 此分钟数（且尚未进入窗口）时，软罚乘数随接近程度递增（PR#27: D004 中午延后判断）。"""
@@ -336,3 +346,49 @@ DAILY_REST_RISK_EARLY_RATIO = 3.0
 
 DAILY_REST_RISK_TIGHT_RATIO = 1.5
 """每日休息余量紧迫触发线：remaining_after < deficit × 该比例 时施加强软罚（PR#27: 由 1.3→1.5）。"""
+
+
+# ---------------------------------------------------------------------------
+# PENALTY_DEFAULTS — 数据集无关的兜底罚金（PR#28 架构改进）
+# ---------------------------------------------------------------------------
+# 设计目标：把 scoring.py 中散落的 `rule.penalty_amount or <magic_number>`
+# 默认值集中到此处，便于：
+#   1) 跨数据集复用：新数据集若未在 preferences 文本里给出明确罚金，
+#      也能从这里取到与历史评测口径一致的兜底值（D001-D010 实测频率最高的金额）。
+#   2) 调参可观察：所有兜底值集中到一个 dict，方便日后做敏感度分析或 A/B。
+#   3) 验证层引用：finalize_score 钩子在 breakdown 一致性检查时可参考各罚金量级。
+#
+# 维护约定：
+#   - 仅在 preference_parser 返回的规则字段 `penalty_amount` 为 None 或 0 时使用。
+#   - 新增 key 必须有 docstring 注释，标注典型来源数据集与单位（元）。
+#   - 调整数值需附评测对照（避免无据修改）。
+# ---------------------------------------------------------------------------
+
+PENALTY_DEFAULTS: dict[str, float] = {
+    # 距离类（distance_limit）
+    # 单票装/卸/赴装货空驶距离超限的默认单位罚金（D002/D006/D008 实测 ¥100/次）。
+    "distance_limit_haul_pickup": 100.0,
+    # 月度空驶赶路距离的默认每公里罚金（D003 实测 ≈¥1-10/km，取保守上界）。
+    "distance_limit_monthly_deadhead": 10.0,
+    # 区域类（forbidden_zone）：禁入圆区/矩形区的默认单次罚金（D001/D003 实测 ¥1,000/次）。
+    "forbidden_zone": 1000.0,
+    # 时间窗类：禁行窗的默认单日罚金（D003/D005/D007 严格夜禁 ¥200/天）。
+    "no_drive_window_default": 200.0,
+    # 接单频次：同日接单超限的默认每多一单罚金（D004 实测 ¥200/单）。
+    "daily_order_limit": 200.0,
+    # 首单晚于截止时间的默认罚金（D004 实测 ¥200/次）。
+    "first_order_rule": 200.0,
+    # 回家约束违反的默认罚金（D009/D010 实测 ¥600/次）。
+    "home_rule": 600.0,
+    # 优先货源的默认错失/接单激励（D005/D007 实测 ¥5,000/单）。
+    "preferred_cargo": 5000.0,
+    # 定时事件（家事/接送等）的默认罚金（D010 家事 ¥3,000/事件 cap）。
+    "timed_stay_event": 3000.0,
+    # 每日连续休息不足的默认单日罚金（D008/D010 实测 ¥200-400/天）。
+    "rest_rule": 200.0,
+    # 月度休息日不足的默认罚金（D008/D010 月度 cap ¥3,000）。
+    "monthly_day_off": 3000.0,
+    # 必访点未达成的默认罚金（D010 类场景）。
+    "must_visit": 3000.0,
+}
+"""dataset-agnostic 罚金兜底表，键名与 scoring._penalty_default 调用一一对应。"""

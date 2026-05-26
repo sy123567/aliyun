@@ -1,0 +1,89 @@
+[
+  {
+    "id": "forbidden_category_basic",
+    "content": "不接化工塑料品类。",
+    "penalty_amount": 500,
+    "penalty_cap": null,
+    "expect": {"forbidden_category": ["化工塑料"]}
+  },
+  {
+    "id": "avoid_category_basic",
+    "content": "尽量不拉鲜活水产品。",
+    "penalty_amount": 100,
+    "penalty_cap": 1000,
+    "expect": {"avoid_category": ["鲜活水产品"]}
+  },
+  {
+    "id": "no_drive_night_basic",
+    "content": "晚上23点至次日4点不接单不空驶。",
+    "penalty_amount": 800,
+    "penalty_cap": null,
+    "expect": {"no_drive_window": {"start_minute": 1380, "end_minute": 1680}}
+  },
+  {
+    "id": "soft_no_drive_noon",
+    "content": "中午12点至下午1点尽量不接单不空跑。",
+    "penalty_amount": 100,
+    "penalty_cap": 3000,
+    "expect": {"no_drive_window": {"start_minute": 720, "end_minute": 780}}
+  },
+  {
+    "id": "home_rule_combo",
+    "content": "每天23点前车辆须在自家位置（23.12，113.28）一公里内，23点至次日8点不接单不空跑。",
+    "penalty_amount": 900,
+    "penalty_cap": null,
+    "expect": {
+      "home_rule": {"home_by_hour": 23, "no_drive_until_hour": 8, "radius_km": 1.0},
+      "no_drive_window_contains": {"start_minute": 1380, "end_minute": 1920}
+    }
+  },
+  {
+    "id": "monthly_day_off",
+    "content": "每个自然月至少4天完全不接单不出车。",
+    "penalty_amount": 2000,
+    "penalty_cap": null,
+    "expect": {"monthly_day_off": {"required_days": 4}}
+  },
+  {
+    "id": "first_order_before_noon",
+    "content": "如当天接单，首单不得晚于12点。",
+    "penalty_amount": 200,
+    "penalty_cap": null,
+    "expect": {"first_order_rule": {"before_hour": 12}}
+  },
+  {
+    "id": "distance_haul_limit",
+    "content": "单笔装货点至卸货点距离不得超过300公里。",
+    "penalty_amount": 500,
+    "penalty_cap": null,
+    "expect": {"distance_limit": {"kind": "haul", "max_km": 300.0}}
+  },
+  {
+    "id": "distance_pickup_limit",
+    "content": "接单后赴装货空驶不得超过50公里。",
+    "penalty_amount": 300,
+    "penalty_cap": null,
+    "expect": {"distance_limit": {"kind": "pickup", "max_km": 50.0}}
+  },
+  {
+    "id": "distance_monthly_deadhead",
+    "content": "一个月空驶累计不超过2000公里。",
+    "penalty_amount": 10,
+    "penalty_cap": 2000,
+    "expect": {"distance_limit": {"kind": "monthly_deadhead", "max_km": 2000.0}}
+  },
+  {
+    "id": "daily_order_limit",
+    "content": "同一天接单不得超过3单。",
+    "penalty_amount": 300,
+    "penalty_cap": null,
+    "expect": {"daily_order_limit": {"max_orders": 3}}
+  },
+  {
+    "id": "preferred_cargo",
+    "content": "指定熟货源编号8888优先承运。",
+    "penalty_amount": 0,
+    "penalty_cap": null,
+    "expect": {"preferred_cargo_id": "8888"}
+  }
+]

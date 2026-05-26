@@ -1,0 +1,458 @@
+{
+  "month": "2026-03",
+  "simulate_time_seconds": 372.56,
+  "result_files_count": 10,
+  "drivers": [
+    {
+      "driver_id": "D001",
+      "income": {
+        "gross_income": 20025.74,
+        "distance_km": 3373.88,
+        "cost": 5060.82,
+        "preference_penalty": 0.0,
+        "net_income": 14964.92
+      },
+      "token_usage": {
+        "prompt_tokens": 912,
+        "completion_tokens": 3235,
+        "reasoning_tokens": 3034,
+        "total_tokens": 4147
+      },
+      "calculation_aborted": false,
+      "validation_error": null,
+      "preference_check": {
+        "rules": [
+          {
+            "rule": "每日连续熄火休息≥8小时",
+            "violations": 0,
+            "penalty": 0.0,
+            "preference_text": "我这人熬不住连轴转，每天至少连续停车熄火休息满8小时。"
+          },
+          {
+            "rule": "禁接化工塑料/煤炭矿产",
+            "violations": 0,
+            "penalty": 0.0,
+            "preference_text": "不接货源品类为「化工塑料」或「煤炭矿产」的订单。"
+          },
+          {
+            "rule": "深圳市范围内行驶与停车",
+            "violations": 0,
+            "penalty": 0.0,
+            "preference_text": "我就在深圳干活，不出市。从 22.54,114.06 这一带出车；跑车或停车时，车辆位置须始终在深圳市范围内（北纬22.42至22.89，东经113.74至114.66）。"
+          }
+        ]
+      }
+    },
+    {
+      "driver_id": "D002",
+      "income": {
+        "gross_income": 41539.44,
+        "distance_km": 8463.59,
+        "cost": 12695.39,
+        "preference_penalty": 200.0,
+        "net_income": 28644.05
+      },
+      "token_usage": {
+        "prompt_tokens": 1647,
+        "completion_tokens": 1660,
+        "reasoning_tokens": 1500,
+        "total_tokens": 3307
+      },
+      "calculation_aborted": false,
+      "validation_error": null,
+      "preference_check": {
+        "rules": [
+          {
+            "rule": "自然月至少4整天无成交接单（空驶不计）",
+            "free_days": 4,
+            "penalty": 0.0,
+            "preference_text": "自然月内至少要有4个整天不接单。"
+          },
+          {
+            "rule": "不接蔬菜",
+            "violations": 0,
+            "penalty": 0.0,
+            "preference_text": "不接货源品类为「蔬菜」的订单。"
+          },
+          {
+            "rule": "每日连续停车歇脚≥4小时",
+            "violations": 1,
+            "penalty": 200.0,
+            "preference_text": "每天至少有一段连着停车歇满4小时（真熄火歇脚）。"
+          }
+        ]
+      }
+    },
+    {
+      "driver_id": "D003",
+      "income": {
+        "gross_income": 40380.85,
+        "distance_km": 9418.75,
+        "cost": 14128.12,
+        "preference_penalty": 2000.0,
+        "net_income": 24252.72
+      },
+      "token_usage": {
+        "prompt_tokens": 879,
+        "completion_tokens": 1846,
+        "reasoning_tokens": 1647,
+        "total_tokens": 2725
+      },
+      "calculation_aborted": false,
+      "validation_error": null,
+      "preference_check": {
+        "rules": [
+          {
+            "rule": "月度空驶赶路≤100km（超额按公里计）",
+            "deadhead_km": 1943.2,
+            "over_km": 1843.2,
+            "penalty": 2000.0,
+            "preference_text": "一个月空驶赶路里程总和不得超过100公里；仅对超出部分按公里计罚。"
+          },
+          {
+            "rule": "禁入圆区(23.30,113.52)半径20km",
+            "violations": 0,
+            "penalty": 0.0,
+            "preference_text": "车辆不得进入以（23.30，113.52）为圆心、半径20公里的区域。"
+          },
+          {
+            "rule": "凌晨2–5点不接单不空驶",
+            "violations": 0,
+            "penalty": 0.0,
+            "preference_text": "每天凌晨2点至5点不接单、不空车赶路（从发车赶路或去接单时刻计）。"
+          }
+        ]
+      }
+    },
+    {
+      "driver_id": "D004",
+      "income": {
+        "gross_income": 61422.06,
+        "distance_km": 13373.93,
+        "cost": 20060.89,
+        "preference_penalty": 3800.0,
+        "net_income": 37561.17
+      },
+      "token_usage": {
+        "prompt_tokens": 861,
+        "completion_tokens": 1693,
+        "reasoning_tokens": 1528,
+        "total_tokens": 2554
+      },
+      "calculation_aborted": false,
+      "validation_error": null,
+      "preference_check": {
+        "rules": [
+          {
+            "rule": "有接单则首单开工不晚于当日12:00",
+            "violations": 3,
+            "penalty": 600.0,
+            "preference_text": "只要这天接了单，首单开工不得晚于当天中午12点。"
+          },
+          {
+            "rule": "同日接单≤3单",
+            "penalty": 400.0,
+            "preference_text": "同一天接单不得超过3单；每多一单按单计罚（无月度封顶）。"
+          },
+          {
+            "rule": "12–13点不接单不空驶",
+            "violations": 28,
+            "penalty": 2800.0,
+            "preference_text": "每天中午12点至下午1点吃饭歇脚，不接单、不空车赶路。"
+          }
+        ]
+      }
+    },
+    {
+      "driver_id": "D005",
+      "income": {
+        "gross_income": 33213.44,
+        "distance_km": 5243.79,
+        "cost": 7865.68,
+        "preference_penalty": 200.0,
+        "net_income": 25147.76
+      },
+      "token_usage": {
+        "prompt_tokens": 844,
+        "completion_tokens": 1881,
+        "reasoning_tokens": 1706,
+        "total_tokens": 2725
+      },
+      "calculation_aborted": false,
+      "validation_error": null,
+      "preference_check": {
+        "rules": [
+          {
+            "rule": "单笔装卸距离≤100km",
+            "violations": 2,
+            "penalty": 200.0,
+            "preference_text": "单笔货装货点至卸货点的距离不得超过100公里。"
+          },
+          {
+            "rule": "赴装货点空驶≤90km",
+            "violations": 0,
+            "penalty": 0.0,
+            "preference_text": "接单后赴装货点的空驶距离不得超过90公里。"
+          },
+          {
+            "rule": "每日23–次日6不接单不空驶",
+            "violations": 0,
+            "penalty": 0.0,
+            "preference_text": "每晚23点至次日早6点不接单、不空车赶路。"
+          }
+        ]
+      }
+    },
+    {
+      "driver_id": "D006",
+      "income": {
+        "gross_income": 38303.58,
+        "distance_km": 6500.84,
+        "cost": 9751.26,
+        "preference_penalty": 250.0,
+        "net_income": 28302.32
+      },
+      "token_usage": {
+        "prompt_tokens": 2368,
+        "completion_tokens": 2019,
+        "reasoning_tokens": 1803,
+        "total_tokens": 4387
+      },
+      "calculation_aborted": false,
+      "validation_error": null,
+      "preference_check": {
+        "rules": [
+          {
+            "rule": "每日连续停车休息≥5小时",
+            "violations": 0,
+            "penalty": 0.0,
+            "preference_text": "每天至少有一段连着停车休息满5小时（真停车歇着；送货与空跑不算休息）。"
+          },
+          {
+            "rule": "不接鲜活水产品",
+            "violations": 0,
+            "penalty": 0.0,
+            "preference_text": "不接货源品类为「鲜活水产品」的订单。"
+          },
+          {
+            "rule": "单笔装卸距离≤150km",
+            "violations": 1,
+            "penalty": 250.0,
+            "preference_text": "单笔货装货点至卸货点距离不得超过150公里。"
+          },
+          {
+            "rule": "每月至少2整天不接单且不外跑",
+            "off_days": 2,
+            "penalty": 0.0,
+            "preference_text": "自然月内至少要有2个整天既不接单也不空车乱跑。"
+          }
+        ]
+      }
+    },
+    {
+      "driver_id": "D007",
+      "income": {
+        "gross_income": 34860.11,
+        "distance_km": 6128.27,
+        "cost": 9192.41,
+        "preference_penalty": 200.0,
+        "net_income": 25467.7
+      },
+      "token_usage": {
+        "prompt_tokens": 1378,
+        "completion_tokens": 1981,
+        "reasoning_tokens": 1756,
+        "total_tokens": 3359
+      },
+      "calculation_aborted": false,
+      "validation_error": null,
+      "preference_check": {
+        "rules": [
+          {
+            "rule": "每日23–次日4不接单不空驶",
+            "violations": 0,
+            "penalty": 0.0,
+            "preference_text": "每天23点至次日4点不接单、不空车赶路；路边停车等人不算违规。"
+          },
+          {
+            "rule": "不接机械设备",
+            "violations": 0,
+            "penalty": 0.0,
+            "preference_text": "不接货源品类为「机械设备」的订单。"
+          },
+          {
+            "rule": "单笔装卸距离≤180km",
+            "violations": 1,
+            "penalty": 200.0,
+            "preference_text": "单笔货装货点至卸货点距离不得超过180公里。"
+          },
+          {
+            "rule": "自然月至少放空一整天不接单",
+            "free_days": 1,
+            "penalty": 0.0,
+            "preference_text": "自然月内至少放空一整天不接单。"
+          }
+        ]
+      }
+    },
+    {
+      "driver_id": "D008",
+      "income": {
+        "gross_income": 45005.12,
+        "distance_km": 9284.42,
+        "cost": 13926.63,
+        "preference_penalty": 1100.0,
+        "net_income": 29978.49
+      },
+      "token_usage": {
+        "prompt_tokens": 6698,
+        "completion_tokens": 2066,
+        "reasoning_tokens": 1840,
+        "total_tokens": 8764
+      },
+      "calculation_aborted": false,
+      "validation_error": null,
+      "preference_check": {
+        "rules": [
+          {
+            "rule": "自然月至少2天完全歇着",
+            "off_days": 2,
+            "penalty": 0.0,
+            "preference_text": "自然月内至少要有2天完全歇着：不接单也不空车乱跑。"
+          },
+          {
+            "rule": "平日连续停车休息≥4小时",
+            "violations": 2,
+            "penalty": 800.0,
+            "preference_text": "平日每天连续停车休息满4小时。"
+          },
+          {
+            "rule": "尽量不拉食品饮料",
+            "violations": 1,
+            "penalty": 200.0,
+            "preference_text": "尽量不拉货源品类为「食品饮料」的订单。"
+          },
+          {
+            "rule": "赴装货点空驶≤50km",
+            "violations": 1,
+            "penalty": 100.0,
+            "preference_text": "接单后赴装货点空驶距离不得超过50公里。"
+          }
+        ]
+      }
+    },
+    {
+      "driver_id": "D009",
+      "income": {
+        "gross_income": 26059.44,
+        "distance_km": 6287.0,
+        "cost": 9430.5,
+        "preference_penalty": 900.0,
+        "net_income": 15728.94
+      },
+      "token_usage": {
+        "prompt_tokens": 3686,
+        "completion_tokens": 8340,
+        "reasoning_tokens": 7674,
+        "total_tokens": 12026
+      },
+      "calculation_aborted": false,
+      "validation_error": null,
+      "preference_check": {
+        "rules": [
+          {
+            "rule": "临时约定熟货240646",
+            "satisfied": true,
+            "penalty": 0.0,
+            "preference_text": "【临时约定·熟货】指定熟货源编号240646（品类「服饰纺织皮革」）：装货地：韶关市浈江区（24.81，113.58）；上架时间：2026-03-03 14:43:36；不接则丧失该老客户信任，经济损失10000元。"
+          },
+          {
+            "rule": "每日23点前到家且夜间不接单不空驶",
+            "violations": 1,
+            "penalty": 900.0,
+            "preference_text": "每天23点前车辆须在自家位置（23.12，113.28）一公里内；当天23点至次日8点不接单、不空跑。"
+          },
+          {
+            "rule": "不接快递快运搬家",
+            "violations": 0,
+            "penalty": 0.0,
+            "preference_text": "不接货源品类为「快递快运搬家」的订单。"
+          }
+        ]
+      }
+    },
+    {
+      "driver_id": "D010",
+      "income": {
+        "gross_income": 44790.87,
+        "distance_km": 12598.04,
+        "cost": 18897.06,
+        "preference_penalty": 1640.0,
+        "net_income": 24253.81
+      },
+      "token_usage": {
+        "prompt_tokens": 18804,
+        "completion_tokens": 6720,
+        "reasoning_tokens": 6006,
+        "total_tokens": 25524
+      },
+      "calculation_aborted": false,
+      "validation_error": null,
+      "preference_check": {
+        "rules": [
+          {
+            "rule": "家事临时约定(3/10–3/13)",
+            "sequence_ok": true,
+            "home_window": [
+              13560,
+              17880
+            ],
+            "minutes_not_home_in_window": 208,
+            "pickup_done_minute": 13755,
+            "first_home_minute": 13768,
+            "penalty_absence_minutes": 1040.0,
+            "triggers_spouse_incomplete": false,
+            "never_arrived_home": false,
+            "left_after_arrival": false,
+            "triggers_early_leave": false,
+            "penalty_fixed_9000": 0.0,
+            "penalty": 1040.0,
+            "preference_text": "【临时约定·家事】2026年3月10日10:00，家中急事：须先到（23.21，113.37）接上配偶（原地停留不少于10分钟），再返回老家（23.19，113.36）；须在2026年3月10日22:00前进家门，到家后须在原处静止，至少待到2026年3月13日22:00事情解决方可再出车。解决前（2026年3月10日22:00至2026年3月13日22:00）每迟到或不在家1分钟罚5元、上不封顶。未接到配偶即抵达老家、完全未抵达家中或提前离家，满足任一项额外一次性罚9000元。"
+          },
+          {
+            "rule": "月度至少5日到访指定点半径1km",
+            "visit_days": 22,
+            "penalty": 0.0,
+            "preference_text": "自然月内至少5个不同的自然日到过（23.13，113.26）一公里内；同日多次只算一天。"
+          },
+          {
+            "rule": "每日连续停车休息≥3小时",
+            "violations": 2,
+            "penalty": 600.0,
+            "preference_text": "每天连续停车休息至少3小时。"
+          },
+          {
+            "rule": "尽量不拉服饰纺织皮革",
+            "violations": 0,
+            "penalty": 0.0,
+            "preference_text": "尽量不拉货源品类为「服饰纺织皮革」的订单。"
+          }
+        ]
+      }
+    }
+  ],
+  "summary": {
+    "total_net_income_all_drivers": 254301.88,
+    "total_preference_penalty": 10290.0,
+    "total_token_usage": {
+      "prompt_tokens": 38077,
+      "completion_tokens": 31441,
+      "reasoning_tokens": 28494,
+      "total_tokens": 69518
+    },
+    "failed_driver_count": 0,
+    "failed_drivers": {}
+  },
+  "cost_meaning": "cost = distance_km * cost_per_km (driver cost per km)",
+  "cost_metric": "net_income = gross_income - (distance_km * cost_per_km)"
+}

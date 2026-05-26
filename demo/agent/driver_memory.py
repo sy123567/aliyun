@@ -51,6 +51,29 @@ class HourBucket:
     sum_price_per_minute: float = 0.0
 
 
+def _project_no_drive_window(day_start: int, start_minute: int, end_minute: int) -> list[tuple[int, int]]:
+    if end_minute <= 24 * 60:
+        return [(day_start + start_minute, day_start + end_minute)]
+    return [
+        (day_start + start_minute, day_start + 24 * 60),
+        (day_start + 24 * 60, day_start + 24 * 60 + (end_minute - 24 * 60)),
+    ]
+
+
+def _no_drive_window_hit_dates(action_start_minutes: int, action_end_minutes: int, window: Any) -> set[str]:
+    if action_end_minutes <= action_start_minutes:
+        action_end_minutes = action_start_minutes + 1
+    hit_dates: set[str] = set()
+    first_day = max(0, action_start_minutes // 1440 - 1)
+    last_day = max(first_day, action_end_minutes // 1440 + 1)
+    for day_idx in range(first_day, last_day + 1):
+        day_start = day_idx * 1440
+        for ws, we in _project_no_drive_window(day_start, int(window.start_minute), int(window.end_minute)):
+            if min(action_end_minutes, we) > max(action_start_minutes, ws):
+                hit_dates.add(geo_utils.date_str(day_start))
+    return hit_dates
+
+
 @dataclass
 class DriverMemory:
     """单司机决策上下文，跨步骤累积。"""
@@ -84,6 +107,7 @@ class DriverMemory:
 
     # 偏好违规累积（penalty_cap 限流判断用）：rule_id -> 累计罚金
     preference_penalty_accum: dict[str, float] = field(default_factory=dict)
+    preference_violation_days: dict[str, set[str]] = field(default_factory=lambda: defaultdict(set))
 
     # 热点：grid_key -> HotspotCell
     hotspots: dict[tuple[int, int], HotspotCell] = field(default_factory=dict)
@@ -244,6 +268,29 @@ class DriverMemory:
             self.consecutive_wait_count += 1
         else:
             return
+        if self.rules is not None and action_name in {"take_order", "reposition"}:
+            if action_name == "take_order" and not bool(result.get("accepted", False)):
+                return
+            self._record_no_drive_window_violations(action_start_minutes, sim_minutes_after)
+
+    def _record_no_drive_window_violations(self, action_start_minutes: int, action_end_minutes: int) -> None:
+        rules = self.rules
+        if rules is None:
+            return
+        for window in getattr(rules, "no_drive_windows", []) or []:
+            penalty = float(getattr(window, "penalty_amount", 0.0) or 0.0)
+            if penalty <= 0:
+                continue
+            rule_id = f"nodrive_{int(window.start_minute)}"
+            days = _no_drive_window_hit_dates(action_start_minutes, action_end_minutes, window)
+            if not days:
+                continue
+            self.preference_violation_days[rule_id].update(days)
+            raw = penalty * len(self.preference_violation_days[rule_id])
+            cap = getattr(window, "penalty_cap", None)
+            if cap is not None and float(cap) > 0:
+                raw = min(raw, float(cap))
+            self.preference_penalty_accum[rule_id] = raw
 
     def _mark_active_days(self, action_start_minutes: int, action_end_minutes: int) -> None:
         """将 [action_start, action_end] 跨过的每个自然日均加入 daily_active。

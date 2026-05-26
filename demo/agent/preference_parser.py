@@ -808,13 +808,22 @@ kind 枚举与 params 要求：
 - home_rule:         {"lat": float, "lng": float, "radius_km": float,
                       "home_by_hour": int (0..24),                  几点前需到家
                       "no_drive_until_hour": int (0..24)}            次日几点前不接不空
+- home_and_no_drive: 同 home_rule，另可包含 {"no_drive_start_minute": int, "no_drive_end_minute": int}
+- soft_no_drive_window: {"start_minute": 0..1440, "end_minute": 0..2880}
+                                                                    低额/尽量类禁行，按天或 cap 软计罚
 - monthly_day_off:   {"required_days": int}                          月内至少几天不出车
 - daily_order_limit: {"max_orders": int}                             每日接单上限
 - distance_limit:    {"kind": "haul|pickup|monthly_deadhead", "max_km": float}
                                                                     haul=单笔干线，pickup=赴装货空驶，
                                                                     monthly_deadhead=月累计空驶
 - first_order_rule:  {"before_hour": int (0..24)}                    首单不得晚于几点
-- preferred_cargo:   {"cargo_id": "字符串"}                          点名熟货源
+- preferred_cargo:   {"cargo_id": "字符串", "lat": 可选float, "lng": 可选float,
+                      "available_minutes": 可选int}                 点名熟货源
+- timed_stay_event:  {"start_minutes": int, "pickup_lat": float, "pickup_lng": float,
+                      "home_lat": float, "home_lng": float, "deadline_minutes": int,
+                      "stay_until_minutes": int, "pickup_stay_minutes": 可选int,
+                      "radius_km": 可选float, "absence_penalty_per_minute": 可选float}
+                                                                    临时家事/接人/回家/停留事件
 - complex:           {"note": "原因描述"}                            无法准确结构化
 
 重要要求：
@@ -822,7 +831,9 @@ kind 枚举与 params 要求：
 2. “不接品类 X”/“禁运”=forbidden_category；“尽量不”=avoid_category。
 3. 夜间“23点至次日4点”应输出 start_minute=1380, end_minute=1680。
 4. 一条偏好可能包含多个规则（例如同时含回家 + 禁出区），可在该 index 下返回多条。
-5. 不肯定的条目一律用 complex，不要猜。"""
+5. penalty_amount/penalty_cap 默认沿用输入；罚分单位若为每分钟，写入 absence_penalty_per_minute。
+6. “上不封顶”输出 penalty_cap=null。
+7. 不肯定的条目一律用 complex，不要猜。"""
 
 
 def _llm_parse_all(
@@ -949,10 +960,10 @@ def _absorb_llm_rule(
                     )
                 )
             return True
-        if kind == "no_drive_window":
+        if kind in {"no_drive_window", "soft_no_drive_window"}:
             start = int(params.get("start_minute", 0))
             end = int(params.get("end_minute", 0))
-            if end <= start:
+            if start < 0 or start > 1440 or end <= start or end > 2880:
                 return False
             rules.no_drive_windows.append(
                 TimeWindowRule(
@@ -965,11 +976,16 @@ def _absorb_llm_rule(
             )
             return True
         if kind == "forbidden_zone":
+            lat = float(params.get("lat", 0.0))
+            lng = float(params.get("lng", 0.0))
+            radius_km = float(params.get("radius_km", 0.0))
+            if not (-90 <= lat <= 90 and -180 <= lng <= 180 and radius_km > 0):
+                return False
             rules.forbidden_zones.append(
                 CircleZone(
-                    lat=float(params.get("lat", 0.0)),
-                    lng=float(params.get("lng", 0.0)),
-                    radius_km=float(params.get("radius_km", 0.0)),
+                    lat=lat,
+                    lng=lng,
+                    radius_km=radius_km,
                     raw=str(source_item.get("content", "")),
                     penalty_amount=penalty_amount,
                     penalty_cap=penalty_cap,
@@ -977,12 +993,18 @@ def _absorb_llm_rule(
             )
             return True
         if kind == "must_visit":
+            lat = float(params.get("lat", 0.0))
+            lng = float(params.get("lng", 0.0))
+            radius_km = float(params.get("radius_km", 1.0))
+            required_days = int(params.get("required_days", 1))
+            if not (-90 <= lat <= 90 and -180 <= lng <= 180 and radius_km > 0 and required_days > 0):
+                return False
             rules.must_visit.append(
                 MustVisitRule(
-                    lat=float(params.get("lat", 0.0)),
-                    lng=float(params.get("lng", 0.0)),
-                    radius_km=float(params.get("radius_km", 1.0)),
-                    required_days=int(params.get("required_days", 1)),
+                    lat=lat,
+                    lng=lng,
+                    radius_km=radius_km,
+                    required_days=required_days,
                     penalty_amount=penalty_amount,
                     penalty_cap=penalty_cap,
                 )
@@ -1007,16 +1029,52 @@ def _absorb_llm_rule(
                 )
             )
             return True
-        if kind == "home_rule":
+        if kind in {"home_rule", "home_and_no_drive"}:
+            lat = float(params.get("lat", 0.0))
+            lng = float(params.get("lng", 0.0))
+            radius_km = float(params.get("radius_km", 1.0))
+            # LLM 偶尔会漏掉 home_by_hour / no_drive_until_hour，导致掉入默认值（23/6）。
+            # 当原文里能解析出明确时段范围时，优先用原文兜底，避免和文本不一致。
+            src_content = str(source_item.get("content", ""))
+            src_rng = _extract_hour_range(src_content)
+            hb_raw = params.get("home_by_hour")
+            nu_raw = params.get("no_drive_until_hour")
+            if hb_raw is None and src_rng is not None:
+                home_by_hour = src_rng[0]
+            else:
+                home_by_hour = int(hb_raw) if hb_raw is not None else 23
+            if nu_raw is None and src_rng is not None:
+                no_drive_until_hour = src_rng[1]
+            else:
+                no_drive_until_hour = int(nu_raw) if nu_raw is not None else 6
+            if not (-90 <= lat <= 90 and -180 <= lng <= 180 and radius_km > 0):
+                return False
+            if not (0 <= home_by_hour <= 24 and 0 <= no_drive_until_hour <= 24):
+                return False
             rules.home_rule = HomeRule(
-                lat=float(params.get("lat", 0.0)),
-                lng=float(params.get("lng", 0.0)),
-                radius_km=float(params.get("radius_km", 1.0)),
-                home_by_hour=int(params.get("home_by_hour", 23)),
-                no_drive_until_hour=int(params.get("no_drive_until_hour", 6)),
+                lat=lat,
+                lng=lng,
+                radius_km=radius_km,
+                home_by_hour=home_by_hour,
+                no_drive_until_hour=no_drive_until_hour,
                 penalty_amount=penalty_amount,
                 penalty_cap=penalty_cap,
             )
+            if kind == "home_and_no_drive":
+                start = int(params.get("no_drive_start_minute", home_by_hour * 60))
+                end = int(params.get("no_drive_end_minute", no_drive_until_hour * 60))
+                if end <= start:
+                    end += 24 * 60
+                if 0 <= start <= 1440 and start < end <= 2880:
+                    rules.no_drive_windows.append(
+                        TimeWindowRule(
+                            start_minute=start,
+                            end_minute=end,
+                            raw=str(source_item.get("content", "")),
+                            penalty_amount=penalty_amount,
+                            penalty_cap=penalty_cap,
+                        )
+                    )
             return True
         if kind == "monthly_day_off":
             rules.monthly_day_off = MonthlyDayOffRule(
@@ -1062,16 +1120,67 @@ def _absorb_llm_rule(
                 lat = params.get("lat")
                 lng = params.get("lng")
                 available_minutes = params.get("available_minutes")
+                lat_value = float(lat) if lat is not None else None
+                lng_value = float(lng) if lng is not None else None
+                if lat_value is not None and not -90 <= lat_value <= 90:
+                    return False
+                if lng_value is not None and not -180 <= lng_value <= 180:
+                    return False
                 rules.preferred_cargo.append(
                     PreferredCargoRule(
                         cargo_id=cargo_id,
-                        lat=float(lat) if lat is not None else None,
-                        lng=float(lng) if lng is not None else None,
+                        lat=lat_value,
+                        lng=lng_value,
                         available_minutes=int(available_minutes) if available_minutes is not None else None,
                         penalty_amount=penalty_amount,
                         penalty_cap=penalty_cap,
                     )
                 )
+            return True
+        if kind == "timed_stay_event":
+            start_minutes = int(params.get("start_minutes"))
+            pickup_lat = float(params.get("pickup_lat"))
+            pickup_lng = float(params.get("pickup_lng"))
+            home_lat = float(params.get("home_lat"))
+            home_lng = float(params.get("home_lng"))
+            deadline_minutes = int(params.get("deadline_minutes"))
+            stay_until_minutes = int(params.get("stay_until_minutes"))
+            pickup_stay_minutes = int(params.get("pickup_stay_minutes", 10))
+            radius_km = float(params.get("radius_km", 1.0))
+            absence_unit = float(params.get("absence_penalty_per_minute", 5.0))
+            if not (0 <= start_minutes <= deadline_minutes <= stay_until_minutes):
+                return False
+            if not (
+                -90 <= pickup_lat <= 90
+                and -180 <= pickup_lng <= 180
+                and -90 <= home_lat <= 90
+                and -180 <= home_lng <= 180
+                and pickup_stay_minutes > 0
+                and radius_km > 0
+                and absence_unit >= 0
+            ):
+                return False
+            event = TimedStayEventRule(
+                start_minutes=start_minutes,
+                pickup_lat=pickup_lat,
+                pickup_lng=pickup_lng,
+                home_lat=home_lat,
+                home_lng=home_lng,
+                deadline_minutes=deadline_minutes,
+                stay_until_minutes=stay_until_minutes,
+                pickup_stay_minutes=pickup_stay_minutes,
+                radius_km=radius_km,
+                absence_penalty_per_minute=absence_unit,
+                penalty_amount=penalty_amount,
+                penalty_cap=penalty_cap,
+            )
+            if not any(
+                e.start_minutes == event.start_minutes
+                and abs(e.pickup_lat - event.pickup_lat) < 1e-6
+                and abs(e.home_lat - event.home_lat) < 1e-6
+                for e in rules.timed_stay_events
+            ):
+                rules.timed_stay_events.append(event)
             return True
         if kind == "complex":
             return False  # 交给正则安全网、正则也失败则计入 unparsed

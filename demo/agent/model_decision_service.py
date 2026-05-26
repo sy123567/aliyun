@@ -463,6 +463,16 @@ class ModelDecisionService:
             rules.parse_failure_count,
             len(memory.preference_state.dynamic_changes),
         )
+        if rules.parse_failure_count > 0 and rules.unparsed:
+            # 高风险：未解析的偏好可能导致评分模块完全错过该约束。
+            # 截断到前 5 条避免日志爆炸；换数据集时需重点排查。
+            sample = [str(item.get("content", ""))[:80] for item in rules.unparsed[:5]]
+            self._logger.warning(
+                "偏好存在未解析条目 driver_id=%s count=%s samples=%s",
+                driver_id,
+                rules.parse_failure_count,
+                sample,
+            )
         return rules
 
     def _make_llm_caller(self, driver_id: str, memory: driver_memory.DriverMemory):
@@ -563,7 +573,7 @@ class ModelDecisionService:
                     selected_ids.add(cargo_id)
         for item in selected:
             scored = scoring.score_take_order(item, rules, memory, ctx)
-            candidates.append(scored)
+            candidates.append(scoring._finalize_score(scored))
         return candidates
 
     def _build_wait_candidates(
@@ -575,7 +585,10 @@ class ModelDecisionService:
     ) -> list[ScoredAction]:
         durations = scoring.build_wait_durations(rules, ctx, memory)
         candidates = [
-            scoring.score_wait(d, rules, memory, ctx, has_good_order=has_good_order) for d in durations
+            scoring._finalize_score(
+                scoring.score_wait(d, rules, memory, ctx, has_good_order=has_good_order)
+            )
+            for d in durations
         ]
         return candidates
 
@@ -637,7 +650,7 @@ class ModelDecisionService:
         deduped = deduped_priority[:max_priority_slots] + deduped_non_priority
         deduped = deduped[:_TOP_REPOSITION_TARGETS]
         return [
-            scoring.score_reposition(t[0], t[1], rules, memory, ctx)
+            scoring._finalize_score(scoring.score_reposition(t[0], t[1], rules, memory, ctx))
             for t in deduped
         ]
 

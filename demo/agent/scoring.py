@@ -7,6 +7,29 @@
 - 成本侧：行驶成本（里程 × cost_per_km）、时间机会成本、装货等待。
 - 风险侧：偏好命中罚分预估、月度仿真上界风险。
 - 偏好侧：硬约束直接过滤，软偏好计入罚分。
+
+架构分层（PR#28）
+-----------------
+本模块按"数据集无关 + 数据集相关"两层组织：
+
+1. **数据集无关层**（dataset-agnostic）：
+   - :data:`config.PENALTY_DEFAULTS`：所有罚金兜底值（仅当规则字段未提供时使用）。
+   - :func:`_penalty_default`：按 ``kind`` 键读取兜底罚金，统一替代 ``or N.0`` 模式。
+   - :func:`_finalize_score`：评分结果验证钩子，统一拦截 NaN/Inf、确保 breakdown 与 score 一致。
+
+2. **数据集相关层**（dataset-specific）：
+   - :class:`ParsedRules` 携带从司机偏好文本里解析出的 ``penalty_amount`` / ``penalty_cap`` 等参数。
+   - 当某条规则未提供 ``penalty_amount`` 时由 ``_penalty_default`` 兜底，保证新数据集亦可工作。
+
+   规则的具体业务语义（如 first_order 截止前 2h 给 urgency bonus）在三大入口
+   :func:`score_take_order`、:func:`score_wait`、:func:`score_reposition` 中实现，
+   并在出口统一经过 ``_finalize_score`` 校验，保证：
+
+   * 不返回 NaN/Inf；
+   * breakdown 各项相加 ≈ score（容差 1e-6）；
+   * feasible=False 时 score 必为负惩罚（用于排序）。
+
+这样既允许业务逻辑灵活适配各司机偏好，也保证跨数据集的评分稳定性与可观测性。
 """
 
 from __future__ import annotations
@@ -32,6 +55,108 @@ DEFAULT_OPPORTUNITY_COST_PER_MINUTE = config.DEFAULT_OPPORTUNITY_COST_PER_MINUTE
 HORIZON_OVERFLOW_PENALTY = config.HORIZON_OVERFLOW_PENALTY
 DEFAULT_REPOSITION_SPEED_KMH = config.DEFAULT_REPOSITION_SPEED_KMH
 HARD_CONSTRAINT_PENALTY = config.HARD_CONSTRAINT_PENALTY
+
+# ---------------- 数据集无关层 ----------------
+
+# 评分一致性校验容差：breakdown 各项求和 vs. score 的允许误差（元）。
+_FINALIZE_SCORE_TOLERANCE = 1e-6
+
+# 评分一致性校验断言：仅在显式启用时抛错，否则 silent-fix 并记录到 breakdown。
+# 由 config.SCORING_STRICT_VALIDATION 控制（默认 False，避免影响仿真）。
+_STRICT_VALIDATION = getattr(config, "SCORING_STRICT_VALIDATION", False)
+
+
+def _penalty_default(kind: str) -> float:
+    """读取 ``config.PENALTY_DEFAULTS`` 中 ``kind`` 对应的兜底罚金。
+
+    设计目的：替代 scoring.py 中散落的 ``rule.penalty_amount or N.0`` 模式，
+    把数据集无关的兜底值集中到 :data:`config.PENALTY_DEFAULTS` 一处维护。
+
+    参数
+    ----
+    kind: 兜底键名，必须在 ``config.PENALTY_DEFAULTS`` 中存在。
+
+    返回
+    ----
+    对应的兜底罚金（元）；若键不存在，返回 ``0.0`` 并记录调试信息（不抛异常，
+    保证未注册的 kind 在生产环境下退化为「无罚金」而非崩溃）。
+    """
+    defaults: dict[str, float] = getattr(config, "PENALTY_DEFAULTS", {})
+    val = defaults.get(kind)
+    if val is None:
+        # 未注册的 kind 在严格模式下抛错，便于开发期暴露问题；生产模式下静默返回 0。
+        if _STRICT_VALIDATION:
+            raise KeyError(f"penalty default '{kind}' not registered in config.PENALTY_DEFAULTS")
+        return 0.0
+    return float(val)
+
+
+def _finalize_score(scored: "ScoredAction") -> "ScoredAction":
+    """评分结果的统一出口校验。
+
+    校验项目（顺序执行，前者失败即拦截）：
+
+    1. **NaN/Inf 拦截**：若 ``score`` 或 ``breakdown`` 中任一值为 NaN/Inf，
+       将其重置为 ``-HARD_CONSTRAINT_PENALTY`` 并把 feasible 标记为 False，
+       同时在 breakdown 写入 ``_finalize_nan_inf`` 标记，便于日志侧排查。
+
+    2. **breakdown 一致性**：``sum(breakdown.values())`` 与 ``score`` 的差
+       超过 ``_FINALIZE_SCORE_TOLERANCE`` 时，记录 ``_finalize_drift`` 项
+       表示差额，不修改 score（不破坏现有调优）。
+
+    3. **不可行评分必须为负**：``feasible=False`` 时 score 应为负惩罚；
+       违反时把 score 修正为 ``-HARD_CONSTRAINT_PENALTY``。
+
+    严格模式（``config.SCORING_STRICT_VALIDATION=True``，开发期使用）下
+    所有违规均抛 ``AssertionError``；默认生产模式下静默修复，确保仿真不被中断。
+
+    返回经过校验/修复后的 ``ScoredAction``（就地修改，亦原样返回，便于链式调用）。
+    """
+    import math
+
+    # 1) NaN / Inf 拦截
+    bad_values: list[str] = []
+    if not math.isfinite(scored.score):
+        bad_values.append("score")
+    for key, val in list(scored.breakdown.items()):
+        if not math.isfinite(val):
+            bad_values.append(key)
+    if bad_values:
+        if _STRICT_VALIDATION:
+            raise AssertionError(
+                f"_finalize_score: non-finite values in {scored.action}: {bad_values}"
+            )
+        scored.breakdown = {
+            k: v for k, v in scored.breakdown.items() if math.isfinite(v)
+        }
+        scored.breakdown["_finalize_nan_inf"] = -float(HARD_CONSTRAINT_PENALTY)
+        scored.score = -float(HARD_CONSTRAINT_PENALTY)
+        scored.feasible = False
+        scored.note = (scored.note + "|nan_inf_blocked").strip("|")
+        return scored
+
+    # 2) breakdown ≈ score 一致性（不修复 score，仅打标）
+    if scored.breakdown:
+        total = sum(scored.breakdown.values())
+        drift = scored.score - total
+        if abs(drift) > _FINALIZE_SCORE_TOLERANCE:
+            if _STRICT_VALIDATION:
+                raise AssertionError(
+                    f"_finalize_score: breakdown sum {total:.6f} != score {scored.score:.6f} "
+                    f"(drift {drift:.6f}) in {scored.action}"
+                )
+            scored.breakdown["_finalize_drift"] = drift
+
+    # 3) 不可行评分必须为负
+    if not scored.feasible and scored.score >= 0:
+        if _STRICT_VALIDATION:
+            raise AssertionError(
+                f"_finalize_score: infeasible action {scored.action} has non-negative score {scored.score}"
+            )
+        scored.score = -float(HARD_CONSTRAINT_PENALTY)
+        scored.note = (scored.note + "|infeasible_score_fixed").strip("|")
+
+    return scored
 
 # 评分明细 key 到 ScoringWeights 字段的映射；未列出的项统一使用 preference_risk。
 _WEIGHT_MAP: dict[str, str] = {
@@ -155,6 +280,9 @@ def _is_preference_near_violation(rules: ParsedRules, memory: DriverMemory) -> b
         caps["home_rule"] = float(rules.home_rule.penalty_cap)
     for window in rules.no_drive_windows:
         if window.penalty_cap is not None and window.penalty_cap > 0:
+            window_penalty = float(window.penalty_amount or 0.0)
+            if 0 < window_penalty <= config.NO_DRIVE_SOFT_PENALTY_THRESHOLD:
+                continue
             caps[f"nodrive_{window.start_minute}"] = float(window.penalty_cap)
     for rule_id, accum in memory.preference_penalty_accum.items():
         cap = caps.get(rule_id)
@@ -353,6 +481,42 @@ def _soft_no_drive_defer_multiplier(window: TimeWindowRule, current_minutes: int
     return 1.0
 
 
+def _soft_no_drive_marginal_charge(
+    window: TimeWindowRule,
+    action_start_minutes: int,
+    action_end_minutes: int,
+    memory: DriverMemory,
+) -> float:
+    penalty = float(window.penalty_amount or 0.0)
+    if penalty <= 0:
+        return 0.0
+    rule_id = f"nodrive_{int(window.start_minute)}"
+    cap = window.penalty_cap
+    accumulated = float(memory.preference_penalty_accum.get(rule_id, 0.0) or 0.0)
+    if cap is not None and float(cap) > 0 and accumulated >= float(cap) * 0.95:
+        return 0.0
+    hit_dates: set[str] = set()
+    if action_end_minutes <= action_start_minutes:
+        action_end_minutes = action_start_minutes + 1
+    first_day = max(0, action_start_minutes // 1440 - 1)
+    last_day = max(first_day, action_end_minutes // 1440 + 1)
+    for day_idx in range(first_day, last_day + 1):
+        day_start = day_idx * 1440
+        for ws, we in _project_rule_to_minutes(day_start, int(window.start_minute), int(window.end_minute)):
+            if min(action_end_minutes, we) > max(action_start_minutes, ws):
+                hit_dates.add(geo_utils.date_str(day_start))
+    if not hit_dates:
+        return 0.0
+    existing = memory.preference_violation_days.get(rule_id, set())
+    new_days = hit_dates - existing
+    if not new_days:
+        return 0.0
+    charge = penalty * len(new_days)
+    if cap is not None and float(cap) > 0:
+        charge = min(charge, max(0.0, float(cap) - accumulated))
+    return charge
+
+
 # ---------------- 接单评分 ----------------
 
 
@@ -530,15 +694,15 @@ def score_take_order(
                 dist_end_to_home = geo_utils.haversine_km(end_lat, end_lng, event.home_lat, event.home_lng)
                 if dist_end_to_home > config.TIMED_EVENT_SOFT_LIMIT_DISTANCE_KM:
                     over_ratio = (dist_end_to_home - config.TIMED_EVENT_SOFT_LIMIT_DISTANCE_KM) / config.TIMED_EVENT_SOFT_LIMIT_DISTANCE_KM
-                    penalty = float(event.penalty_amount or 3000.0) * min(2.0, over_ratio)
+                    penalty = float(event.penalty_amount or _penalty_default("timed_stay_event")) * min(2.0, over_ratio)
                     breakdown["timed_event_soft_distance_penalty"] = -penalty
                     note_parts.append("timed_event_soft_dist_limit")
             if dist_to_pick > cur_dist_to_pick + 30:
-                penalty = float(event.penalty_amount or 3000.0) * 0.3
+                penalty = float(event.penalty_amount or _penalty_default("timed_stay_event")) * 0.3
                 breakdown["timed_event_order_penalty"] = breakdown.get("timed_event_order_penalty", 0.0) - penalty
                 note_parts.append("timed_event_early_approach_away")
             elif dist_to_pick < cur_dist_to_pick - 10:
-                gain = float(event.penalty_amount or 3000.0) * 0.15
+                gain = float(event.penalty_amount or _penalty_default("timed_stay_event")) * 0.15
                 breakdown["timed_event_approach_gain"] = breakdown.get("timed_event_approach_gain", 0.0) + gain
                 note_parts.append("timed_event_early_approach_closer")
             continue
@@ -682,7 +846,7 @@ def score_take_order(
                     note=f"haul_distance_exceed_limit_{limit.max_km}km",
                 )
             over_ratio = (haul_km - limit.max_km) / max(1.0, limit.max_km)
-            pref_penalty += float(limit.penalty_amount or 100.0) * (1.0 + over_ratio * 3.0)
+            pref_penalty += float(limit.penalty_amount or _penalty_default("distance_limit_haul_pickup")) * (1.0 + over_ratio * 3.0)
         elif limit.kind == "pickup" and distance_pickup_km > limit.max_km:
             if distance_pickup_km > limit.max_km * 1.2:
                 return ScoredAction(
@@ -693,12 +857,12 @@ def score_take_order(
                     note=f"pickup_deadhead_exceed_limit_{limit.max_km}km",
                 )
             over_ratio = (distance_pickup_km - limit.max_km) / max(1.0, limit.max_km)
-            pref_penalty += float(limit.penalty_amount or 100.0) * (1.0 + over_ratio * 3.0)
+            pref_penalty += float(limit.penalty_amount or _penalty_default("distance_limit_haul_pickup")) * (1.0 + over_ratio * 3.0)
         elif limit.kind == "monthly_deadhead":
             # 月度空驶赶路上限：按「新增超额公里数 × 单价」计软惩罚，不硬阻拦。
             # 评测仅按累计 over_km × 单价（≈10 元/km）扣分；硬阻拦会让司机在累计稍超即停摆。
             # 原硬阻拦在 D003（限 100km）触发后导致全月 899 次 wait、3 单 → 改为软罚。
-            pen_per_km_t = float(limit.penalty_amount or 10.0)
+            pen_per_km_t = float(limit.penalty_amount or _penalty_default("distance_limit_monthly_deadhead"))
             already_over = max(0.0, memory.total_deadhead_km - limit.max_km)
             new_total = memory.total_deadhead_km + distance_pickup_km
             new_over_km = max(0.0, max(0.0, new_total - limit.max_km) - already_over)
@@ -740,9 +904,9 @@ def score_take_order(
     forbidden_path_penalty = 0.0
     for zone in rules.forbidden_zones:
         if _path_passes_forbidden_zone(ctx.current_lat, ctx.current_lng, start_lat, start_lng, zone):
-            forbidden_path_penalty += float(zone.penalty_amount or 1000.0)
+            forbidden_path_penalty += float(zone.penalty_amount or _penalty_default("forbidden_zone"))
         elif _path_passes_forbidden_zone(start_lat, start_lng, end_lat, end_lng, zone):
-            forbidden_path_penalty += float(zone.penalty_amount or 1000.0)
+            forbidden_path_penalty += float(zone.penalty_amount or _penalty_default("forbidden_zone"))
     if forbidden_path_penalty > 0:
         breakdown["forbidden_zone_penalty"] = -forbidden_path_penalty
 
@@ -778,8 +942,9 @@ def score_take_order(
                 # 多数违规源于「12:30 接单工时 60min」一类显然可延后的决策；若当前时刻就在窗内或窗前 90min，
                 # 把软罚乘以倍数以强化反向偏好；远离窗口的违规（如长单 11:00-13:30 跨过）保留原罚金。
                 multiplier = _soft_no_drive_defer_multiplier(window, ctx.current_minutes)
+                marginal = _soft_no_drive_marginal_charge(window, ctx.current_minutes, finish_minutes, memory)
                 breakdown["no_drive_window_soft_penalty"] = (
-                    breakdown.get("no_drive_window_soft_penalty", 0.0) - window_penalty * multiplier
+                    breakdown.get("no_drive_window_soft_penalty", 0.0) - marginal * multiplier
                 )
                 note_parts.append("no_drive_soft_window")
             continue
@@ -807,7 +972,7 @@ def score_take_order(
         already = memory.daily_orders_today(ctx.current_minutes)
         if already + 1 > rules.daily_order_limit.max_orders:
             extra = already + 1 - rules.daily_order_limit.max_orders
-            unit = float(rules.daily_order_limit.penalty_amount or 200.0)
+            unit = float(rules.daily_order_limit.penalty_amount or _penalty_default("daily_order_limit"))
             breakdown["daily_order_limit_penalty"] = -unit * extra
 
     # 偏好：首单时间
@@ -815,13 +980,13 @@ def score_take_order(
         first_take_minute = geo_utils.minute_of_day(ctx.current_minutes)
         deadline_min_first = rules.first_order_rule.before_hour * 60
         if first_take_minute >= deadline_min_first:
-            breakdown["first_order_late_penalty"] = -float(rules.first_order_rule.penalty_amount or 200.0)
+            breakdown["first_order_late_penalty"] = -float(rules.first_order_rule.penalty_amount or _penalty_default("first_order_rule"))
         else:
             # PR#27: 截止前 PROXIMITY 分钟内若仍未接单，给 take_order 软增益——
             # 与 wait 侧的 first_order_deadline_wait_penalty 配合：take 比 wait 更优。
             gap = deadline_min_first - first_take_minute
             if 0 < gap <= config.FIRST_ORDER_PROXIMITY_BOOST_WINDOW_MINUTES:
-                boost_unit = float(rules.first_order_rule.penalty_amount or 200.0) * config.FIRST_ORDER_PROXIMITY_BOOST_RATIO
+                boost_unit = float(rules.first_order_rule.penalty_amount or _penalty_default("first_order_rule")) * config.FIRST_ORDER_PROXIMITY_BOOST_RATIO
                 # 越接近截止，激励越强（gap 越小、boost 越大）
                 ratio_boost = 1.0 - gap / max(1.0, config.FIRST_ORDER_PROXIMITY_BOOST_WINDOW_MINUTES)
                 breakdown["first_order_proximity_bonus"] = boost_unit * ratio_boost
@@ -845,7 +1010,7 @@ def score_take_order(
             slack = (end_day * 1440 + home_by_min) - (finish_minutes + minutes_to_home_from_end)
             if 0 < slack <= 90:
                 severity = max(0.3, 1.0 - slack / 90.0)
-                breakdown["home_rule_tight_slack_penalty"] = -float(rules.home_rule.penalty_amount or 600.0) * severity
+                breakdown["home_rule_tight_slack_penalty"] = -float(rules.home_rule.penalty_amount or _penalty_default("home_rule")) * severity
                 note_parts.append("home_tight_slack")
         if not can_reach_home_by_deadline and not end_in_home:
             return ScoredAction(
@@ -856,7 +1021,7 @@ def score_take_order(
                 note="home_rule_unreachable",
             )
         if finish_hour >= rules.home_rule.home_by_hour and not end_in_home:
-            breakdown["home_rule_penalty"] = -float(rules.home_rule.penalty_amount or 600.0)
+            breakdown["home_rule_penalty"] = -float(rules.home_rule.penalty_amount or _penalty_default("home_rule"))
         else:
             current_minute = geo_utils.minute_of_day(ctx.current_minutes)
             finish_minute = geo_utils.minute_of_day(finish_minutes)
@@ -871,7 +1036,7 @@ def score_take_order(
             )
             if not end_in_home and (near_home_window or cannot_reach_home_after_order) and cannot_reach_home_after_order:
                 breakdown["home_rule_penalty"] = -float(
-                    rules.home_rule.penalty_amount or 600.0
+                    rules.home_rule.penalty_amount or _penalty_default("home_rule")
                 ) * config.HOME_RULE_REACHABILITY_MULTIPLIER
 
     # 偏好：熟货源加成——高价值熟货使用更高倍数确保压倒普通订单
@@ -907,7 +1072,7 @@ def score_take_order(
             ctx.reposition_speed_km_per_hour,
         )
         if finish_minutes + minutes_to_target + config.PREFERRED_CARGO_ARRIVAL_BUFFER_MINUTES > preferred.available_minutes:
-            conflict_base = float(preferred.penalty_amount or 5000.0)
+            conflict_base = float(preferred.penalty_amount or _penalty_default("preferred_cargo"))
             # 高价值熟货冲突使用更高惩罚，确保不因普通订单错过熟货
             if preferred.penalty_amount and preferred.penalty_amount >= 5000:
                 conflict_base *= 2.0
@@ -917,7 +1082,7 @@ def score_take_order(
     for event in rules.timed_stay_events:
         phase = timed_event_phase(event, memory, ctx)
         if phase in {"pickup", "home", "stay", "late_pickup", "late_home"}:
-            penalty = float(event.penalty_amount or 3000.0)
+            penalty = float(event.penalty_amount or _penalty_default("timed_stay_event"))
             if phase.startswith("late"):
                 penalty *= 2.0
             breakdown["timed_event_order_penalty"] = breakdown.get("timed_event_order_penalty", 0.0) - penalty
@@ -930,7 +1095,7 @@ def score_take_order(
                 > config.TIMED_EVENT_PRE_LOCK_DISTANCE_KM
             )
             if crosses_event and far_from_pickup:
-                penalty = float(event.penalty_amount or 3000.0) * 1.5
+                penalty = float(event.penalty_amount or _penalty_default("timed_stay_event")) * 1.5
                 breakdown["timed_event_order_penalty"] = breakdown.get("timed_event_order_penalty", 0.0) - penalty
                 note_parts.append("timed_event_pre_lock_block")
 
@@ -946,7 +1111,7 @@ def score_take_order(
             crosses_day = finish_minutes // 1440 > ctx.current_minutes // 1440
             remaining_after = 1440 - finish_md if not crosses_day else 0
             available_now = 1440 - cur_md
-            unit = float(rest.penalty_amount or 200.0)
+            unit = float(rest.penalty_amount or _penalty_default("rest_rule"))
             if available_now >= deficit and (crosses_day or remaining_after < deficit):
                 # 接单前还可以完成 deficit，接单后不再可能 → 硬阻拦
                 return ScoredAction(
@@ -1016,7 +1181,7 @@ def score_take_order(
                 if sim_day_to >= config.MONTHLY_DAY_OFF_LATE_MONTH_DAY:
                     urg_threshold = config.MONTHLY_DAY_OFF_URGENCY_THRESHOLD_LATE
                 if urgency >= urg_threshold:
-                    base_pen = float(rules.monthly_day_off.penalty_amount or 3000.0)
+                    base_pen = float(rules.monthly_day_off.penalty_amount or _penalty_default("monthly_day_off"))
                     coeff = min(1.0, urgency) * 1.0
                     if urgency >= 0.3:
                         coeff = min(2.0, urgency) * 1.5
@@ -1027,12 +1192,12 @@ def score_take_order(
                     note_parts.append(f"day_off_urgency(urg={urgency:.2f})")
                 ideal_spacing = eval_horizon / max(1, R)
                 if past_off_days_to == 0 and sim_day_to >= ideal_spacing:
-                    base_pen = float(rules.monthly_day_off.penalty_amount or 3000.0)
+                    base_pen = float(rules.monthly_day_off.penalty_amount or _penalty_default("monthly_day_off"))
                     breakdown["monthly_day_off_spacing_penalty"] = -base_pen * config.MONTHLY_DAY_OFF_SPACING_COEFF
                     note_parts.append("day_off_no_rest_yet")
                 # R5-P1: 月末集中休息——剩余≤5天且deficit=1时增加urgency惩罚
                 if deficit_after == 1 and days_left_after_today_to <= config.MONTHLY_DAY_OFF_MONTH_END_DAYS:
-                    base_pen = float(rules.monthly_day_off.penalty_amount or 3000.0)
+                    base_pen = float(rules.monthly_day_off.penalty_amount or _penalty_default("monthly_day_off"))
                     breakdown["monthly_day_off_month_end_penalty"] = -base_pen * 0.6
                     note_parts.append("day_off_month_end")
         # 跨天订单额外检查：若 step_end 落在新一天，也会激活该天
@@ -1129,7 +1294,7 @@ def build_wait_durations(rules: ParsedRules, ctx: DecisionContext, memory: Drive
             # V4: 当天尚未接单且有休息日缺口时，生成全天等待候选
             # 仅当罚金>=4000元时才值得放弃一天收入来休息（D002=6000 适用）
             days_off_deficit = days_off_required - days_off_so_far
-            penalty_amt = float(rules.monthly_day_off.penalty_amount or 3000.0)
+            penalty_amt = float(rules.monthly_day_off.penalty_amount or _penalty_default("monthly_day_off"))
             if days_off_deficit > 0 and penalty_amt >= 4000:
                 long_durations.add(max(1, 1440 - cur_md))
     # 回家窗口或夜间禁行：休息至次日 6:00 / 8:00
@@ -1228,7 +1393,7 @@ def score_wait(
         deficit = rest.required_minutes - today_rest
         if deficit > 0:
             covered = min(duration_minutes, deficit)
-            unit = float(rest.penalty_amount or 200.0)
+            unit = float(rest.penalty_amount or _penalty_default("rest_rule"))
             rest_gain += unit * (covered / max(1, deficit))
             # P2: 长时间 wait 完全覆盖 deficit 时给予额外奖励，避免多次短wait代替一次长wait
             if duration_minutes >= deficit:
@@ -1268,8 +1433,11 @@ def score_wait(
                 and window.start_minute == rules.home_rule.home_by_hour * 60
             ):
                 continue
-            unit = float(window.penalty_amount or 200.0)
-            no_drive_gain += unit * (overlap / 60.0)
+            unit = float(window.penalty_amount or _penalty_default("no_drive_window_default"))
+            if 0 < unit <= config.NO_DRIVE_SOFT_PENALTY_THRESHOLD:
+                no_drive_gain += _soft_no_drive_marginal_charge(window, ctx.current_minutes, end_minutes, memory)
+            else:
+                no_drive_gain += unit * (overlap / 60.0)
     if no_drive_gain > 0:
         breakdown["no_drive_window_avoid_gain"] = no_drive_gain
         note_parts.append("avoid_no_drive")
@@ -1283,7 +1451,7 @@ def score_wait(
         overlap = _hits_no_drive_window(ctx.current_minutes, end_minutes, home_window)
         if overlap > 0:
             breakdown["home_rule_away_wait_penalty"] = -float(
-                rules.home_rule.penalty_amount or 600.0
+                rules.home_rule.penalty_amount or _penalty_default("home_rule")
             ) * config.HOME_RULE_AWAY_WAIT_PENALTY_MULTIPLIER
             note_parts.append("away_from_home_wait")
 
@@ -1299,7 +1467,7 @@ def score_wait(
         wait_to_available = max(0, preferred.available_minutes - ctx.current_minutes)
         if wait_to_available <= config.PREFERRED_CARGO_MAX_WAIT_MINUTES:
             covered = min(duration_minutes, max(1, wait_to_available))
-            preferred_wait_gain += float(preferred.penalty_amount or 5000.0) * config.PREFERRED_CARGO_WAIT_GAIN_MULTIPLIER * (
+            preferred_wait_gain += float(preferred.penalty_amount or _penalty_default("preferred_cargo")) * config.PREFERRED_CARGO_WAIT_GAIN_MULTIPLIER * (
                 covered / max(1, wait_to_available)
             )
     if preferred_wait_gain > 0:
@@ -1315,7 +1483,7 @@ def score_wait(
         end_md_fo = geo_utils.minute_of_day(end_minutes)
         crosses_day_fo = end_minutes // 1440 > ctx.current_minutes // 1440
         if cur_md_fo < deadline_fo and (end_md_fo >= deadline_fo or crosses_day_fo):
-            fo_penalty = float(rules.first_order_rule.penalty_amount or 200.0)
+            fo_penalty = float(rules.first_order_rule.penalty_amount or _penalty_default("first_order_rule"))
             # PR#27: 原 ×0.5 让 wait 跨过截止比 take_order 还便宜（晚单仅 -¥200），
             # 用 FIRST_ORDER_WAIT_CROSS_MULTIPLIER 让边际成本与 take_order 侧对齐。
             breakdown["first_order_deadline_wait_penalty"] = -fo_penalty * config.FIRST_ORDER_WAIT_CROSS_MULTIPLIER
@@ -1331,7 +1499,7 @@ def score_wait(
         near_pickup = geo_utils.haversine_km(ctx.current_lat, ctx.current_lng, event.pickup_lat, event.pickup_lng) <= event.radius_km
         near_home = geo_utils.haversine_km(ctx.current_lat, ctx.current_lng, event.home_lat, event.home_lng) <= event.radius_km
         if phase in {"pickup", "late_pickup"} and near_pickup and duration_minutes >= event.pickup_stay_minutes:
-            base = float(event.penalty_amount or 3000.0) * config.TIMED_EVENT_FIXED_GAIN_MULTIPLIER
+            base = float(event.penalty_amount or _penalty_default("timed_stay_event")) * config.TIMED_EVENT_FIXED_GAIN_MULTIPLIER
             if phase == "late_pickup":
                 base *= 2.0  # 已经迟到了，必须立刻完成 10 分钟停留
             breakdown["timed_event_pickup_gain"] = base
@@ -1424,12 +1592,12 @@ def score_wait(
         if needs_off_today:
             cur_md_off = geo_utils.minute_of_day(ctx.current_minutes)
             remaining_today = max(60, 1440 - cur_md_off)
-            base = float(rules.monthly_day_off.penalty_amount or 3000.0)
+            base = float(rules.monthly_day_off.penalty_amount or _penalty_default("monthly_day_off"))
             ratio = max(0.5, min(1.0, duration_minutes / float(remaining_today)))
             breakdown["monthly_day_off_gain"] = base * ratio * 1.5
             note_parts.append("day_off_required")
         elif days_off_so_far + days_remaining < days_off_required and duration_minutes >= 6 * 60:
-            breakdown["monthly_day_off_gain"] = float(rules.monthly_day_off.penalty_amount or 3000.0) * 0.8
+            breakdown["monthly_day_off_gain"] = float(rules.monthly_day_off.penalty_amount or _penalty_default("monthly_day_off")) * 0.8
             note_parts.append("day_off_relief")
         elif not today_already_active:
             past_off_days = max(0, sim_day - active_so_far)
@@ -1441,7 +1609,7 @@ def score_wait(
                 if urgency >= 0.03 and duration_minutes >= 60:
                     cur_md_off = geo_utils.minute_of_day(ctx.current_minutes)
                     remaining_today = max(60, 1440 - cur_md_off)
-                    base = float(rules.monthly_day_off.penalty_amount or 3000.0)
+                    base = float(rules.monthly_day_off.penalty_amount or _penalty_default("monthly_day_off"))
                     ratio = min(1.0, duration_minutes / float(remaining_today))
                     # V3: 提高最低系数以确保休息日增益能与接单收入竞争
                     coeff = max(0.4, min(1.0, urgency)) * 1.5
@@ -1452,14 +1620,14 @@ def score_wait(
                         breakdown["monthly_day_off_pacing_gain"] = pacing_gain
                         note_parts.append(f"day_off_pacing(urg={urgency:.2f})")
                 elif proactive_rest and duration_minutes >= 60:
-                    base = float(rules.monthly_day_off.penalty_amount or 3000.0)
+                    base = float(rules.monthly_day_off.penalty_amount or _penalty_default("monthly_day_off"))
                     breakdown["monthly_day_off_pacing_gain"] = base * 0.6
                     note_parts.append("day_off_proactive")
                 # R5-P1: 月末集中休息增益——剩余≤5天且deficit=1时给更高增益
                 elif deficit_after_today_if_active == 1 and days_remaining <= config.MONTHLY_DAY_OFF_MONTH_END_DAYS and duration_minutes >= 60:
                     cur_md_off = geo_utils.minute_of_day(ctx.current_minutes)
                     remaining_today = max(60, 1440 - cur_md_off)
-                    base = float(rules.monthly_day_off.penalty_amount or 3000.0)
+                    base = float(rules.monthly_day_off.penalty_amount or _penalty_default("monthly_day_off"))
                     ratio = max(0.5, min(1.0, duration_minutes / float(remaining_today)))
                     breakdown["monthly_day_off_pacing_gain"] = base * ratio * 1.2
                     note_parts.append("day_off_month_end_rest")
@@ -1467,12 +1635,12 @@ def score_wait(
                 elif sim_day >= config.MONTHLY_DAY_OFF_FORCE_REST_DAY and deficit_after_today_if_active >= 1 and duration_minutes >= 60:
                     cur_md_off = geo_utils.minute_of_day(ctx.current_minutes)
                     remaining_today = max(60, 1440 - cur_md_off)
-                    base = float(rules.monthly_day_off.penalty_amount or 3000.0)
+                    base = float(rules.monthly_day_off.penalty_amount or _penalty_default("monthly_day_off"))
                     ratio = max(0.5, min(1.0, duration_minutes / float(remaining_today)))
                     breakdown["monthly_day_off_pacing_gain"] = base * ratio * 2.0
                     note_parts.append("day_off_force_rest_late")
                 elif cur_md <= 6 * 60 and deficit_after_today_if_active >= 1:
-                    base = float(rules.monthly_day_off.penalty_amount or 3000.0)
+                    base = float(rules.monthly_day_off.penalty_amount or _penalty_default("monthly_day_off"))
                     breakdown["monthly_day_off_pacing_gain"] = base * 0.2
                     note_parts.append("day_off_early_pacing")
     _apply_adaptive_weights(breakdown, ctx.weights)
@@ -1538,7 +1706,7 @@ def score_reposition(
                 note="target_in_forbidden_zone",
             )
         if _path_passes_forbidden_zone(ctx.current_lat, ctx.current_lng, target_lat, target_lng, zone):
-            breakdown["forbidden_path_penalty"] = -float(zone.penalty_amount or 1000.0)
+            breakdown["forbidden_path_penalty"] = -float(zone.penalty_amount or _penalty_default("forbidden_zone"))
             note_parts.append("forbidden_path")
     for box in rules.bounded_areas:
         if not _is_in_box(target_lat, target_lng, box):
@@ -1593,8 +1761,9 @@ def score_reposition(
             real_overlap = _hits_no_drive_window(ctx.current_minutes, end_minutes, window)
             if real_overlap > 0:
                 multiplier = _soft_no_drive_defer_multiplier(window, ctx.current_minutes)
+                marginal = _soft_no_drive_marginal_charge(window, ctx.current_minutes, end_minutes, memory)
                 breakdown["no_drive_window_soft_penalty"] = (
-                    breakdown.get("no_drive_window_soft_penalty", 0.0) - window_penalty * multiplier
+                    breakdown.get("no_drive_window_soft_penalty", 0.0) - marginal * multiplier
                 )
                 note_parts.append("no_drive_soft_window")
             continue
@@ -1615,7 +1784,7 @@ def score_reposition(
     if rules.home_rule is not None:
         arrival_hour = geo_utils.hour_of_day(end_minutes)
         if arrival_hour >= rules.home_rule.home_by_hour and not _is_in_circle(target_lat, target_lng, rules.home_rule):
-            breakdown["home_rule_penalty"] = -float(rules.home_rule.penalty_amount or 600.0)
+            breakdown["home_rule_penalty"] = -float(rules.home_rule.penalty_amount or _penalty_default("home_rule"))
             note_parts.append("miss_home")
         # PR#22 经验：基于实际行程时间判断空驶后能否按时回家。
         # 非回家空驶：计算从目标点到家的行程时间，若到达目标后已来不及在 home_by_hour 前回家，
@@ -1626,11 +1795,11 @@ def score_reposition(
             home_by_abs = (end_minutes // 1440) * 1440 + rules.home_rule.home_by_hour * 60
             slack_after_repo = home_by_abs - (end_minutes + minutes_target_to_home)
             if slack_after_repo < 0:
-                breakdown["home_rule_penalty"] = -float(rules.home_rule.penalty_amount or 600.0)
+                breakdown["home_rule_penalty"] = -float(rules.home_rule.penalty_amount or _penalty_default("home_rule"))
                 note_parts.append("repo_miss_home_travel")
             elif slack_after_repo <= 60:
                 severity = max(0.3, 1.0 - slack_after_repo / 60.0)
-                breakdown["home_rule_tight_slack_penalty"] = -float(rules.home_rule.penalty_amount or 600.0) * severity
+                breakdown["home_rule_tight_slack_penalty"] = -float(rules.home_rule.penalty_amount or _penalty_default("home_rule")) * severity
                 note_parts.append("repo_home_tight_slack")
 
     # 增益：目标点热点 + 必到 + 回家
@@ -1643,7 +1812,7 @@ def score_reposition(
             arrival_min_of_day = geo_utils.minute_of_day(ctx.current_minutes + minutes)
             home_by_min = rules.home_rule.home_by_hour * 60
             cur_md = geo_utils.minute_of_day(ctx.current_minutes)
-            unit = float(rules.home_rule.penalty_amount or 600.0)
+            unit = float(rules.home_rule.penalty_amount or _penalty_default("home_rule"))
             # 行程本身的耗时：远距离回家时，即便当前时刻"看似还早"，
             # 也需要立即出发才能在截止前抵达。slack = 距截止还剩多少分钟可挥霍。
             slack_minutes = home_by_min - arrival_min_of_day
@@ -1673,7 +1842,7 @@ def score_reposition(
         if target is None or not preferred_cargo_preposition_ready(preferred, ctx.current_minutes):
             continue
         if geo_utils.haversine_km(target_lat, target_lng, target[0], target[1]) <= 3.0:
-            gain = float(preferred.penalty_amount or 5000.0) * config.PREFERRED_CARGO_POSITION_GAIN_MULTIPLIER
+            gain = float(preferred.penalty_amount or _penalty_default("preferred_cargo")) * config.PREFERRED_CARGO_POSITION_GAIN_MULTIPLIER
             if preferred.available_minutes is not None:
                 arrival_minutes = ctx.current_minutes + minutes
                 if arrival_minutes > preferred.available_minutes + config.PREFERRED_CARGO_GIVEUP_WINDOW_MINUTES:
@@ -1720,7 +1889,7 @@ def score_reposition(
                 dist_to_home_repo = geo_utils.haversine_km(target_lat, target_lng, event.home_lat, event.home_lng)
                 dist_to_pick_repo = geo_utils.haversine_km(target_lat, target_lng, event.pickup_lat, event.pickup_lng)
                 if dist_to_home_repo <= event.radius_km or dist_to_pick_repo <= event.radius_km:
-                    breakdown["timed_event_mandatory_home_repo_gain"] = float(event.penalty_amount or 3000.0) * 2.0
+                    breakdown["timed_event_mandatory_home_repo_gain"] = float(event.penalty_amount or _penalty_default("timed_stay_event")) * 2.0
                     note_parts.append("timed_event_mandatory_home_repo")
             target = (event.pickup_lat, event.pickup_lng)
             gain_key = "timed_event_approach_gain"
@@ -1734,7 +1903,7 @@ def score_reposition(
             target = (event.home_lat, event.home_lng)
             gain_key = "timed_event_home_gain"
         if target is not None and geo_utils.haversine_km(target_lat, target_lng, target[0], target[1]) <= event.radius_km:
-            gain = float(event.penalty_amount or 3000.0) * config.TIMED_EVENT_FIXED_GAIN_MULTIPLIER
+            gain = float(event.penalty_amount or _penalty_default("timed_stay_event")) * config.TIMED_EVENT_FIXED_GAIN_MULTIPLIER
             if phase == "early_approach":
                 gain *= 0.5
             elif phase == "approaching":
@@ -1748,7 +1917,7 @@ def score_reposition(
         date_today = geo_utils.date_str(ctx.current_minutes)
         already = memory.visited_target_dates.get(_must_visit_key(must), set())
         if date_today not in already and geo_utils.haversine_km(target_lat, target_lng, must.lat, must.lng) <= must.radius_km:
-            breakdown["must_visit_gain"] = float(must.penalty_amount or 3000.0) / max(1, must.required_days)
+            breakdown["must_visit_gain"] = float(must.penalty_amount or _penalty_default("must_visit")) / max(1, must.required_days)
             note_parts.append("must_visit")
 
     # 月度空驶累计限制：超过预算的普通空驶直接拒绝（D003 月预算 100km 单一约束极紧）。
@@ -1780,7 +1949,7 @@ def score_reposition(
     for limit in rules.distance_limits:
         if limit.kind == "monthly_deadhead":
             projected = memory.total_deadhead_km + distance_km
-            pen_per_km = float(limit.penalty_amount or 10.0)
+            pen_per_km = float(limit.penalty_amount or _penalty_default("distance_limit_monthly_deadhead"))
             # PR#27: 预警阶段对空驶同样生效——避免反复短空驶累计冲破限额。
             preempt_threshold_r = limit.max_km * config.MONTHLY_DEADHEAD_PREEMPT_RATIO
             if memory.total_deadhead_km < limit.max_km and projected > preempt_threshold_r:
@@ -1818,9 +1987,10 @@ def score_reposition(
                     new_over_km_repo = max(0.0, projected - limit.max_km) - max(
                         0.0, memory.total_deadhead_km - limit.max_km
                     )
-                    residual = max(50.0, pen_per_km * max(0.0, new_over_km_repo) * config.MONTHLY_DEADHEAD_OVERCAP_RESIDUAL_COEFF)
-                    breakdown["monthly_deadhead_overcap_penalty"] = -residual
-                    note_parts.append("deadhead_overcap_soft")
+                    residual = pen_per_km * max(0.0, new_over_km_repo) * config.MONTHLY_DEADHEAD_OVERCAP_RESIDUAL_COEFF
+                    if residual > 0:
+                        breakdown["monthly_deadhead_overcap_penalty"] = -residual
+                        note_parts.append("deadhead_overcap_soft")
                 else:
                     # 优先目标且 cap 未到：强软惩罚，由偏好增益自身决定是否抵消
                     breakdown["monthly_deadhead_penalty"] = -pen_per_km * (

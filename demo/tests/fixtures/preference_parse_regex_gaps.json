@@ -1,0 +1,50 @@
+[
+  {
+    "id": "synonym_no_drive_stop_running",
+    "content": "晚23点到次日6点车辆停运，不出活。",
+    "penalty_amount": 800,
+    "penalty_cap": null,
+    "expect": {"no_drive_window": {"start_minute": 1380, "end_minute": 1800}},
+    "comment": "停运/不出活 非 '不接单不空驶' 同义，正则当前不覆盖"
+  },
+  {
+    "id": "iso_time_no_drive",
+    "content": "23:00-06:00禁止接单和空跑。",
+    "penalty_amount": 800,
+    "penalty_cap": null,
+    "expect": {"no_drive_window": {"start_minute": 1380, "end_minute": 1800}},
+    "comment": "ISO 形式 23:00-06:00 当前正则不支持"
+  },
+  {
+    "id": "haul_synonym_total_distance",
+    "content": "单趟运输总里程不得超过400公里。",
+    "penalty_amount": 500,
+    "penalty_cap": null,
+    "expect": {"distance_limit": {"kind": "haul", "max_km": 400.0}},
+    "comment": "总里程/单趟运输 不命中 '装货点至卸货点/单笔'"
+  },
+  {
+    "id": "daily_limit_synonym",
+    "content": "每天最多接2单。",
+    "penalty_amount": 300,
+    "penalty_cap": null,
+    "expect": {"daily_order_limit": {"max_orders": 2}},
+    "comment": "每天最多 X 单 不命中 '同一天/不得超过'"
+  },
+  {
+    "id": "monthly_off_synonym",
+    "content": "每月需歇业不少于3天。",
+    "penalty_amount": 1500,
+    "penalty_cap": null,
+    "expect": {"monthly_day_off": {"required_days": 3}},
+    "comment": "歇业 同义；当前匹配 '不接单/不出车/歇着'"
+  },
+  {
+    "id": "first_order_synonym",
+    "content": "若当日出车，第一单时间不可晚于上午11点。",
+    "penalty_amount": 200,
+    "penalty_cap": null,
+    "expect": {"first_order_rule": {"before_hour": 11}},
+    "comment": "'第一单/不可晚于' 不命中 '首单/不得晚于'"
+  }
+]
