@@ -190,8 +190,8 @@ TIMED_EVENT_PRE_LOCK_WINDOW_MINUTES = 48 * 60
 """事件开始前的提前对位窗口：在此窗内若接单后会被锁在远处，则视同违规并施加重罚。
 扩大到 48h 以确保 D010 等有多日家事约定的司机能提前对位。"""
 
-TIMED_EVENT_EARLY_APPROACH_WINDOW_MINUTES = 72 * 60
-"""事件开始前的早期趋近窗口：在此窗内给予软激励让司机向接人点靠拢。"""
+TIMED_EVENT_EARLY_APPROACH_WINDOW_MINUTES = 96 * 60
+"""事件开始前的早期趋近窗口：在此窗内给予软激励让司机向接人点靠拢（PR#29: 72h→96h 更早引导）。"""
 
 TIMED_EVENT_PRE_LOCK_DISTANCE_KM = 80.0
 """提前对位窗内，订单完工点距离接人点超过此值即施加重罚。"""
@@ -204,14 +204,14 @@ TIMED_EVENT_LONG_STAY_MAX_MINUTES = 4 * 24 * 60
 TIMED_EVENT_HOME_MANDATORY_WINDOW_MINUTES = 24 * 60
 """事件开始前 N 分钟内，若司机不在家附近，硬阻拦所有 take_order，强制回家。"""
 
-TIMED_EVENT_PRECOMPLETION_WINDOW_MINUTES = 48 * 60
-"""事件开始前 N 分钟内，只允许接在事件开始前能完工的订单。"""
+TIMED_EVENT_PRECOMPLETION_WINDOW_MINUTES = 72 * 60
+"""事件开始前 N 分钟内，只允许接在事件开始前能完工的订单（PR#29: 48h→72h 与多日强制窗对齐）。"""
 
 TIMED_EVENT_STAY_GAIN_MULTIPLIER = 5.0
 """stay 阶段 wait 增益倍数：确保司机留在家中不外出。（R5: 3.0→5.0）"""
 
-TIMED_EVENT_SOFT_LIMIT_WINDOW_MINUTES = 48 * 60
-"""事件开始前 N 分钟内，只允许接卸货点在家附近的订单（软限制窗口）。"""
+TIMED_EVENT_SOFT_LIMIT_WINDOW_MINUTES = 72 * 60
+"""事件开始前 N 分钟内，只允许接卸货点在家附近的订单（PR#29: 48h→72h 与强制窗对齐）。"""
 
 TIMED_EVENT_SOFT_LIMIT_DISTANCE_KM = 200.0
 """软限制窗口内，订单卸货点距家超过此距离则施加重罚。"""
@@ -222,10 +222,10 @@ TIMED_EVENT_POST_STAY_BUFFER_MINUTES = 2 * 60
 TIMED_EVENT_APPROACH_GAIN_MULTIPLIER = 1.6
 TIMED_EVENT_START_BUFFER_MINUTES = 30
 TIMED_EVENT_PICKUP_OVERSTAY_MULTIPLIER = 2.0
-HOME_RULE_PREP_WINDOW_MINUTES = 6 * 60
+HOME_RULE_PREP_WINDOW_MINUTES = 8 * 60
 HOME_RULE_TARGET_GAIN_MULTIPLIER = 2.0
 HOME_RULE_REACHABILITY_MULTIPLIER = 2.0
-HOME_RULE_AWAY_WAIT_PENALTY_MULTIPLIER = 2.0
+HOME_RULE_AWAY_WAIT_PENALTY_MULTIPLIER = 3.0
 
 HOME_RULE_AFTERNOON_BLOCK_HOUR = 12
 """下午 N 点后且距家>200km 时开始阻拦新订单（参数搜索优化：14→12点）。"""
@@ -323,29 +323,29 @@ cap 前预警仍由 PREEMPT_RATIO/MAX_COEFF 保留。"""
 SOFT_NODRIVE_DEFER_PROXIMITY_MINUTES = 90
 """当前时刻距离软禁行窗口起始 ≤ 此分钟数（且尚未进入窗口）时，软罚乘数随接近程度递增（PR#27: D004 中午延后判断）。"""
 
-SOFT_NODRIVE_DEFER_INSIDE_MULTIPLIER = 2.5
-"""若当前时刻已落入软窗内、且即将开始的动作可被推迟到窗口结束后，软罚乘数（PR#27）。"""
+SOFT_NODRIVE_DEFER_INSIDE_MULTIPLIER = 3.5
+"""若当前时刻已落入软窗内、且即将开始的动作可被推迟到窗口结束后，软罚乘数（PR#29: 2.5→3.5 加强D004午间惩罚）。"""
 
 TIMED_EVENT_MULTIDAY_THRESHOLD_MINUTES = 24 * 60
 """事件 stay 时长 ≥ 此值视为多日 stay，触发更深的提前回家强制窗（PR#27: D010 家事约定）。"""
 
-TIMED_EVENT_MULTIDAY_HOME_MANDATORY_WINDOW_MINUTES = 48 * 60
-"""多日 stay 事件的提前强制回家窗口（PR#27: 由默认 24h 扩到 48h，确保 D010 提前两天回家）。"""
+TIMED_EVENT_MULTIDAY_HOME_MANDATORY_WINDOW_MINUTES = 72 * 60
+"""多日 stay 事件的提前强制回家窗口（PR#29: 48h→72h，确保 D010 提前三天回家减少缺席罚分）。"""
 
-FIRST_ORDER_PROXIMITY_BOOST_WINDOW_MINUTES = 90
-"""首单截止前 N 分钟内，若当天尚未接单则对 take_order 施加软增益（PR#27: D004 首单晚开工）。"""
+FIRST_ORDER_PROXIMITY_BOOST_WINDOW_MINUTES = 150
+"""首单截止前 N 分钟内，若当天尚未接单则对 take_order 施加软增益（PR#29: 90→150min，更早给予首单激励）。"""
 
-FIRST_ORDER_PROXIMITY_BOOST_RATIO = 0.6
-"""首单截止前软增益占规则单日罚金的比例上限（PR#27）。"""
+FIRST_ORDER_PROXIMITY_BOOST_RATIO = 0.9
+"""首单截止前软增益占规则单日罚金的比例上限（PR#29: 0.6→0.9，加强首单激励减少D004违规）。"""
 
-FIRST_ORDER_WAIT_CROSS_MULTIPLIER = 1.0
-"""wait 跨过 first_order 截止时的罚金系数（PR#27: 由 0.5 提高到 1.0，让 wait 与 take_order 边际匹配）。"""
+FIRST_ORDER_WAIT_CROSS_MULTIPLIER = 1.5
+"""wait 跨过 first_order 截止时的罚金系数（PR#29: 1.0→1.5，进一步惩罚跨过首单截止的等待）。"""
 
-DAILY_REST_RISK_EARLY_RATIO = 3.0
-"""每日休息余量预警触发线：remaining_after < deficit × 该比例 时施加软罚（PR#27: 由 2.0→3.0 提前）。"""
+DAILY_REST_RISK_EARLY_RATIO = 4.0
+"""每日休息余量预警触发线：remaining_after < deficit × 该比例 时施加软罚（PR#29: 3.0→4.0，更早预警以减少D002/D010休息违规）。"""
 
-DAILY_REST_RISK_TIGHT_RATIO = 1.5
-"""每日休息余量紧迫触发线：remaining_after < deficit × 该比例 时施加强软罚（PR#27: 由 1.3→1.5）。"""
+DAILY_REST_RISK_TIGHT_RATIO = 2.0
+"""每日休息余量紧迫触发线：remaining_after < deficit × 该比例 时施加强软罚（PR#29: 1.5→2.0，更早触发强休息预警）。"""
 
 
 # ---------------------------------------------------------------------------
