@@ -119,6 +119,27 @@ class ModelDecisionService:
         order_candidates = self._build_order_candidates(cargo_items, rules, memory, ctx)
         has_good_order = any(c.feasible and c.score > 0 for c in order_candidates)
 
+        # 即时二次评估：首次无正分订单时，降低机会成本重新评分以捕获边际盈利订单
+        if not has_good_order and len(cargo_items) > 0:
+            reduced_ctx = DecisionContext(
+                driver_id=ctx.driver_id,
+                cost_per_km=ctx.cost_per_km,
+                truck_length=ctx.truck_length,
+                current_lat=ctx.current_lat,
+                current_lng=ctx.current_lng,
+                current_minutes=ctx.current_minutes,
+                horizon_minutes=ctx.horizon_minutes,
+                opportunity_cost_per_minute=ctx.opportunity_cost_per_minute * 0.5,
+                weights=ctx.weights,
+                visible_cargo_count=ctx.visible_cargo_count,
+            )
+            retry_candidates = self._build_order_candidates(cargo_items, rules, memory, reduced_ctx)
+            retry_good = [c for c in retry_candidates if c.feasible and c.score > 0]
+            if retry_good:
+                order_candidates = retry_candidates
+                has_good_order = True
+                ctx = reduced_ctx
+
         wait_candidates = self._build_wait_candidates(rules, memory, ctx, has_good_order)
         reposition_candidates = self._build_reposition_candidates(
             cargo_items, rules, memory, ctx, has_good_order
@@ -144,12 +165,6 @@ class ModelDecisionService:
             return action_validator.safe_wait(_MIN_WAIT_FALLBACK_MINUTES, note="no_feasible_candidate")
 
         best = max(feasible, key=lambda c: c.score)
-
-        # R10: LLM 辅助决策——当有多个可行候选时让 LLM 做最终选择
-        if len(feasible) > 1:
-            llm_choice = self._llm_select_action(driver_id, memory, rules, ctx, feasible)
-            if llm_choice is not None:
-                best = llm_choice
 
         allowed_cargo_ids: set[str] | None = None
         if best.action == "take_order":

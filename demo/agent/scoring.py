@@ -837,7 +837,7 @@ def score_take_order(
     pref_penalty = 0.0
     for limit in rules.distance_limits:
         if limit.kind == "haul" and haul_km > limit.max_km:
-            if haul_km > limit.max_km * 1.2:
+            if haul_km > limit.max_km * 1.05:
                 return ScoredAction(
                     action="take_order",
                     params={"cargo_id": cargo_id},
@@ -846,9 +846,9 @@ def score_take_order(
                     note=f"haul_distance_exceed_limit_{limit.max_km}km",
                 )
             over_ratio = (haul_km - limit.max_km) / max(1.0, limit.max_km)
-            pref_penalty += float(limit.penalty_amount or _penalty_default("distance_limit_haul_pickup")) * (1.0 + over_ratio * 3.0)
+            pref_penalty += float(limit.penalty_amount or _penalty_default("distance_limit_haul_pickup")) * (1.0 + over_ratio * 5.0)
         elif limit.kind == "pickup" and distance_pickup_km > limit.max_km:
-            if distance_pickup_km > limit.max_km * 1.2:
+            if distance_pickup_km > limit.max_km * 1.05:
                 return ScoredAction(
                     action="take_order",
                     params={"cargo_id": cargo_id},
@@ -857,7 +857,7 @@ def score_take_order(
                     note=f"pickup_deadhead_exceed_limit_{limit.max_km}km",
                 )
             over_ratio = (distance_pickup_km - limit.max_km) / max(1.0, limit.max_km)
-            pref_penalty += float(limit.penalty_amount or _penalty_default("distance_limit_haul_pickup")) * (1.0 + over_ratio * 3.0)
+            pref_penalty += float(limit.penalty_amount or _penalty_default("distance_limit_haul_pickup")) * (1.0 + over_ratio * 5.0)
         elif limit.kind == "monthly_deadhead":
             # 月度空驶赶路上限：按「新增超额公里数 × 单价」计软惩罚，不硬阻拦。
             # 评测仅按累计 over_km × 单价（≈10 元/km）扣分；硬阻拦会让司机在累计稍超即停摆。
@@ -968,12 +968,22 @@ def score_take_order(
                 )
 
     # 偏好：每日接单上限
+    # PR#29: 超限 2 单以上硬阻拦，超限 1 单用 2× 罚金作强软罚——
+    # D004（max_orders=3, ¥200/单）历史上因软罚不足吃到 ¥400 违规。
     if rules.daily_order_limit is not None:
         already = memory.daily_orders_today(ctx.current_minutes)
         if already + 1 > rules.daily_order_limit.max_orders:
             extra = already + 1 - rules.daily_order_limit.max_orders
             unit = float(rules.daily_order_limit.penalty_amount or _penalty_default("daily_order_limit"))
-            breakdown["daily_order_limit_penalty"] = -unit * extra
+            if extra >= 2:
+                return ScoredAction(
+                    action="take_order",
+                    params={"cargo_id": cargo_id},
+                    score=-HARD_CONSTRAINT_PENALTY,
+                    feasible=False,
+                    note="daily_order_limit_hard_block",
+                )
+            breakdown["daily_order_limit_penalty"] = -unit * extra * 2.0
 
     # 偏好：首单时间
     if rules.first_order_rule is not None and memory.daily_orders_today(ctx.current_minutes) == 0:
@@ -1005,12 +1015,13 @@ def score_take_order(
         if finish_minutes + minutes_to_home_from_end <= end_day * 1440 + home_by_min:
             can_reach_home_by_deadline = True
         end_in_home = _is_in_circle(end_lat, end_lng, rules.home_rule)
-        # R6-P3: 动态回家时间检查——tight slack扩大至90min + 渐进式罚分
+        # R6-P3: 动态回家时间检查——tight slack扩大至120min + 渐进式罚分
+        # PR#29: 90→120min 窗口, 确保 D009 等有更多缓冲避免到家偏晚
         if can_reach_home_by_deadline and not end_in_home:
             slack = (end_day * 1440 + home_by_min) - (finish_minutes + minutes_to_home_from_end)
-            if 0 < slack <= 90:
-                severity = max(0.3, 1.0 - slack / 90.0)
-                breakdown["home_rule_tight_slack_penalty"] = -float(rules.home_rule.penalty_amount or _penalty_default("home_rule")) * severity
+            if 0 < slack <= 120:
+                severity = max(0.3, 1.0 - slack / 120.0)
+                breakdown["home_rule_tight_slack_penalty"] = -float(rules.home_rule.penalty_amount or _penalty_default("home_rule")) * severity * 1.5
                 note_parts.append("home_tight_slack")
         if not can_reach_home_by_deadline and not end_in_home:
             return ScoredAction(
@@ -1121,14 +1132,14 @@ def score_take_order(
                     feasible=False,
                     note="daily_rest_blocked",
                 )
-            # PR#27: 预警与紧迫触发线均提前——D002/D006/D008/D010 累计 ¥900+ 休息罚，
+            # PR#29: 预警与紧迫触发线均提前——D002/D006/D008/D010 累计 ¥900+ 休息罚，
             # 多为「白天没意识到要留出连续休息段」导致夜里凑不齐。
+            # tight 惩罚 2.5→3.5, early 惩罚 1.0→1.5 以更积极阻止吃掉休息余量。
             if remaining_after < deficit * config.DAILY_REST_RISK_TIGHT_RATIO:
-                # 余量紧张：强软惩罚（覆盖单日上限）
-                breakdown["daily_rest_risk_penalty"] = -unit * 2.5
+                breakdown["daily_rest_risk_penalty"] = -unit * 3.5
                 note_parts.append("rest_risk_tight")
             elif remaining_after < deficit * config.DAILY_REST_RISK_EARLY_RATIO:
-                breakdown["daily_rest_risk_penalty"] = -unit * 1.0
+                breakdown["daily_rest_risk_penalty"] = -unit * 1.5
                 note_parts.append("rest_risk")
 
     # 月度休息日：评测按 [action_start, action_end] 跨过的每个自然日都计入「活跃日」，
@@ -1308,17 +1319,17 @@ def build_wait_durations(rules: ParsedRules, ctx: DecisionContext, memory: Drive
             if wait_to > 0:
                 durations.add(wait_to)
     # 每日连续休息要求——在白天生成能覆盖 rest deficit 的休息时长
+    # PR#29: 额外生成 deficit+30 的候选，确保安全覆盖（仿真计时可能有微小偏差）
     for rest in rules.rest_rules:
         today_rest = memory.longest_rest_today(ctx.current_minutes)
         deficit = rest.required_minutes - today_rest
         if deficit > 0:
-            # 距离当天结束还剩多少分钟（取当天剩余时间的上限）
             cur_md = geo_utils.minute_of_day(ctx.current_minutes)
             remaining_today = 1440 - cur_md
             if remaining_today >= deficit:
                 durations.add(min(deficit, remaining_today))
-            # 同时保留全额 deficit 时长供夜间休息用
             durations.add(max(deficit, 30))
+            durations.add(deficit + 30)
     # 首单截止前生成唤醒候选：避免 wait 跨过 first_order deadline 而吃到晚单罚
     if rules.first_order_rule is not None:
         cur_md = geo_utils.minute_of_day(ctx.current_minutes)
@@ -1335,6 +1346,12 @@ def build_wait_durations(rules: ParsedRules, ctx: DecisionContext, memory: Drive
         wait_to = (target - cur_md) % (24 * 60)
         if wait_to > 0:
             durations.add(wait_to)
+        # PR#29: 在 home_by_hour 前 2h 生成回家等待候选（覆盖 D009 23:00 回家需求）
+        home_by_md = rules.home_rule.home_by_hour * 60
+        if cur_md < home_by_md:
+            gap_to_home = home_by_md - cur_md
+            if gap_to_home <= 4 * 60:
+                durations.add(max(30, gap_to_home - 60))
     for preferred in rules.preferred_cargo:
         target = preferred_cargo_target(preferred)
         if target is None or preferred.available_minutes is None:
@@ -1837,6 +1854,10 @@ def score_reposition(
             elif arrival_min_of_day < home_by_min and cur_md >= home_by_min - 6 * 60 and minutes >= 90:
                 breakdown["home_rule_gain"] = unit * config.HOME_RULE_TARGET_GAIN_MULTIPLIER * 0.6
                 note_parts.append("home_target_early")
+            # PR#29: 距截止 6-8h 且行程占用 ≥2h：更早的微弱回家激励
+            elif arrival_min_of_day < home_by_min and cur_md >= home_by_min - 8 * 60 and minutes >= 120:
+                breakdown["home_rule_gain"] = unit * config.HOME_RULE_TARGET_GAIN_MULTIPLIER * 0.3
+                note_parts.append("home_target_very_early")
     for preferred in rules.preferred_cargo:
         target = preferred_cargo_target(preferred)
         if target is None or not preferred_cargo_preposition_ready(preferred, ctx.current_minutes):
