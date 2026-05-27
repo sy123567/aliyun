@@ -403,22 +403,22 @@ PENALTY_DEFAULTS: dict[str, float] = {
 DYNAMIC_OC_ENABLED = True
 """启用基于当前扫描货源质量的动态机会成本。"""
 
-DYNAMIC_OC_MIN = 0.3
+DYNAMIC_OC_MIN = 0.2
 """动态机会成本下限（元/分钟）：即使市场极差也不低于此值。"""
 
-DYNAMIC_OC_MAX = 1.5
+DYNAMIC_OC_MAX = 2.0
 """动态机会成本上限（元/分钟）：防止过度挑剔。"""
 
-DYNAMIC_OC_MARKET_RATIO = 0.7
+DYNAMIC_OC_MARKET_RATIO = 0.8
 """动态成本 = 市场中位数 × 该比例，留出利润空间。"""
 
-DYNAMIC_OC_EMPTY_DISCOUNT = 0.5
+DYNAMIC_OC_EMPTY_DISCOUNT = 0.35
 """无货源时，按默认机会成本 × 该比例回退。"""
 
-DYNAMIC_OC_WAIT_DECAY_PER_STEP = 0.1
+DYNAMIC_OC_WAIT_DECAY_PER_STEP = 0.15
 """连续等待每步对动态机会成本的衰减幅度（最大累计 0.5）。"""
 
-DYNAMIC_OC_WAIT_DECAY_TRIGGER = 3
+DYNAMIC_OC_WAIT_DECAY_TRIGGER = 2
 """连续等待 ≥ 此次数后开始衰减。"""
 
 DYNAMIC_OC_SAMPLE_SIZE = 20
@@ -442,7 +442,7 @@ EFFICIENCY_SELECTION_MIN_CANDIDATES = 2
 CHAIN_VALUE_ENABLED = True
 """启用订单链评估——评估卸货点的后续接单价值。"""
 
-CHAIN_VALUE_COEFF = 0.15
+CHAIN_VALUE_COEFF = 0.2
 """链价值评分系数：chain_value = estimate_location_value() × 该系数。"""
 
 CHAIN_VALUE_RADIUS_KM = 50.0
@@ -460,7 +460,7 @@ SMART_REPOSITION_ENABLED = True
 SMART_REPOSITION_MIN_DIST_KM = 20.0
 """智能空驶最小距离（km）：太近无需主动空驶。"""
 
-SMART_REPOSITION_MAX_DIST_KM = 100.0
+SMART_REPOSITION_MAX_DIST_KM = 80.0
 """智能空驶最大距离（km）：太远不值得空驶。"""
 
 SMART_REPOSITION_TOP_N = 3
@@ -481,5 +481,5 @@ ONLINE_LEARNING_GRID_DEG = 0.1
 ONLINE_LEARNING_MIN_ORDERS = 2
 """某区域-时段至少有 N 个完成订单才有统计意义。"""
 
-ONLINE_LEARNING_SCORING_COEFF = 0.1
+ONLINE_LEARNING_SCORING_COEFF = 0.12
 """在线学习信号对评分的影响系数。"""
