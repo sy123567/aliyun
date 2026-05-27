@@ -194,6 +194,7 @@ class ScoredAction:
     feasible: bool = True
     breakdown: dict[str, float] = field(default_factory=dict)
     note: str = ""
+    occupied_minutes: float = 0.0
 
     def as_action_dict(self) -> dict[str, Any]:
         return {"action": self.action, "params": dict(self.params)}
@@ -1258,6 +1259,20 @@ def score_take_order(
     if future_value > 0:
         breakdown["future_location_value"] = future_value
 
+    # 方案一：订单链评估——卸货点的后续接单价值
+    if config.CHAIN_VALUE_ENABLED and not income_voided_by_horizon:
+        chain_value = memory.estimate_location_value(end_lat, end_lng)
+        if chain_value > 0:
+            breakdown["chain_value"] = chain_value * config.CHAIN_VALUE_COEFF
+
+    # 方案五：在线学习——卸货点+到达时段的历史收益率信号
+    if config.ONLINE_LEARNING_ENABLED and not income_voided_by_horizon:
+        loc_time_value = memory.get_location_time_value(end_lat, end_lng, arrival_hour)
+        if loc_time_value > 0:
+            breakdown["online_learning_value"] = (
+                loc_time_value * horizon_minutes_ahead * config.ONLINE_LEARNING_SCORING_COEFF
+            )
+
     _apply_adaptive_weights(breakdown, ctx.weights)
     score = sum(breakdown.values())
     return ScoredAction(
@@ -1267,6 +1282,7 @@ def score_take_order(
         feasible=score > -HARD_CONSTRAINT_PENALTY / 2,
         breakdown=breakdown,
         note=",".join(note_parts) if note_parts else "",
+        occupied_minutes=float(occupied_minutes),
     )
 
 
