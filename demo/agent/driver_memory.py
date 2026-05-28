@@ -21,6 +21,33 @@ TOKEN_DEGRADE_THRESHOLD = config.TOKEN_DEGRADE_THRESHOLD
 
 
 @dataclass
+class CompletedOrderRecord:
+    """已完成订单的摘要记录，用于订单链评估（方案一）。"""
+
+    end_lat: float
+    end_lng: float
+    income: float
+    occupied_minutes: float
+    completed_at_minutes: int
+
+
+@dataclass
+class LocationTimeStats:
+    """某区域某时段的订单统计，用于在线学习（方案五）。"""
+
+    grid_key: str
+    hour_bucket: int
+    total_income: float = 0.0
+    total_orders: int = 0
+    total_minutes: float = 0.0
+
+    @property
+    def avg_rate(self) -> float:
+        """平均元/分钟。"""
+        return self.total_income / max(1.0, self.total_minutes)
+
+
+@dataclass
 class HotspotCell:
     """单个网格的聚合统计。"""
 
@@ -28,6 +55,8 @@ class HotspotCell:
     sum_price: float = 0.0
     sum_price_per_minute: float = 0.0
     last_seen_minutes: int = 0
+    sum_income: float = 0.0
+    income_samples: int = 0
 
 
 @dataclass
@@ -125,6 +154,12 @@ class DriverMemory:
 
     timed_event_flags: set[str] = field(default_factory=set)
 
+    # 方案一：已完成订单记录（订单链评估）
+    completed_orders: list[CompletedOrderRecord] = field(default_factory=list)
+
+    # 方案五：在线学习——区域×时段统计
+    location_time_stats: dict[str, LocationTimeStats] = field(default_factory=dict)
+
     def update_token(self, delta: int) -> None:
         if delta > 0:
             self.token_used += int(delta)
@@ -158,6 +193,95 @@ class DriverMemory:
         bucket.samples += 1
         bucket.sum_price += float(price_yuan)
         bucket.sum_price_per_minute += float(price_yuan) / float(minutes)
+
+    def record_completed_order(
+        self,
+        end_lat: float,
+        end_lng: float,
+        income: float,
+        occupied_minutes: float,
+        completed_at_minutes: int,
+    ) -> None:
+        """记录已完成订单摘要，供订单链评估使用（方案一）。"""
+        self.completed_orders.append(
+            CompletedOrderRecord(
+                end_lat=end_lat,
+                end_lng=end_lng,
+                income=income,
+                occupied_minutes=occupied_minutes,
+                completed_at_minutes=completed_at_minutes,
+            )
+        )
+
+    def estimate_location_value(self, lat: float, lng: float) -> float:
+        """基于历史完单记录估算某位置的后续接单价值（方案一）。
+
+        在 completed_orders 中查找 CHAIN_VALUE_RADIUS_KM 范围内的历史卸货点，
+        以距离加权平均估算该位置的收益水平。
+        """
+        if len(self.completed_orders) < config.CHAIN_VALUE_MIN_RECORDS:
+            return 0.0
+        radius = config.CHAIN_VALUE_RADIUS_KM
+        total_value = 0.0
+        total_weight = 0.0
+        for rec in self.completed_orders:
+            dist = geo_utils.haversine_km(lat, lng, rec.end_lat, rec.end_lng)
+            if dist < radius:
+                w = max(0.0, 1.0 - dist / radius)
+                total_value += rec.income * w
+                total_weight += w
+        if total_weight <= 0:
+            return 0.0
+        return total_value / total_weight
+
+    def record_order_completion_stats(
+        self,
+        lat: float,
+        lng: float,
+        hour: int,
+        income: float,
+        minutes: float,
+    ) -> None:
+        """记录完成订单的区域-时段统计（方案五：在线学习）。"""
+        grid_deg = config.ONLINE_LEARNING_GRID_DEG
+        grid_key = f"{lat / grid_deg:.0f}_{lng / grid_deg:.0f}_{hour}"
+        stats = self.location_time_stats.get(grid_key)
+        if stats is None:
+            stats = LocationTimeStats(grid_key=grid_key, hour_bucket=hour)
+            self.location_time_stats[grid_key] = stats
+        stats.total_income += income
+        stats.total_orders += 1
+        stats.total_minutes += max(1.0, minutes)
+
+    def get_location_time_value(self, lat: float, lng: float, hour: int) -> float:
+        """查询某位置某时段的历史收益率（方案五）。"""
+        grid_deg = config.ONLINE_LEARNING_GRID_DEG
+        grid_key = f"{lat / grid_deg:.0f}_{lng / grid_deg:.0f}_{hour}"
+        stats = self.location_time_stats.get(grid_key)
+        if stats is not None and stats.total_orders >= config.ONLINE_LEARNING_MIN_ORDERS:
+            return stats.avg_rate
+        return 0.0
+
+    def get_high_value_reposition_targets(
+        self, current_lat: float, current_lng: float
+    ) -> list[tuple[float, float]]:
+        """基于历史接单经验推荐高价值空驶目标（方案四）。"""
+        targets: list[tuple[float, float, float]] = []
+        for key, cell in self.hotspots.items():
+            if cell.samples < config.SMART_REPOSITION_MIN_SAMPLES:
+                continue
+            lat, lng = geo_utils.grid_center(key)
+            dist = geo_utils.haversine_km(current_lat, current_lng, lat, lng)
+            if dist < config.SMART_REPOSITION_MIN_DIST_KM:
+                continue
+            if dist > config.SMART_REPOSITION_MAX_DIST_KM:
+                continue
+            avg_income = cell.sum_price / max(1, cell.samples)
+            avg_yield = cell.sum_price_per_minute / max(1, cell.samples)
+            score = avg_income * 0.3 + avg_yield * 100.0
+            targets.append((lat, lng, score))
+        targets.sort(key=lambda t: t[2], reverse=True)
+        return [(t[0], t[1]) for t in targets[: config.SMART_REPOSITION_TOP_N]]
 
     def hour_pattern_value(self, hour: int) -> float:
         """返回该小时的平均货源单位时间收益，用作在线时间模式信号。"""
@@ -245,6 +369,30 @@ class DriverMemory:
                 self.total_completed_orders += 1
                 self.total_haul_km += float(result.get("haul_distance_km", 0.0) or 0.0)
                 self.total_deadhead_km += float(result.get("pickup_deadhead_km", 0.0) or 0.0)
+                # 方案一+五：记录完成订单用于链评估和在线学习
+                order_income = float(result.get("income", 0.0) or 0.0)
+                if order_income <= 0:
+                    order_income = float(result.get("price", 0.0) or 0.0)
+                self.total_gross_income += order_income
+                pos_after = record.get("position_after", {}) or {}
+                end_lat = float(pos_after.get("lat", 0.0) or 0.0)
+                end_lng = float(pos_after.get("lng", 0.0) or 0.0)
+                if end_lat != 0.0 and end_lng != 0.0 and order_income > 0:
+                    self.record_completed_order(
+                        end_lat=end_lat,
+                        end_lng=end_lng,
+                        income=order_income,
+                        occupied_minutes=float(action_exec),
+                        completed_at_minutes=sim_minutes_after,
+                    )
+                    if config.ONLINE_LEARNING_ENABLED:
+                        self.record_order_completion_stats(
+                            lat=end_lat,
+                            lng=end_lng,
+                            hour=geo_utils.hour_of_day(sim_minutes_after),
+                            income=order_income,
+                            minutes=float(action_exec),
+                        )
                 if date_action_start not in self.daily_first_take_minute_of_day:
                     self.daily_first_take_minute_of_day[date_action_start] = geo_utils.minute_of_day(
                         action_start_minutes

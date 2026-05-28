@@ -107,6 +107,22 @@ class ModelDecisionService:
 
         self._update_hotspots(memory, cargo_items, sim_minutes)
 
+        # 方案二：动态机会成本——根据当前扫描货源质量动态调整
+        if config.DYNAMIC_OC_ENABLED:
+            dynamic_oc = self._compute_dynamic_opportunity_cost(
+                cargo_items, ctx, memory,
+            )
+            ctx = DecisionContext(
+                driver_id=ctx.driver_id,
+                cost_per_km=ctx.cost_per_km,
+                truck_length=ctx.truck_length,
+                current_lat=ctx.current_lat,
+                current_lng=ctx.current_lng,
+                current_minutes=ctx.current_minutes,
+                horizon_minutes=ctx.horizon_minutes,
+                opportunity_cost_per_minute=dynamic_oc,
+            )
+
         # 自适应权重（文档 8.4 节）：根据月末/夜间/稀缺/违规预警调位
         ctx.weights = scoring.resolve_adaptive_weights(
             rules=rules,
@@ -165,6 +181,19 @@ class ModelDecisionService:
             return action_validator.safe_wait(_MIN_WAIT_FALLBACK_MINUTES, note="no_feasible_candidate")
 
         best = max(feasible, key=lambda c: c.score)
+
+        # 方案三：效率选单——分数接近时按元/分钟排序
+        if config.EFFICIENCY_SELECTION_ENABLED and best.score > 0:
+            threshold = best.score * config.EFFICIENCY_SELECTION_SCORE_THRESHOLD
+            top_pool = [
+                c for c in feasible
+                if c.score >= threshold and c.action == "take_order" and c.occupied_minutes > 0
+            ]
+            if len(top_pool) >= config.EFFICIENCY_SELECTION_MIN_CANDIDATES:
+                best = max(
+                    top_pool,
+                    key=lambda c: c.score / max(1.0, c.occupied_minutes),
+                )
 
         allowed_cargo_ids: set[str] | None = None
         if best.action == "take_order":
@@ -535,6 +564,60 @@ class ModelDecisionService:
                 cand.note,
             )
 
+    # ---------------- 方案二：动态机会成本 ----------------
+
+    def _compute_dynamic_opportunity_cost(
+        self,
+        cargo_items: list[dict[str, Any]],
+        ctx: DecisionContext,
+        memory: driver_memory.DriverMemory,
+    ) -> float:
+        """根据当前可见订单的质量分布动态计算机会成本。"""
+        if not cargo_items:
+            return config.DEFAULT_OPPORTUNITY_COST_PER_MINUTE * config.DYNAMIC_OC_EMPTY_DISCOUNT
+
+        margins: list[float] = []
+        for item in cargo_items[: config.DYNAMIC_OC_SAMPLE_SIZE]:
+            cargo = item.get("cargo", {}) or {}
+            income = float(cargo.get("price", 0) or 0)
+            haul_km = float(cargo.get("haul_distance_km", 0) or 0)
+            if haul_km <= 0:
+                cargo_start = cargo.get("start") or {}
+                cargo_end = cargo.get("end") or {}
+                try:
+                    haul_km = geo_utils.haversine_km(
+                        float(cargo_start.get("lat", 0)),
+                        float(cargo_start.get("lng", 0)),
+                        float(cargo_end.get("lat", 0)),
+                        float(cargo_end.get("lng", 0)),
+                    )
+                except (TypeError, ValueError):
+                    continue
+            pickup_km = float(item.get("distance_km", 0) or 0)
+            total_km = haul_km + pickup_km
+            if total_km <= 0:
+                continue
+            cost = ctx.cost_per_km * total_km
+            estimated_minutes = total_km / max(0.01, ctx.reposition_speed_km_per_hour / 60.0)
+            margin_per_min = (income - cost) / max(1.0, estimated_minutes)
+            margins.append(margin_per_min)
+
+        if not margins:
+            return config.DEFAULT_OPPORTUNITY_COST_PER_MINUTE * config.DYNAMIC_OC_EMPTY_DISCOUNT
+
+        margins.sort()
+        median_margin = margins[len(margins) // 2]
+        dynamic_cost = max(
+            config.DYNAMIC_OC_MIN,
+            min(config.DYNAMIC_OC_MAX, median_margin * config.DYNAMIC_OC_MARKET_RATIO),
+        )
+
+        if memory.consecutive_wait_count >= config.DYNAMIC_OC_WAIT_DECAY_TRIGGER:
+            decay = min(0.5, config.DYNAMIC_OC_WAIT_DECAY_PER_STEP * memory.consecutive_wait_count)
+            dynamic_cost *= (1.0 - decay)
+
+        return max(config.DYNAMIC_OC_MIN, dynamic_cost)
+
     # ---------------- 货源查询 ----------------
 
     def _safe_query_cargo(self, driver_id: str, lat: float, lng: float) -> list[dict[str, Any]]:
@@ -639,6 +722,11 @@ class ModelDecisionService:
         if not has_good_order:
             non_priority.extend(self._reposition_targets_from_cargo(items, ctx))
             non_priority.extend(self._reposition_targets_from_hotspots(memory, ctx))
+            # 方案四：智能空驶——基于历史收益推荐高价值区域
+            if config.SMART_REPOSITION_ENABLED:
+                non_priority.extend(
+                    memory.get_high_value_reposition_targets(ctx.current_lat, ctx.current_lng)
+                )
         # 去重优先目标
         seen: set[tuple[float, float]] = set()
         deduped_priority: list[tuple[float, float]] = []

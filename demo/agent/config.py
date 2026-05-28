@@ -392,3 +392,94 @@ PENALTY_DEFAULTS: dict[str, float] = {
     "must_visit": 3000.0,
 }
 """dataset-agnostic 罚金兜底表，键名与 scoring._penalty_default 调用一一对应。"""
+
+
+# ---------------------------------------------------------------------------
+# 架构优化参数 — PR#30 五方案统一参数（从 260k 到 400k+ 路线图）
+# ---------------------------------------------------------------------------
+
+# ---- 方案二：动态机会成本 ----
+
+DYNAMIC_OC_ENABLED = True
+"""启用基于当前扫描货源质量的动态机会成本。"""
+
+DYNAMIC_OC_MIN = 0.2
+"""动态机会成本下限（元/分钟）：即使市场极差也不低于此值。"""
+
+DYNAMIC_OC_MAX = 2.0
+"""动态机会成本上限（元/分钟）：防止过度挑剔。"""
+
+DYNAMIC_OC_MARKET_RATIO = 0.8
+"""动态成本 = 市场中位数 × 该比例，留出利润空间。"""
+
+DYNAMIC_OC_EMPTY_DISCOUNT = 0.35
+"""无货源时，按默认机会成本 × 该比例回退。"""
+
+DYNAMIC_OC_WAIT_DECAY_PER_STEP = 0.15
+"""连续等待每步对动态机会成本的衰减幅度（最大累计 0.5）。"""
+
+DYNAMIC_OC_WAIT_DECAY_TRIGGER = 2
+"""连续等待 ≥ 此次数后开始衰减。"""
+
+DYNAMIC_OC_SAMPLE_SIZE = 20
+"""计算动态机会成本时的最大货源采样数（已按距离排序的前 N 个）。"""
+
+
+# ---- 方案三：效率选单 ----
+
+EFFICIENCY_SELECTION_ENABLED = True
+"""启用基于元/分钟的效率选单（混合排序）。"""
+
+EFFICIENCY_SELECTION_SCORE_THRESHOLD = 0.8
+"""分数在最优分 × 该比例以上的候选进入效率排序池。"""
+
+EFFICIENCY_SELECTION_MIN_CANDIDATES = 2
+"""效率选单至少要有 N 个候选才启用。"""
+
+
+# ---- 方案一：订单链评估 ----
+
+CHAIN_VALUE_ENABLED = True
+"""启用订单链评估——评估卸货点的后续接单价值。"""
+
+CHAIN_VALUE_COEFF = 0.2
+"""链价值评分系数：chain_value = estimate_location_value() × 该系数。"""
+
+CHAIN_VALUE_RADIUS_KM = 50.0
+"""链价值评估的影响半径（km）：仅统计此范围内的历史完单。"""
+
+CHAIN_VALUE_MIN_RECORDS = 3
+"""至少有 N 条历史完单记录后才启用链价值评估。"""
+
+
+# ---- 方案四：智能空驶 ----
+
+SMART_REPOSITION_ENABLED = True
+"""启用基于历史收益的智能空驶目标推荐。"""
+
+SMART_REPOSITION_MIN_DIST_KM = 20.0
+"""智能空驶最小距离（km）：太近无需主动空驶。"""
+
+SMART_REPOSITION_MAX_DIST_KM = 80.0
+"""智能空驶最大距离（km）：太远不值得空驶。"""
+
+SMART_REPOSITION_TOP_N = 3
+"""智能空驶推荐的 top-N 高价值目标。"""
+
+SMART_REPOSITION_MIN_SAMPLES = 3
+"""热点区域至少有 N 次观测才纳入智能空驶候选。"""
+
+
+# ---- 方案五：在线学习 ----
+
+ONLINE_LEARNING_ENABLED = True
+"""启用在线学习——在仿真中积累区域-时段统计。"""
+
+ONLINE_LEARNING_GRID_DEG = 0.1
+"""在线学习的经纬度网格粒度（度）。"""
+
+ONLINE_LEARNING_MIN_ORDERS = 2
+"""某区域-时段至少有 N 个完成订单才有统计意义。"""
+
+ONLINE_LEARNING_SCORING_COEFF = 0.12
+"""在线学习信号对评分的影响系数。"""
