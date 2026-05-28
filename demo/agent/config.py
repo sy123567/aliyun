@@ -497,7 +497,10 @@ ONLINE_LEARNING_SCORING_COEFF = 0.12
 # ---- #1 目的地市场质量硬过滤 ----
 
 DEST_QUALITY_FILTER_ENABLED = True
-"""启用目的地市场质量评估——对预测"卸货后困死"的订单施加重罚。"""
+"""启用目的地市场质量评估——对预测"卸货后困死"的订单施加重罚。
+注意：当前仿真框架下 result.income 为 0 导致 completed_orders 始终为空，
+chain_value/count_nearby_completed_orders 均返回 0，该过滤器实际不会触发。
+保留为 True 以便未来修复 income 回传后自动生效。"""
 
 DEST_QUALITY_MIN_COMPLETED_ORDERS = 10
 """司机本月完成订单数 ≥ N 时才启用目的地市场质量过滤（避免冷启动误伤）。"""
