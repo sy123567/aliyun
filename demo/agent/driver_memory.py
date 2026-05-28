@@ -157,6 +157,12 @@ class DriverMemory:
     # 方案一：已完成订单记录（订单链评估）
     completed_orders: list[CompletedOrderRecord] = field(default_factory=list)
 
+    # PR#32 突破 #3：决策时即时累计（不依赖 result.income，规避仿真框架不回传 income 的限制）
+    committed_income_total: float = 0.0
+    committed_occupied_minutes_total: float = 0.0
+    committed_take_count: int = 0
+    committed_seen_cargo_ids: set[str] = field(default_factory=set)
+
     # 方案五：在线学习——区域×时段统计
     location_time_stats: dict[str, LocationTimeStats] = field(default_factory=dict)
 
@@ -234,6 +240,55 @@ class DriverMemory:
             return 0.0
         return total_value / total_weight
 
+    def count_nearby_completed_orders(
+        self, lat: float, lng: float, radius_km: float | None = None
+    ) -> int:
+        """统计指定位置 radius_km 内的历史完成订单数（PR#32 突破 #1：陌生区域判定）。"""
+        radius = radius_km if radius_km is not None else config.CHAIN_VALUE_RADIUS_KM
+        n = 0
+        for rec in self.completed_orders:
+            if geo_utils.haversine_km(lat, lng, rec.end_lat, rec.end_lng) < radius:
+                n += 1
+        return n
+
+    def personal_rate_per_minute(self) -> float:
+        """估算司机本月已实现的收益率（元/分钟）。
+
+        优先使用 completed_orders（含 result.income）；当仿真框架不在 result 中回传 income
+        时（实测确认），完成订单列表为空，则回退到决策时即时累计（committed_income_total）。
+        """
+        total_income = 0.0
+        total_minutes = 0.0
+        for rec in self.completed_orders:
+            if rec.occupied_minutes <= 0 or rec.income <= 0:
+                continue
+            total_income += rec.income
+            total_minutes += rec.occupied_minutes
+        if total_minutes > 0:
+            return total_income / total_minutes
+        if (
+            self.committed_occupied_minutes_total > 0
+            and self.committed_income_total > 0
+        ):
+            return self.committed_income_total / self.committed_occupied_minutes_total
+        return 0.0
+
+    def record_committed_order(
+        self, cargo_id: str, price: float, occupied_minutes: float
+    ) -> None:
+        """PR#32 突破 #3：决策时即时累计 cargo.price 与 occupied_minutes。
+
+        每个 cargo_id 只累计一次（防止 query_history 同步重放导致重复计数）。
+        """
+        if not cargo_id or price <= 0 or occupied_minutes <= 0:
+            return
+        if cargo_id in self.committed_seen_cargo_ids:
+            return
+        self.committed_seen_cargo_ids.add(cargo_id)
+        self.committed_income_total += price
+        self.committed_occupied_minutes_total += occupied_minutes
+        self.committed_take_count += 1
+
     def record_order_completion_stats(
         self,
         lat: float,
@@ -263,9 +318,17 @@ class DriverMemory:
         return 0.0
 
     def get_high_value_reposition_targets(
-        self, current_lat: float, current_lng: float
+        self,
+        current_lat: float,
+        current_lng: float,
+        max_dist_km: float | None = None,
     ) -> list[tuple[float, float]]:
-        """基于历史接单经验推荐高价值空驶目标（方案四）。"""
+        """基于历史接单经验推荐高价值空驶目标（方案四）。
+
+        ``max_dist_km`` 缺省使用 ``config.SMART_REPOSITION_MAX_DIST_KM``；
+        PR#32 突破 #2 允许困境模式临时放宽到 ``STRANDED_REPOSITION_MAX_DIST_KM``。
+        """
+        cap = max_dist_km if max_dist_km is not None else config.SMART_REPOSITION_MAX_DIST_KM
         targets: list[tuple[float, float, float]] = []
         for key, cell in self.hotspots.items():
             if cell.samples < config.SMART_REPOSITION_MIN_SAMPLES:
@@ -274,7 +337,7 @@ class DriverMemory:
             dist = geo_utils.haversine_km(current_lat, current_lng, lat, lng)
             if dist < config.SMART_REPOSITION_MIN_DIST_KM:
                 continue
-            if dist > config.SMART_REPOSITION_MAX_DIST_KM:
+            if dist > cap:
                 continue
             avg_income = cell.sum_price / max(1, cell.samples)
             avg_yield = cell.sum_price_per_minute / max(1, cell.samples)
