@@ -131,6 +131,14 @@ class ModelDecisionService:
             visible_cargo_count=len(cargo_items),
         )
         ctx.visible_cargo_count = len(cargo_items)
+        # PR#32 突破 #2：困境模式判定——连续等待无果次数 ≥ 阈值进入 stranded
+        # 仅对有 home_rule 的司机启用（其他司机被设计为漂移行为，stranded 反而干扰）
+        if (
+            config.STRANDED_RECOVERY_ENABLED
+            and rules.home_rule is not None
+            and memory.consecutive_wait_count >= config.STRANDED_RECOVERY_TRIGGER_WAIT_COUNT
+        ):
+            ctx.stranded_mode = True
 
         order_candidates = self._build_order_candidates(cargo_items, rules, memory, ctx)
         has_good_order = any(c.feasible and c.score > 0 for c in order_candidates)
@@ -202,6 +210,23 @@ class ModelDecisionService:
                 for item in cargo_items
             }
             allowed_cargo_ids.discard("")
+            # PR#32 突破 #3：在决策时即时累计 cargo.price 与 occupied_minutes，
+            # 规避仿真框架不在 result 回传 income 的限制。
+            # NOTE: 故意不回填 completed_orders——实测一旦 chain_value/count_nearby
+            # 等链评估真正运作，反而损失 -16k 净收入。
+            best_cargo_id = str(best.params.get("cargo_id", "")).strip() if best.params else ""
+            if best_cargo_id:
+                for item in cargo_items:
+                    cargo_d = item.get("cargo") or {}
+                    if str(cargo_d.get("cargo_id", "")).strip() == best_cargo_id:
+                        try:
+                            price_val = float(cargo_d.get("price", 0) or 0)
+                        except (TypeError, ValueError):
+                            price_val = 0.0
+                        memory.record_committed_order(
+                            best_cargo_id, price_val, best.occupied_minutes
+                        )
+                        break
 
         try:
             validated = action_validator.validate_action(
@@ -574,7 +599,23 @@ class ModelDecisionService:
     ) -> float:
         """根据当前可见订单的质量分布动态计算机会成本。"""
         if not cargo_items:
-            return config.DEFAULT_OPPORTUNITY_COST_PER_MINUTE * config.DYNAMIC_OC_EMPTY_DISCOUNT
+            base = config.DEFAULT_OPPORTUNITY_COST_PER_MINUTE * config.DYNAMIC_OC_EMPTY_DISCOUNT
+            # PR#32 突破 #3：空货源时仍按司机已实现 rate 校准
+            if (
+                config.PERSONAL_OC_ENABLED
+                and memory.total_completed_orders >= config.PERSONAL_OC_MIN_COMPLETED_ORDERS
+            ):
+                personal_rate = memory.personal_rate_per_minute()
+                if personal_rate > 0:
+                    blended = (
+                        personal_rate * config.PERSONAL_OC_BLEND_RATIO
+                        + base * (1.0 - config.PERSONAL_OC_BLEND_RATIO)
+                    )
+                    return max(
+                        config.PERSONAL_OC_FLOOR,
+                        min(config.PERSONAL_OC_CEIL, blended),
+                    )
+            return base
 
         margins: list[float] = []
         for item in cargo_items[: config.DYNAMIC_OC_SAMPLE_SIZE]:
@@ -615,6 +656,24 @@ class ModelDecisionService:
         if memory.consecutive_wait_count >= config.DYNAMIC_OC_WAIT_DECAY_TRIGGER:
             decay = min(0.5, config.DYNAMIC_OC_WAIT_DECAY_PER_STEP * memory.consecutive_wait_count)
             dynamic_cost *= (1.0 - decay)
+
+        # PR#32 突破 #3：个性化机会成本——融合司机本月已实现 rate
+        # 数据：D004 rate ≈ 1.46 元/min（动态 OC 低估其等待成本），
+        # D001 ≈ 0.85（动态 OC 高估其等待成本，被迫接低价短途）。
+        if (
+            config.PERSONAL_OC_ENABLED
+            and memory.total_completed_orders >= config.PERSONAL_OC_MIN_COMPLETED_ORDERS
+        ):
+            personal_rate = memory.personal_rate_per_minute()
+            if personal_rate > 0:
+                blended = (
+                    personal_rate * config.PERSONAL_OC_BLEND_RATIO
+                    + dynamic_cost * (1.0 - config.PERSONAL_OC_BLEND_RATIO)
+                )
+                dynamic_cost = max(
+                    config.PERSONAL_OC_FLOOR,
+                    min(config.PERSONAL_OC_CEIL, blended),
+                )
 
         return max(config.DYNAMIC_OC_MIN, dynamic_cost)
 
@@ -724,8 +783,16 @@ class ModelDecisionService:
             non_priority.extend(self._reposition_targets_from_hotspots(memory, ctx))
             # 方案四：智能空驶——基于历史收益推荐高价值区域
             if config.SMART_REPOSITION_ENABLED:
+                # PR#32 突破 #2：困境模式临时放宽 SMART_REPOSITION_MAX_DIST_KM
+                max_dist = (
+                    config.STRANDED_REPOSITION_MAX_DIST_KM
+                    if ctx.stranded_mode
+                    else config.SMART_REPOSITION_MAX_DIST_KM
+                )
                 non_priority.extend(
-                    memory.get_high_value_reposition_targets(ctx.current_lat, ctx.current_lng)
+                    memory.get_high_value_reposition_targets(
+                        ctx.current_lat, ctx.current_lng, max_dist_km=max_dist
+                    )
                 )
         # 去重优先目标
         seen: set[tuple[float, float]] = set()

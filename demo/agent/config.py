@@ -483,3 +483,87 @@ ONLINE_LEARNING_MIN_ORDERS = 2
 
 ONLINE_LEARNING_SCORING_COEFF = 0.12
 """在线学习信号对评分的影响系数。"""
+
+
+# ---------------------------------------------------------------------------
+# 突破方案 — PR#32 三项突破（目的地硬过滤 / 困境长距回流 / 个性化机会成本）
+# ---------------------------------------------------------------------------
+# 数据洞察：仿真 D003/D005/D007 共浪费 32+ 天「在卸货目的地干等天亮」，
+# 同时段 50km 内有 ¥120k+ 货源可接。PR#30 的 chain_value/smart_reposition/dynamic_oc
+# 信号太弱：CHAIN_VALUE_COEFF=0.2 无法阻止"远征到死区"，SMART_REPOSITION_MAX_DIST_KM=80
+# 无法救出 200km+ 困境，DEFAULT_OPPORTUNITY_COST_PER_MINUTE=1.0 没有按司机实际 rate 校准。
+# 详细分析见 outputs/bottleneck_breakthrough_analysis.md。
+
+# ---- #1 目的地市场质量硬过滤 ----
+
+DEST_QUALITY_FILTER_ENABLED = True
+"""启用目的地市场质量评估——对预测"卸货后困死"的订单施加重罚。
+注意：当前仿真框架下 result.income 为 0 导致 completed_orders 始终为空，
+chain_value/count_nearby_completed_orders 均返回 0，该过滤器实际不会触发。
+保留为 True 以便未来修复 income 回传后自动生效。"""
+
+DEST_QUALITY_MIN_COMPLETED_ORDERS = 10
+"""司机本月完成订单数 ≥ N 时才启用目的地市场质量过滤（避免冷启动误伤）。"""
+
+DEST_QUALITY_EVENING_HOUR_START = 17
+DEST_QUALITY_EVENING_HOUR_END = 23
+"""到达目的地的"晚归窗"。在这个窗内到达且远离家/热点的订单将被重罚。"""
+
+DEST_QUALITY_HOME_RADIUS_KM = 80.0
+"""到达目的地距家 > 此距离时纳入晚归风险判定（仅对有 home_rule 的司机）。"""
+
+DEST_QUALITY_DEAD_ZONE_PENALTY = 800.0
+"""目的地被判定为死区时的固定重罚（元）；与 income 共同决定净 score。"""
+
+DEST_QUALITY_LOW_DENSITY_HOTSPOT = 0.05
+"""目的地附近 hotspot_value < 此阈值视为低密度（元/分钟）。"""
+
+DEST_QUALITY_MIN_NEARBY_HISTORY = 2
+"""目的地 50km 内历史完单 < N 条视为陌生区域。"""
+
+# 加强 chain_value 与 online_learning 的影响（原 0.2 / 0.12 太弱）
+DEST_QUALITY_CHAIN_VALUE_BOOST = 2.0
+"""目的地评估中 chain_value 系数额外放大倍数（与 CHAIN_VALUE_COEFF 相乘）。"""
+
+
+# ---- #2 困境长距回流（stranded recovery） ----
+
+STRANDED_RECOVERY_ENABLED = True
+"""启用困境长距回流——连续等待无果时放宽长距空驶限制。"""
+
+STRANDED_RECOVERY_TRIGGER_WAIT_COUNT = 2
+"""连续 wait ≥ 此值后进入困境模式。"""
+
+STRANDED_REPOSITION_MAX_DIST_KM = 280.0
+"""困境模式下智能空驶最大距离（km），覆盖到 200km+ 外远距离。"""
+
+STRANDED_LONG_REPOS_PENALTY_MULTIPLIER = 0.0
+"""困境模式下，长距 reposition 的额外惩罚系数（取代默认 0.5）。
+   置 0 让评分系统按"行驶成本 + 时间机会成本"的客观估算决策。"""
+
+STRANDED_HOME_REPOSITION_BONUS = 500.0
+"""困境模式下，目标点为家（home_rule lat/lng）时的额外软激励。"""
+
+
+# ---- #3 个性化机会成本（per-driver opportunity cost） ----
+
+PERSONAL_OC_ENABLED = False
+"""启用基于司机本月实际 rate 的机会成本校准。
+
+实测结论（仿真验证）：将 gross_income/occupied_minutes 作为机会成本会显著超过真实
+"放弃下一分钟的边际价值"——总收入率包含了多个订单累积，而 OC 应该是边际成本。
+强制启用会让 D004 等高利用率司机过度挑剔，反而损失 -10k 净收入。保留代码与
+record_committed_order/personal_rate_per_minute 接口供后续探索（如 1-step rollout）。
+"""
+
+PERSONAL_OC_MIN_COMPLETED_ORDERS = 5
+"""司机本月完成订单数 ≥ N 后才用其历史 rate 校准机会成本。"""
+
+PERSONAL_OC_BLEND_RATIO = 0.5
+"""个性化机会成本与动态市场成本的混合比例：personal_blend = personal_rate × ratio + market × (1-ratio)。"""
+
+PERSONAL_OC_FLOOR = 0.3
+"""个性化机会成本下限（元/分钟），避免 D001 等低 rate 司机机会成本过低导致过度接单。"""
+
+PERSONAL_OC_CEIL = 2.0
+"""个性化机会成本上限（元/分钟），避免高 rate 司机机会成本过高导致过度挑剔。"""

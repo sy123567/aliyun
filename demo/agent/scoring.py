@@ -215,6 +215,8 @@ class DecisionContext:
     opportunity_cost_per_minute: float = DEFAULT_OPPORTUNITY_COST_PER_MINUTE
     weights: config.ScoringWeights = config.DEFAULT_WEIGHTS
     visible_cargo_count: int = 0
+    # PR#32 突破 #2：困境模式标记——连续等待无果时进入，放宽长距 reposition 限制
+    stranded_mode: bool = False
 
 
 # ---------------- 自适应权重 ----------------
@@ -1260,17 +1262,59 @@ def score_take_order(
         breakdown["future_location_value"] = future_value
 
     # 方案一：订单链评估——卸货点的后续接单价值
+    chain_value = 0.0
     if config.CHAIN_VALUE_ENABLED and not income_voided_by_horizon:
         chain_value = memory.estimate_location_value(end_lat, end_lng)
         if chain_value > 0:
             breakdown["chain_value"] = chain_value * config.CHAIN_VALUE_COEFF
 
     # 方案五：在线学习——卸货点+到达时段的历史收益率信号
+    loc_time_value = 0.0
     if config.ONLINE_LEARNING_ENABLED and not income_voided_by_horizon:
         loc_time_value = memory.get_location_time_value(end_lat, end_lng, arrival_hour)
         if loc_time_value > 0:
             breakdown["online_learning_value"] = (
                 loc_time_value * horizon_minutes_ahead * config.ONLINE_LEARNING_SCORING_COEFF
+            )
+
+    # PR#32 突破 #1：目的地市场质量硬过滤——避免"远征到死区然后困到天亮"
+    # 实证：D003/D005/D007 各浪费 10+ 天在卸货目的地干等。绝大多数发生在 17-23 点到达远离家的陌生区。
+    # 仅对有 home_rule 的司机启用（其它司机本身就漂移，"远离家"不构成额外风险）。
+    if (
+        config.DEST_QUALITY_FILTER_ENABLED
+        and not income_voided_by_horizon
+        and memory.total_completed_orders >= config.DEST_QUALITY_MIN_COMPLETED_ORDERS
+        and income > 0
+        and rules.home_rule is not None
+    ):
+        dest_hotspot = memory.hotspot_value(end_lat, end_lng)
+        nearby_history = memory.count_nearby_completed_orders(end_lat, end_lng)
+        is_evening_arrival = (
+            config.DEST_QUALITY_EVENING_HOUR_START <= arrival_hour <= config.DEST_QUALITY_EVENING_HOUR_END
+        )
+        home_dist = geo_utils.haversine_km(
+            end_lat, end_lng, rules.home_rule.lat, rules.home_rule.lng
+        )
+        far_from_home = home_dist > config.DEST_QUALITY_HOME_RADIUS_KM
+        # 死区判定：到达时段在晚归窗 + 远离家 + 历史完单稀疏 + 热点货源密度低
+        is_dead_zone = (
+            is_evening_arrival
+            and far_from_home
+            and nearby_history < config.DEST_QUALITY_MIN_NEARBY_HISTORY
+            and dest_hotspot < config.DEST_QUALITY_LOW_DENSITY_HOTSPOT
+        )
+        if is_dead_zone:
+            # 死区订单仍可保留高 rate 的例外（rate ≥ 司机均值 ×2 视为值得困一晚）
+            personal_rate = memory.personal_rate_per_minute()
+            order_rate = income / max(1.0, occupied_minutes)
+            keep_threshold = personal_rate * 2.0 if personal_rate > 0 else 2.0
+            if order_rate < keep_threshold:
+                breakdown["dest_dead_zone_penalty"] = -config.DEST_QUALITY_DEAD_ZONE_PENALTY
+                note_parts.append("dead_zone_dest")
+        elif chain_value > 0 and (is_evening_arrival or far_from_home):
+            # 非死区但晚归/远家场景：加强 chain_value 信号
+            breakdown["chain_value_boost"] = (
+                chain_value * config.CHAIN_VALUE_COEFF * (config.DEST_QUALITY_CHAIN_VALUE_BOOST - 1.0)
             )
 
     _apply_adaptive_weights(breakdown, ctx.weights)
@@ -1776,9 +1820,22 @@ def score_reposition(
                     is_priority = True
                     break
         if not is_priority:
-            extra_time_cost = ctx.opportunity_cost_per_minute * minutes * config.REPOSITION_LONG_DISTANCE_PENALTY_MULTIPLIER
-            breakdown["long_reposition_penalty"] = -extra_time_cost
-            note_parts.append("long_reposition")
+            # PR#32 突破 #2：困境模式下，按 STRANDED_LONG_REPOS_PENALTY_MULTIPLIER 取代默认 0.5
+            penalty_mult = (
+                config.STRANDED_LONG_REPOS_PENALTY_MULTIPLIER
+                if ctx.stranded_mode
+                else config.REPOSITION_LONG_DISTANCE_PENALTY_MULTIPLIER
+            )
+            if penalty_mult > 0:
+                extra_time_cost = ctx.opportunity_cost_per_minute * minutes * penalty_mult
+                breakdown["long_reposition_penalty"] = -extra_time_cost
+                note_parts.append("long_reposition")
+
+    # PR#32 突破 #2：困境模式下，对家方向 reposition 给软激励——鼓励长距回家脱困
+    if ctx.stranded_mode and rules.home_rule is not None:
+        if _is_in_circle(target_lat, target_lng, rules.home_rule):
+            breakdown["stranded_home_bonus"] = config.STRANDED_HOME_REPOSITION_BONUS
+            note_parts.append("stranded_home")
 
     end_minutes = ctx.current_minutes + minutes
     # 空驶同样受禁行窗约束（PR#22 经验：与 take_order 对齐软/硬分离逻辑）
