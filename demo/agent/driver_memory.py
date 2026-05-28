@@ -274,11 +274,19 @@ class DriverMemory:
         return 0.0
 
     def record_committed_order(
-        self, cargo_id: str, price: float, occupied_minutes: float
+        self,
+        cargo_id: str,
+        price: float,
+        occupied_minutes: float,
+        end_lat: float = 0.0,
+        end_lng: float = 0.0,
+        completed_at_minutes: int = 0,
     ) -> None:
         """PR#32 突破 #3：决策时即时累计 cargo.price 与 occupied_minutes。
 
         每个 cargo_id 只累计一次（防止 query_history 同步重放导致重复计数）。
+        同时回填 completed_orders（PR#30 链评估依赖此列表）——规避仿真框架
+        不在 result 中回传 income 导致 _absorb_single_record 跳过该记录。
         """
         if not cargo_id or price <= 0 or occupied_minutes <= 0:
             return
@@ -288,6 +296,18 @@ class DriverMemory:
         self.committed_income_total += price
         self.committed_occupied_minutes_total += occupied_minutes
         self.committed_take_count += 1
+        # 回填到 completed_orders 列表，让 chain_value / count_nearby 等
+        # PR#30 链评估逻辑能基于"已承诺"的订单运作。
+        if end_lat != 0.0 and end_lng != 0.0:
+            self.completed_orders.append(
+                CompletedOrderRecord(
+                    end_lat=end_lat,
+                    end_lng=end_lng,
+                    income=price,
+                    occupied_minutes=occupied_minutes,
+                    completed_at_minutes=completed_at_minutes,
+                )
+            )
 
     def record_order_completion_stats(
         self,

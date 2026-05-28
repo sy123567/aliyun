@@ -519,7 +519,7 @@ DEST_QUALITY_MIN_NEARBY_HISTORY = 2
 """目的地 50km 内历史完单 < N 条视为陌生区域。"""
 
 # 加强 chain_value 与 online_learning 的影响（原 0.2 / 0.12 太弱）
-DEST_QUALITY_CHAIN_VALUE_BOOST = 3.0
+DEST_QUALITY_CHAIN_VALUE_BOOST = 2.0
 """目的地评估中 chain_value 系数额外放大倍数（与 CHAIN_VALUE_COEFF 相乘）。"""
 
 

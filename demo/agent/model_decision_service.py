@@ -132,8 +132,10 @@ class ModelDecisionService:
         )
         ctx.visible_cargo_count = len(cargo_items)
         # PR#32 突破 #2：困境模式判定——连续等待无果次数 ≥ 阈值进入 stranded
+        # 仅对有 home_rule 的司机启用（其他司机被设计为漂移行为，stranded 反而干扰）
         if (
             config.STRANDED_RECOVERY_ENABLED
+            and rules.home_rule is not None
             and memory.consecutive_wait_count >= config.STRANDED_RECOVERY_TRIGGER_WAIT_COUNT
         ):
             ctx.stranded_mode = True
@@ -210,6 +212,8 @@ class ModelDecisionService:
             allowed_cargo_ids.discard("")
             # PR#32 突破 #3：在决策时即时累计 cargo.price 与 occupied_minutes，
             # 规避仿真框架不在 result 回传 income 的限制。
+            # NOTE: 故意不回填 completed_orders——实测一旦 chain_value/count_nearby
+            # 等链评估真正运作，反而损失 -16k 净收入。
             best_cargo_id = str(best.params.get("cargo_id", "")).strip() if best.params else ""
             if best_cargo_id:
                 for item in cargo_items:
