@@ -8,6 +8,9 @@ from typing import Any
 from simkit.cargo_repository import CargoRepository
 from simkit.driver_state_manager import DriverStateManager
 
+QUERY_CARGO_MAX_K = 600
+QUERY_CARGO_DEFAULT_K = 100
+
 
 def haversine_km(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
     radius_km = 6371.0
@@ -98,13 +101,16 @@ def query_cargo(
     driver_id: str,
     latitude: float,
     longitude: float,
-    k: int,
+    k: int = QUERY_CARGO_DEFAULT_K,
 ) -> dict[str, Any]:
+    k = max(1, min(k, QUERY_CARGO_MAX_K))
     manager.ensure_active_driver(driver_id)
     current_time_minutes = manager.get_simulation_progress_minutes()
-    pairs = repo.nearest_pickup_km(latitude, longitude, current_time_minutes=current_time_minutes, k=k)
+    pairs = repo.nearest_pickup_km(
+        latitude, longitude, current_time_minutes=current_time_minutes, k=k
+    )
     items = [{"distance_km": float(d), "cargo": normalize_cargo_price_to_yuan(c)} for d, c in pairs]
-    return {"driver_id": driver_id, "items": items}
+    return {"driver_id": driver_id, "k": k, "items": items}
 
 
 def apply_cargo_query_scan_cost(

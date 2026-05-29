@@ -36,14 +36,12 @@ class EmbeddedDecisionEnvironment:
         model_gateway: ModelGatewayClient,
         *,
         session_actions_by_driver: dict[str, list[dict[str, Any]]] | None = None,
-        nearest_cargo_limit: int = 100,
         cargo_view_batch_size: int = 10,
     ) -> None:
         self._repo = repo
         self._manager = manager
         self._model_gateway = model_gateway
         self._session_actions_by_driver = session_actions_by_driver
-        self._nearest_cargo_limit = nearest_cargo_limit
         self._cargo_view_batch_size = cargo_view_batch_size
         self._logger = logging.getLogger("bench.embedded_agent.environment")
         self._last_model_usage = self._empty_usage()
@@ -51,7 +49,9 @@ class EmbeddedDecisionEnvironment:
     def get_driver_status(self, driver_id: str) -> dict[str, Any]:
         return self._manager.get_driver_status(driver_id)
 
-    def query_cargo(self, driver_id: str, latitude: float, longitude: float) -> dict[str, Any]:
+    def query_cargo(
+        self, driver_id: str, latitude: float, longitude: float, k: int = 100
+    ) -> dict[str, Any]:
         sim_min_before = self._manager.get_simulation_progress_minutes()
         raw = simulation_actions.query_cargo(
             self._repo,
@@ -59,7 +59,7 @@ class EmbeddedDecisionEnvironment:
             driver_id,
             latitude,
             longitude,
-            k=self._nearest_cargo_limit,
+            k=k,
         )
         items = raw.get("items", [])
         if not isinstance(items, list):
@@ -74,8 +74,9 @@ class EmbeddedDecisionEnvironment:
         sim_min_after = self._manager.get_simulation_progress_minutes()
         scan_cost_minutes = sim_min_after - sim_min_before
         self._logger.info(
-            "query_cargo ok driver_id=%s items=%s scan_cost_min=%s",
+            "query_cargo ok driver_id=%s k=%s items=%s scan_cost_min=%s",
             driver_id,
+            raw.get("k"),
             len(items),
             scan_cost_minutes,
         )

@@ -34,6 +34,20 @@ def _preferences_visible_at(preferences: list[Any], wall_time_str: str) -> list[
     return [p for p in preferences if _preference_visible_at_wall_time(p, now)]
 
 
+_PREFERENCE_API_HIDDEN_KEYS = frozenset({"start_time", "end_time"})
+
+
+def _preferences_for_api(preferences: list[Any]) -> list[Any]:
+    """对外接口不返回可见窗口字段（仅用于内部过滤，非偏好业务生效时间）。"""
+    exposed: list[Any] = []
+    for item in preferences:
+        if not isinstance(item, dict):
+            exposed.append(item)
+            continue
+        exposed.append({k: v for k, v in item.items() if k not in _PREFERENCE_API_HIDDEN_KEYS})
+    return exposed
+
+
 class DriverStateManager:
     """内存状态管理器。仿真时间单位：分钟（minutes）。"""
 
@@ -110,7 +124,9 @@ class DriverStateManager:
         ).strftime(_WALL_TIME_FMT)
 
         raw_preferences = list(profile.get("preferences", []))
-        preferences = _preferences_visible_at(raw_preferences, simulation_wall_time)
+        preferences = _preferences_for_api(
+            _preferences_visible_at(raw_preferences, simulation_wall_time)
+        )
 
         return {
             "driver_id": driver_id,
