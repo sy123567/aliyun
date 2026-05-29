@@ -41,10 +41,52 @@ class AppSettings:
     log_dir: Path
     simulation_max_steps: int
     simulation_duration_days: int
+    driver_max_total_tokens: int
     model_api_url: str
     model_api_key: str
     model_name: str
     model_timeout_seconds: float
+
+
+def build_app_settings(
+    *,
+    cargo_dataset_path: Path,
+    drivers_path: Path,
+    results_dir: Path,
+    log_dir: Path,
+    reposition_speed_km_per_hour: float = 60.0,
+    simulation_max_steps: int = 20000,
+    simulation_duration_days: int = 31,
+    driver_max_total_tokens: int = 5_000_000,
+    model_api_url: str,
+    model_api_key: str,
+    model_name: str,
+    model_timeout_seconds: float = 60.0,
+) -> AppSettings:
+    if reposition_speed_km_per_hour <= 0:
+        raise ValueError("reposition_speed_km_per_hour 必须为正数")
+    if simulation_max_steps <= 0:
+        raise ValueError("simulation_max_steps 必须为正整数")
+    if simulation_duration_days <= 0:
+        raise ValueError("simulation_duration_days 必须为正整数")
+    if driver_max_total_tokens <= 0:
+        raise ValueError("driver_max_total_tokens 必须为正整数")
+    if model_timeout_seconds <= 0:
+        raise ValueError("model_timeout_seconds 必须为正数")
+    return AppSettings(
+        cargo_dataset_path=cargo_dataset_path.resolve(),
+        drivers_path=drivers_path.resolve(),
+        reposition_speed_km_per_hour=float(reposition_speed_km_per_hour),
+        results_dir=results_dir.resolve(),
+        log_dir=log_dir.resolve(),
+        simulation_max_steps=int(simulation_max_steps),
+        simulation_duration_days=int(simulation_duration_days),
+        driver_max_total_tokens=int(driver_max_total_tokens),
+        model_api_url=model_api_url.strip(),
+        model_api_key=model_api_key.strip(),
+        model_name=model_name.strip(),
+        model_timeout_seconds=float(model_timeout_seconds),
+    )
 
 
 def load_settings(config_path: Path | None = None) -> AppSettings:
@@ -71,6 +113,9 @@ def load_settings(config_path: Path | None = None) -> AppSettings:
     simulation_duration_days = raw.get("simulation_duration_days", 31)
     if not isinstance(simulation_duration_days, int) or simulation_duration_days <= 0:
         raise ValueError("config.json 缺少有效字段 simulation_duration_days（正整数）")
+    driver_max_total_tokens = raw.get("driver_max_total_tokens", 5_000_000)
+    if not isinstance(driver_max_total_tokens, int) or driver_max_total_tokens <= 0:
+        raise ValueError("config.json 缺少有效字段 driver_max_total_tokens（正整数）")
     model_api_url = raw.get("model_api_url")
     if not isinstance(model_api_url, str) or not model_api_url.strip():
         raise ValueError("config.json 缺少有效字段 model_api_url（字符串）")
@@ -93,16 +138,17 @@ def load_settings(config_path: Path | None = None) -> AppSettings:
         results_path = DEMO_ROOT / results_path
     if not log_path.is_absolute():
         log_path = DEMO_ROOT / log_path
-    return AppSettings(
-        cargo_dataset_path=cargo_path.resolve(),
-        drivers_path=drivers_path.resolve(),
+    return build_app_settings(
+        cargo_dataset_path=cargo_path,
+        drivers_path=drivers_path,
+        results_dir=results_path,
+        log_dir=log_path,
         reposition_speed_km_per_hour=float(reposition_speed),
-        results_dir=results_path.resolve(),
-        log_dir=log_path.resolve(),
         simulation_max_steps=simulation_max_steps,
         simulation_duration_days=simulation_duration_days,
-        model_api_url=model_api_url.strip(),
-        model_api_key=model_api_key.strip(),
-        model_name=model_name.strip(),
+        driver_max_total_tokens=driver_max_total_tokens,
+        model_api_url=model_api_url,
+        model_api_key=model_api_key,
+        model_name=model_name,
         model_timeout_seconds=float(model_timeout_seconds),
     )

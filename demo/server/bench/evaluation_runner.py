@@ -19,13 +19,19 @@ from .simulation_orchestrator import SimulationOrchestrator
 class EvaluationRunner:
     """配置驱动：跑完仿真并落盘动作日志与 run_summary；不含收益统计。"""
 
-    def __init__(self, config_path: Path | None = None, max_steps: int | None = None) -> None:
+    def __init__(
+        self,
+        config_path: Path | None = None,
+        settings: AppSettings | None = None,
+        max_steps: int | None = None,
+    ) -> None:
         self._config_path = config_path
+        self._settings = settings
         self._max_steps = max_steps
         self._logger = logging.getLogger("bench.evaluation_runner")
 
     def run(self) -> dict[str, Any]:
-        settings = load_settings(self._config_path)
+        settings = self._settings or load_settings(self._config_path)
         self._configure_logging(settings)
         self._logger.info(
             "evaluation begin config=%s max_steps=%s",
@@ -62,6 +68,7 @@ class EvaluationRunner:
                 reposition_speed_km_per_hour=settings.reposition_speed_km_per_hour,
                 simulation_max_steps=settings.simulation_max_steps,
                 simulation_duration_days=settings.simulation_duration_days,
+                driver_max_total_tokens=settings.driver_max_total_tokens,
                 session_actions_by_driver=session_actions_by_driver,
             )
 

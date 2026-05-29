@@ -102,9 +102,9 @@ class CargoRepository:
         latitude: float,
         longitude: float,
         current_time_minutes: int,
-        k: int = 100,
+        k: int,
     ) -> list[tuple[float, dict[str, Any]]]:
-        """返回当前时刻 online 池中距离最近的至多 k 条。"""
+        """返回当前时刻 online 池中距离最近的至多 k 条（k 由 query_cargo 解析，上限 600）。"""
         self.sync_time_minutes(current_time_minutes)
         self._rebuild_online_cache_if_needed()
         n = len(self._online_ids)

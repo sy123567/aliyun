@@ -16,7 +16,9 @@ class SimulationApiPort(Protocol):
 
     def get_driver_status(self, driver_id: str) -> dict[str, Any]: ...
 
-    def query_cargo(self, driver_id: str, latitude: float, longitude: float) -> dict[str, Any]: ...
+    def query_cargo(
+        self, driver_id: str, latitude: float, longitude: float, k: int = 100
+    ) -> dict[str, Any]: ...
 
     def query_decision_history(self, driver_id: str, step: int) -> dict[str, Any]:
         """当前评测会话内存中的历史（与编排器写入 jsonl 前追加的条目一致）；不读磁盘。"""

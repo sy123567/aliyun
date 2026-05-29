@@ -1,9 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "Bash(python -c \"import json,sys; data=json.load\\(sys.stdin\\); [print\\(f\\\\\"{d['driver_id']:>5} net={d['income']['net_income']:>10.2f}  gross={d['income']['gross_income']:>10.2f}  cost={d['income']['cost']:>8.2f}  pref_pen={d['income']['preference_penalty']:>8.0f}\\\\\"\\) for d in data['drivers']]; s=data['summary']; print\\(f'TOTAL net={s[\\\\\"total_net_income_all_drivers\\\\\"]:.2f} pref_pen={s[\\\\\"total_preference_penalty\\\\\"]:.0f}'\\)\")",
-      "Bash(python -c \"from agent.scoring import score_take_order, score_wait, score_reposition, build_wait_durations; from agent import config; print\\('scoring module OK'\\); print\\('NO_DRIVE_SAFETY_BUFFER:', config.NO_DRIVE_SAFETY_BUFFER_MINUTES\\)\")",
-      "Bash(python -c \"from agent.model_decision_service import ModelDecisionService; print\\('ModelDecisionService OK'\\)\")"
-    ]
-  }
-}
