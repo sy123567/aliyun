@@ -248,13 +248,19 @@ class ModelDecisionService:
             ev = self._evaluate_cargo(cargo, item, rules, blackout_regions, now, day_end, lat, lng)
             if ev is None:
                 continue
-            net, touches_required = ev
+            net, touches_required, occupied = ev
+            # Value-density selection: net income per occupied minute. Picking the
+            # single highest-net order is myopic — one long haul eats the whole day and
+            # blocks a second order. Maximising net/minute packs more profitable work
+            # into the fixed daily working window (rest windows stay clean), which both
+            # lifts gross and trims deadhead cost vs. plain max-net.
+            score = net / occupied
             is_req = bool(need_zeng and touches_required)
             # Prefer a required-region order (worth the monthly penalty) over plain net.
             if is_req and not best_is_required:
-                best, best_score, best_is_required = (cargo, net, True)
-            elif is_req == best_is_required and net > best_score:
-                best, best_score, best_is_required = (cargo, net, is_req)
+                best, best_score, best_is_required = (cargo, score, True)
+            elif is_req == best_is_required and score > best_score:
+                best, best_score, best_is_required = (cargo, score, is_req)
         if best is None:
             return None
         if best_is_required:
@@ -306,7 +312,8 @@ class ModelDecisionService:
         if rules.required_region is not None:
             region = rules.required_region[0]
             touches_required = _region_in_city(region, scity) or _region_in_city(region, ecity)
-        return net, touches_required
+        occupied = max(1, finish - now)
+        return net, touches_required, occupied
 
     # ------------------------------------------------------------- action dsl
     @staticmethod
