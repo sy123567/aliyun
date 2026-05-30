@@ -20,6 +20,9 @@ MONTH_DAYS = 31
 SPEED_KM_PER_HOUR = 60.0
 EARTH_RADIUS_KM = 6371.0
 COST_PER_KM = 1.5
+# Minimum remaining minutes in the day worth attempting an anti-stranding reposition:
+# below this there is no time to relocate and still complete an order before day end.
+_STRAND_MIN_BUDGET = 240
 
 SHENZHEN_BBOX = (22.42, 22.89, 113.74, 114.66)  # lat_min, lat_max, lng_min, lng_max
 
@@ -119,6 +122,7 @@ class ModelDecisionService:
                 "zeng_order_days": set(),
                 "dated_single_done": set(),
                 "dated_route_done": set(),
+                "strand_repo": set(),
             },
         )
         # Preferences may only become visible inside their date window, so the off-day
@@ -219,6 +223,14 @@ class ModelDecisionService:
         order = self._pick_order(driver_id, status, rules, plan, now, lat, lng, day, hard_end)
         if order is not None:
             return order
+        # (E') anti-stranding: no compliant order is reachable from here, so the driver
+        # would otherwise idle the entire day. If a single reposition toward a profitable
+        # cargo cluster turns the day productive (the post-reposition pickup is short, so
+        # no deadhead-cap penalty), move there instead of sitting idle. `net` already
+        # nets out the reposition distance, so this never loses money on the anchor order.
+        strand = self._anti_strand(driver_id, rules, plan, now, lat, lng, day, hard_end)
+        if strand is not None:
+            return strand
         return self._wait(max(day_end - now, 1))
 
     def _next_day_is_ordinary(self, rules, plan, day) -> bool:
@@ -293,6 +305,80 @@ class ModelDecisionService:
         if best_is_required:
             plan["zeng_order_days"].add(day)
         return self._take_order(str(best.get("cargo_id")))
+
+    def _anti_strand(self, driver_id, rules, plan, now, lat, lng, day, day_end):
+        """When no compliant order is reachable from the current spot, the driver is
+        stranded (e.g. a previous haul left it far from any cargo cluster) and would
+        idle the whole day. Scan a wide radius for the best order that becomes workable
+        *after a single reposition to its pickup*, and move toward it. The reposition
+        deadhead is already folded into `net`, and the post-reposition pickup is ~0 km,
+        so the deadhead cap is never tripped (penalty stays 0). At most one reposition
+        per day; never on a planned off day (handled before this point)."""
+        if day in plan["strand_repo"]:
+            return None
+        if day_end - now < _STRAND_MIN_BUDGET:
+            return None
+        cargo_resp = self._api.query_cargo(driver_id=driver_id, latitude=lat, longitude=lng, k=600)
+        items = cargo_resp.get("items", [])
+        blackout_regions = {r for r, days in rules.blackout if day in days}
+        best_target = None
+        best_net = 0.0
+        for item in items:
+            cargo = item.get("cargo", {})
+            ev = self._evaluate_relocation(cargo, rules, blackout_regions, now, day_end, lat, lng)
+            if ev is None:
+                continue
+            net, tlat, tlng = ev
+            if net > best_net:
+                best_target, best_net = (tlat, tlng), net
+        if best_target is None:
+            return None
+        plan["strand_repo"].add(day)
+        return self._reposition(best_target[0], best_target[1])
+
+    def _evaluate_relocation(self, cargo, rules, blackout_regions, now, day_end, lat, lng):
+        """Net of an order if the driver first repositions to its pickup. Mirrors
+        _evaluate_cargo's compliance checks but treats the approach as a reposition
+        (so the per-order deadhead cap does not apply) and measures arrival from the
+        pickup. Returns (net, pickup_lat, pickup_lng) or None."""
+        name = str(cargo.get("cargo_name", ""))
+        if name in rules.forbidden_categories:
+            return None
+        start = cargo.get("start") or {}
+        end = cargo.get("end") or {}
+        scity = str(start.get("city", ""))
+        ecity = str(end.get("city", ""))
+        slat, slng = float(start.get("lat", 0.0)), float(start.get("lng", 0.0))
+        elat, elng = float(end.get("lat", 0.0)), float(end.get("lng", 0.0))
+        for region in rules.forbidden_regions:
+            if _region_in_city(region, scity) or _region_in_city(region, ecity):
+                return None
+        for region in blackout_regions:
+            if _region_in_city(region, scity) or _region_in_city(region, ecity):
+                return None
+            if region == "深圳" and (_in_shenzhen(slat, slng) or _in_shenzhen(elat, elng)):
+                return None
+        move_km = _haversine_km(lat, lng, slat, slng)
+        arrival = now + (_travel_minutes(move_km) if move_km > 1e-6 else 0)
+        load_window = cargo.get("load_time")
+        ready = arrival
+        if isinstance(load_window, list) and len(load_window) == 2:
+            ls = _wall_to_min(str(load_window[0]))
+            le = _wall_to_min(str(load_window[1]))
+            if ls is not None and le is not None:
+                if arrival > le:
+                    return None
+                ready = max(arrival, ls)
+        cost_time = int(cargo.get("cost_time_minutes", 0))
+        finish = ready + cost_time
+        if finish > day_end:
+            return None
+        haul_km = _haversine_km(slat, slng, elat, elng)
+        price = float(cargo.get("price", 0.0))
+        net = price - COST_PER_KM * (move_km + haul_km)
+        if net <= 0:
+            return None
+        return net, slat, slng
 
     def _evaluate_cargo(self, cargo, item, rules, blackout_regions, now, day_end, lat, lng):
         name = str(cargo.get("cargo_name", ""))
