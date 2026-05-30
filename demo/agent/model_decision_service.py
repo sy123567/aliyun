@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import math
 import re
@@ -43,6 +44,34 @@ def _in_shenzhen(lat: float, lng: float) -> bool:
     return a <= lat <= b and c <= lng <= d
 
 
+_REGION_SUFFIXES = ("省", "市", "区", "县", "镇", "村", "自治州", "地区")
+
+
+def _norm_region(name: str) -> str:
+    """去掉行政区后缀，便于「增城」与「增城区」「惠州」与「惠州市」互配。"""
+    name = name.strip()
+    changed = True
+    while changed and name:
+        changed = False
+        for suf in _REGION_SUFFIXES:
+            if len(name) > len(suf) and name.endswith(suf):
+                name = name[: -len(suf)]
+                changed = True
+    return name
+
+
+def _region_in_city(region: str, city: str) -> bool:
+    """区域归属判断：对行政区后缀差异稳健（双向子串匹配）。"""
+    if not region or not city:
+        return False
+    if region in city or city in region:
+        return True
+    r, c = _norm_region(region), _norm_region(city)
+    if not r or not c:
+        return False
+    return r in c or c in r
+
+
 class DriverRules:
     """结构化偏好规则。"""
 
@@ -75,6 +104,9 @@ class ModelDecisionService:
         self._logger = logging.getLogger("agent.decision_service")
         self._rules: dict[str, DriverRules] = {}
         self._plan: dict[str, dict[str, Any]] = {}
+        # preference texts already fed to the parser (LLM is only re-invoked when a
+        # new, date-windowed preference becomes visible).
+        self._seen_prefs: dict[str, set[str]] = {}
 
     # ------------------------------------------------------------------ decide
     def decide(self, driver_id: str) -> dict[str, Any]:
@@ -240,10 +272,10 @@ class ModelDecisionService:
         slat, slng = float(start.get("lat", 0.0)), float(start.get("lng", 0.0))
         elat, elng = float(end.get("lat", 0.0)), float(end.get("lng", 0.0))
         for region in rules.forbidden_regions:
-            if region in scity or region in ecity:
+            if _region_in_city(region, scity) or _region_in_city(region, ecity):
                 return None
         for region in blackout_regions:
-            if region in scity or region in ecity:
+            if _region_in_city(region, scity) or _region_in_city(region, ecity):
                 return None
             if region == "深圳" and (_in_shenzhen(slat, slng) or _in_shenzhen(elat, elng)):
                 return None
@@ -273,7 +305,7 @@ class ModelDecisionService:
         touches_required = False
         if rules.required_region is not None:
             region = rules.required_region[0]
-            touches_required = region in scity or region in ecity
+            touches_required = _region_in_city(region, scity) or _region_in_city(region, ecity)
         return net, touches_required
 
     # ------------------------------------------------------------- action dsl
@@ -324,18 +356,32 @@ class ModelDecisionService:
 
     # ------------------------------------------------------------- preferences
     def _ensure_rules(self, driver_id: str, status: dict[str, Any]) -> DriverRules:
-        # Re-parse every step and merge: preferences can be date-windowed and only
-        # become visible inside their window (e.g. 深圳 blackout, 盘库, 寿宴).
+        # Re-parse and merge: preferences can be date-windowed and only become
+        # visible inside their window (e.g. 深圳 blackout, 盘库, 寿宴). The LLM is the
+        # primary parser (generalises to unseen drivers/wordings); it is re-invoked
+        # only when a *new* preference text appears. Regex is the offline fallback.
         rules = self._rules.get(driver_id)
         if rules is None:
             rules = DriverRules()
             self._rules[driver_id] = rules
-        before = self._rules_fingerprint(rules)
         prefs = status.get("preferences") or []
-        coord_map = self._collect_coords(prefs)
-        for pref in prefs:
-            text = pref.get("content", "") if isinstance(pref, dict) else str(pref)
-            self._parse_one(text, rules, coord_map)
+        texts = [
+            (pref.get("content", "") if isinstance(pref, dict) else str(pref)) for pref in prefs
+        ]
+        texts = [t for t in texts if t.strip()]
+        seen = self._seen_prefs.setdefault(driver_id, set())
+        new_texts = [t for t in texts if t not in seen]
+        if not new_texts:
+            return rules
+
+        before = self._rules_fingerprint(rules)
+        parsed_by_llm = self._llm_parse_preferences(driver_id, texts, rules)
+        if not parsed_by_llm:
+            # offline / model unavailable: fall back to the deterministic regex parser.
+            coord_map = self._collect_coords(prefs)
+            for text in texts:
+                self._parse_one(text, rules, coord_map)
+        seen.update(texts)
         if self._rules_fingerprint(rules) != before:
             self._logger.info(
                 "parsed rules driver_id=%s rest=%s window=%s off=%s forbid_cat=%s forbid_reg=%s "
@@ -353,6 +399,184 @@ class ModelDecisionService:
                 rules.dated_route,
             )
         return rules
+
+    # ----------------------------------------------------------- LLM preference parsing
+    _PARSE_SYSTEM = (
+        "你是货运司机偏好抽取器。把司机的自然语言偏好转成严格 JSON，供调度器执行。"
+        "只输出一个 JSON 对象，禁止 markdown / 解释 / 多余文本。未提及的字段用 null 或空数组。"
+        "字段定义（含义务必准确，宁缺毋错）：\n"
+        '- daily_rest_hours: 数字或 null。每天必须「连续静止休息」的最少小时数（如“每天连续休息满8小时”→8）。\n'
+        '- rest_window: {"start_hour":整数,"end_hour":整数} 或 null。每天固定必须停车静止的时段（如“每天0点到6点必须停车熄火”→{"start_hour":0,"end_hour":6}）。\n'
+        '- off_days_min: 整数。整月需要的「一整天完全不出车」的天数（如“每月至少留3个整天休息”→3）；无则 0。\n'
+        '- forbidden_categories: 字符串数组。任何时候都禁止承运的货物名称（用货物本身的名字，如“机械设备”“蔬菜”）。\n'
+        '- forbidden_regions: 字符串数组。任何时候装货地或卸货地落在该城市/地区就不接（如“惠州”）。\n'
+        '- required_region: {"region":字符串,"min_days":整数} 或 null。每月在该地区接货需达到的不同天数。\n'
+        '- pickup_max_km: 数字或 null。赴装货的空驶里程上限（公里）。\n'
+        '- blackout: 数组，元素 {"region":字符串,"dates":[该月日期数字...]}。指定日期内不去某地区。\n'
+        '- dated_single: 数组，元素 {"date":日期数字,"lat":数字,"lng":数字,"wait_minutes":整数,"before_hour":整数或null}。'
+        "某天必须亲自到某地点停留办事（盘库 / 清库存 / 对账 / 验收 等），即使不接单也要去；"
+        "wait_minutes 取需停留时长，before_hour 是当天必须到达的最晚整点，无明确时限则 null。\n"
+        '- dated_route: 数组，元素 {"date":日期数字,"stops":[{"lat":数字,"lng":数字,"wait_minutes":整数,"before_hour":整数或null}...]}。'
+        "某天按顺序经过多个地点的赴约/办事路线（如先取物再赴宴），stops 按先后顺序排列。\n"
+        "通用规则：\n"
+        "1) 日期一律用该月的日数（1-31）。\n"
+        "2) 坐标直接取经纬度数字；若某条偏好只说了地点名（如某档口/某仓库/某地区）却没给经纬度，"
+        "而另一条偏好给出了同一地点的经纬度，则跨偏好引用那个经纬度填进来。\n"
+        "3) 停留时长：‘停一趟，花两小时’→wait_minutes=120；"
+        "‘赴宴到下午两点’且需中午前赶到→在该点停留到结束，wait_minutes 约等于(结束-到达)，按 120 估；"
+        "凡是‘到点办事/赴宴/盘点’类事件，wait_minutes 必须为正（>0），不能填 0。\n"
+        "4) 时刻换算：‘中午十二点前’→before_hour=12；‘下午两点’→14；‘早上六点’→6。\n"
+        "只抽取明确写出的约束，不要臆造未提及的规则。"
+    )
+
+    def _llm_parse_preferences(
+        self, driver_id: str, texts: list[str], rules: DriverRules
+    ) -> bool:
+        """用大模型把全部可见偏好解析成结构化规则并合并进 rules。
+
+        返回 True 表示 LLM 成功产出结构化结果；False 表示模型不可用/解析失败
+        （此时调用方会退回正则解析）。
+        """
+        if not texts:
+            return False
+        user = json.dumps({"preferences": texts}, ensure_ascii=False)
+        try:
+            resp = self._api.model_chat_completion(
+                {
+                    "messages": [
+                        {"role": "system", "content": self._PARSE_SYSTEM},
+                        {"role": "user", "content": user},
+                    ],
+                    "response_format": {"type": "json_object"},
+                }
+            )
+        except Exception as exc:  # model endpoint unavailable (e.g. offline eval)
+            self._logger.info("llm parse unavailable driver_id=%s err=%s", driver_id, exc)
+            return False
+        data = self._extract_json(resp)
+        if data is None:
+            self._logger.warning("llm parse: could not extract JSON driver_id=%s", driver_id)
+            return False
+        try:
+            self._merge_llm_rules(rules, data)
+        except Exception as exc:
+            self._logger.warning("llm parse: merge failed driver_id=%s err=%s", driver_id, exc)
+            return False
+        return True
+
+    @staticmethod
+    def _extract_json(resp: dict[str, Any]) -> dict[str, Any] | None:
+        try:
+            content = resp["choices"][0]["message"]["content"]
+        except (KeyError, IndexError, TypeError):
+            return None
+        if not isinstance(content, str) or not content.strip():
+            return None
+        text = content.strip()
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            m = re.search(r"\{.*\}", text, re.DOTALL)
+            if not m:
+                return None
+            try:
+                data = json.loads(m.group(0))
+            except json.JSONDecodeError:
+                return None
+        return data if isinstance(data, dict) else None
+
+    def _merge_llm_rules(self, rules: DriverRules, data: dict[str, Any]) -> None:
+        rest_h = data.get("daily_rest_hours")
+        if isinstance(rest_h, (int, float)) and rest_h > 0:
+            rules.daily_rest_minutes = max(rules.daily_rest_minutes, int(round(rest_h * 60)))
+        rw = data.get("rest_window")
+        if isinstance(rw, dict):
+            sh, eh = rw.get("start_hour"), rw.get("end_hour")
+            if isinstance(sh, (int, float)) and isinstance(eh, (int, float)) and eh > sh:
+                rules.rest_window = (int(sh) * 60, int(eh) * 60)
+        off = data.get("off_days_min")
+        if isinstance(off, (int, float)) and off > 0:
+            rules.off_days_min = max(rules.off_days_min, int(off))
+        for cat in data.get("forbidden_categories") or []:
+            if isinstance(cat, str) and cat.strip():
+                rules.forbidden_categories.add(cat.strip())
+        for reg in data.get("forbidden_regions") or []:
+            if isinstance(reg, str) and reg.strip():
+                rules.forbidden_regions.add(reg.strip())
+        rr = data.get("required_region")
+        if isinstance(rr, dict):
+            reg, md = rr.get("region"), rr.get("min_days")
+            if isinstance(reg, str) and reg.strip() and isinstance(md, (int, float)) and md > 0:
+                rules.required_region = (reg.strip(), int(md))
+        pk = data.get("pickup_max_km")
+        if isinstance(pk, (int, float)) and pk > 0:
+            rules.pickup_max_km = float(pk)
+        for bo in data.get("blackout") or []:
+            if not isinstance(bo, dict):
+                continue
+            reg = bo.get("region")
+            days = {int(d) - 1 for d in (bo.get("dates") or []) if isinstance(d, (int, float)) and 1 <= d <= 31}
+            if isinstance(reg, str) and reg.strip() and days and not any(r == reg.strip() for r, _ in rules.blackout):
+                rules.blackout.append((reg.strip(), days))
+        for ev in data.get("dated_single") or []:
+            single = self._coerce_single(ev)
+            if single is not None and not any(e["day"] == single["day"] for e in rules.dated_single):
+                rules.dated_single.append(single)
+        for ev in data.get("dated_route") or []:
+            route = self._coerce_route(ev)
+            if route is not None and not any(e["day"] == route["day"] for e in rules.dated_route):
+                rules.dated_route.append(route)
+
+    @staticmethod
+    def _coerce_before(before_hour: Any) -> int:
+        if isinstance(before_hour, (int, float)) and 0 < before_hour <= 24:
+            return int(before_hour) * 60
+        return DAY_MINUTES
+
+    def _coerce_single(self, ev: Any) -> dict[str, Any] | None:
+        if not isinstance(ev, dict):
+            return None
+        date, lat, lng = ev.get("date"), ev.get("lat"), ev.get("lng")
+        if not (isinstance(date, (int, float)) and 1 <= date <= 31):
+            return None
+        if not (isinstance(lat, (int, float)) and isinstance(lng, (int, float))):
+            return None
+        wait = ev.get("wait_minutes")
+        wait = int(wait) if isinstance(wait, (int, float)) and wait > 0 else 120
+        return {
+            "day": int(date) - 1,
+            "lat": float(lat),
+            "lng": float(lng),
+            "min_wait": wait,
+            "before": self._coerce_before(ev.get("before_hour")),
+        }
+
+    def _coerce_route(self, ev: Any) -> dict[str, Any] | None:
+        if not isinstance(ev, dict):
+            return None
+        date = ev.get("date")
+        if not (isinstance(date, (int, float)) and 1 <= date <= 31):
+            return None
+        stops: list[dict[str, Any]] = []
+        for s in ev.get("stops") or []:
+            if not isinstance(s, dict):
+                continue
+            lat, lng = s.get("lat"), s.get("lng")
+            if not (isinstance(lat, (int, float)) and isinstance(lng, (int, float))):
+                continue
+            wait = s.get("wait_minutes")
+            wait = int(wait) if isinstance(wait, (int, float)) and wait >= 0 else 0
+            stops.append(
+                {
+                    "lat": float(lat),
+                    "lng": float(lng),
+                    "min_wait": wait,
+                    "before": self._coerce_before(s.get("before_hour")),
+                }
+            )
+        if not stops:
+            return None
+        return {"day": int(date) - 1, "stops": stops}
 
     @staticmethod
     def _rules_fingerprint(rules: DriverRules) -> str:
@@ -553,10 +777,6 @@ class ModelDecisionService:
                 target = coords[key]
                 break
         if target is not None:
-            wait_min = 120
-            mw = re.search(r"到下午\s*([零一二两三四五六七八九十\d]+)\s*点", text)
-            if mw and "中午" in text:
-                wait_min = max(60, (_cn_to_int(mw.group(1)) + 12 - 12) * 60)
             stops.append({"lat": target[0], "lng": target[1], "min_wait": 120, "before": before})
         return stops
 
