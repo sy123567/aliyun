@@ -158,10 +158,17 @@ class ModelDecisionService:
                 return self._wait(day_end - now)
 
         # (B) start-of-day rest (covers daily-rest & rest-window from 00:00).
+        # For a flexible "N continuous hours anywhere" rest (rest_window is None) the
+        # block may begin after midnight when the previous day's last order ran past
+        # midnight: we then rest a full block from `now` (e.g. 02:00–10:00), which still
+        # gives the day its 8h continuous span (the scorer clips spans to the day).
         block = rules.day_rest_block
         if block > 0 and day not in plan["rest_done"]:
             plan["rest_done"].add(day)
-            dur = min(block - tod, day_end - now) if tod < block else 0
+            if rules.rest_window is None:
+                dur = block if tod + block <= DAY_MINUTES else max(0, DAY_MINUTES - tod)
+            else:
+                dur = min(block - tod, day_end - now) if tod < block else 0
             if dur > 0:
                 return self._wait(dur)
         else:
@@ -200,11 +207,31 @@ class ModelDecisionService:
             else:
                 return self._wait(day_end - now)
 
-        # (E) take the best compliant order, else idle to day end.
-        order = self._pick_order(driver_id, status, rules, plan, now, lat, lng, day, day_end)
+        # (E) take the best compliant order, else idle to day end. A flexible-rest
+        # driver may let the day's *last* order finish past midnight (up to a cap that
+        # still leaves room for a full rest block inside the next day), but only when
+        # the next day is an ordinary working day — never crossing into an off day,
+        # blackout day or a dated-event day.
+        hard_end = day_end
+        if rules.rest_window is None and rules.daily_rest_minutes > 0:
+            if self._next_day_is_ordinary(rules, plan, day):
+                hard_end = day_end + (DAY_MINUTES - rules.day_rest_block)
+        order = self._pick_order(driver_id, status, rules, plan, now, lat, lng, day, hard_end)
         if order is not None:
             return order
         return self._wait(max(day_end - now, 1))
+
+    def _next_day_is_ordinary(self, rules, plan, day) -> bool:
+        nxt = day + 1
+        if nxt >= MONTH_DAYS or nxt in plan["off_days"]:
+            return False
+        if any(nxt in days for _, days in rules.blackout):
+            return False
+        if any(ev["day"] == nxt for ev in rules.dated_single):
+            return False
+        if any(ev["day"] in (nxt, nxt + 1) for ev in rules.dated_route):
+            return False  # event day or its pre-stage evening
+        return True
 
     def _drive_route(self, ev, plan, now, day_start, lat, lng):
         stops = ev["stops"]
