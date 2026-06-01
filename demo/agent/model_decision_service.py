@@ -87,6 +87,7 @@ class DriverRules:
         self.required_region: tuple[str, int] | None = None  # (region, min_days)
         self.pickup_max_km: float | None = None
         self.blackout: list[tuple[str, set[int]]] = []  # (region, days)
+        self.blackout_coords: dict[str, tuple[float, float]] = {}  # region -> centre coord
         self.dated_single: list[dict[str, Any]] = []  # {day,lat,lng,min_wait,before}
         self.dated_route: list[dict[str, Any]] = []  # {day, stops:[{lat,lng,min_wait,before}]}
 
@@ -155,11 +156,17 @@ class ModelDecisionService:
         if day in plan["off_days"]:
             return self._wait(day_end - now)
 
-        # (A') blackout day while sitting inside a forbidden bbox: any move would be
-        # penalised, so idle the whole day (waiting is never penalised).
+        # (A') blackout day while sitting inside a forbidden region: idle the whole
+        # day (waiting is never penalised).  Generalised beyond the original 深圳 bbox.
         for region, days in rules.blackout:
-            if day in days and region == "深圳" and _in_shenzhen(lat, lng):
+            if day not in days:
+                continue
+            if region == "深圳" and _in_shenzhen(lat, lng):
                 return self._wait(day_end - now)
+            if region in rules.blackout_coords:
+                clat, clng = rules.blackout_coords[region]
+                if _haversine_km(lat, lng, clat, clng) < 60:
+                    return self._wait(day_end - now)
 
         # (B) start-of-day rest (covers daily-rest & rest-window from 00:00).
         # For a flexible "N continuous hours anywhere" rest (rest_window is None) the
@@ -495,13 +502,21 @@ class ModelDecisionService:
             return rules
 
         before = self._rules_fingerprint(rules)
+        coord_map = self._collect_coords(prefs)
         parsed_by_llm = self._llm_parse_preferences(driver_id, texts, rules)
         if not parsed_by_llm:
             # offline / model unavailable: fall back to the deterministic regex parser.
-            coord_map = self._collect_coords(prefs)
             for text in texts:
                 self._parse_one(text, rules, coord_map)
         seen.update(texts)
+        # Cross-reference blackout region names with known coordinates so the
+        # scheduler can idle a driver who is already inside a blackout area.
+        for region, _ in rules.blackout:
+            if region not in rules.blackout_coords:
+                for name, loc in coord_map.items():
+                    if _region_in_city(name, region):
+                        rules.blackout_coords[region] = loc
+                        break
         if self._rules_fingerprint(rules) != before:
             self._logger.info(
                 "parsed rules driver_id=%s rest=%s window=%s off=%s forbid_cat=%s forbid_reg=%s "
@@ -717,20 +732,31 @@ class ModelDecisionService:
 
     @staticmethod
     def _collect_coords(prefs: list[Any]) -> dict[str, tuple[float, float]]:
-        """从偏好文本中抽取「地名（lat，lng）」映射。"""
+        """从偏好文本中抽取「地名（lat，lng）」映射（通用版，不硬编码地名）。"""
         out: dict[str, tuple[float, float]] = {}
-        pat = re.compile(r"([\u4e00-\u9fa5]{2,6}?)[（(]\s*([0-9]+\.?[0-9]*)\s*[，,]\s*([0-9]+\.?[0-9]*)\s*[)）]")
+        # Wider capture window so that longer Chinese text before the parenthesis
+        # (e.g. "广州市增城区有家老档口") is fully included.
+        pat = re.compile(
+            r"([\u4e00-\u9fa5]{2,20}?)[（(]\s*([0-9]+\.?[0-9]*)\s*[，,]\s*([0-9]+\.?[0-9]*)\s*[)）]"
+        )
         for pref in prefs:
             text = pref.get("content", "") if isinstance(pref, dict) else str(pref)
             for m in pat.finditer(text):
-                name = m.group(1)
+                raw = m.group(1)
                 loc = (float(m.group(2)), float(m.group(3)))
-                out[name] = loc
-                # canonicalise: the 2-6 chars right before the coordinate identify the place
-                if "增城" in name or "档口" in name:
-                    out["增城"] = loc
-                if "四会" in name or "县城" in name:
-                    out["四会"] = loc
+                out[raw] = loc
+                # Extract 2-4 char substrings from the TAIL of the capture (the
+                # actual place name is right before the coordinate parenthesis).
+                tail = raw[-8:] if len(raw) > 8 else raw
+                for sub_len in range(2, 5):
+                    for start in range(len(tail) - sub_len + 1):
+                        sub = tail[start : start + sub_len]
+                        if sub not in out:
+                            out[sub] = loc
+                # Also store admin-suffix-stripped form of the full capture.
+                stripped = _norm_region(raw)
+                if stripped and stripped != raw and stripped not in out:
+                    out[stripped] = loc
         return out
 
     def _parse_one(self, text: str, rules: DriverRules, coords: dict[str, tuple[float, float]]) -> None:
@@ -744,20 +770,28 @@ class ModelDecisionService:
             window = self._parse_time_window(text)
             if window is not None:
                 rules.rest_window = window
-        # off days: "抽三个整天" / "留两个整天"
-        if "整天" in text and ("歇" in text or "休息" in text or "停驶" in text or "检修" in text or "保养" in text):
+        # off days: "抽三个整天" / "留两个整天" etc.
+        if "整天" in text and ("歇" in text or "休息" in text or "停驶" in text or "检修" in text
+                or "保养" in text or "放假" in text or "不出车" in text or "不跑" in text):
             cnt = self._parse_cn_count(text)
             if cnt:
                 rules.off_days_min = max(rules.off_days_min, cnt)
-        # forbidden category: "X这类活儿...干不了" / "凡是X货源...推掉"
-        if ("干不了" in text or "推掉" in text or ("一律不接" in text and "货源" not in text[:0])) and "扣" in text:
+        # forbidden category: "X这类活儿...干不了" / "凡是X货源...推掉" etc.
+        if ("干不了" in text or "推掉" in text or "不做" in text or "不拉" in text
+                or "不碰" in text or "不运" in text or "一律不接" in text) and "扣" in text:
             cat = self._parse_forbidden_category(text)
             if cat:
                 rules.forbidden_categories.add(cat)
-        # forbidden region: "装货地或卸货地在X的货,我一律不接"
-        m = re.search(r"在([\u4e00-\u9fa5]{2,4}?)的货[，,]?\s*我一律不接", text)
-        if m:
-            rules.forbidden_regions.add(m.group(1))
+        # forbidden region: "装货地或卸货地在X的货,我一律不接" etc.
+        for _fr_pat in (
+            r"在([\u4e00-\u9fa5]{2,4}?)的货[，,]?\s*(?:我)?一律不接",
+            r"([\u4e00-\u9fa5]{2,4}?)(?:那边|那里|那片).*不接",
+            r"不接.*?([\u4e00-\u9fa5]{2,4}?)的(?:货|单|活)",
+        ):
+            m = re.search(_fr_pat, text)
+            if m:
+                rules.forbidden_regions.add(m.group(1))
+                break
         # required region with min days: "装货或卸货在X的货...接够N个不同的日子"
         if "不同的日子" in text or "不同日子" in text:
             mr = re.search(r"在([\u4e00-\u9fa5]{2,4})的货", text)
@@ -769,27 +803,34 @@ class ModelDecisionService:
             km = self._parse_distance_km(text)
             if km:
                 rules.pickup_max_km = km
-        # blackout region on dates: "三月四号五号...不往深圳跑"
-        if ("不往" in text or "别给我派" in text or "不进" in text) and "号" in text:
+        # blackout region on dates: "三月四号五号...不往深圳跑" etc.
+        if ("不往" in text or "别给我派" in text or "不进" in text
+                or "不去" in text or "不要" in text or "别安排" in text) and "号" in text:
             region = self._parse_blackout_region(text)
             days = self._parse_month_days(text)
             if region and days and not any(r == region for r, _ in rules.blackout):
                 rules.blackout.append((region, set(days)))
-        # dated single stop: "三月十二号...到增城区停一趟,花两小时"
-        if "号" in text and ("停一趟" in text or "盘库" in text or "清库存" in text or "对清" in text):
+        # dated single stop: "三月十二号...到增城区停一趟,花两小时" etc.
+        _single_kws = ("停一趟", "盘库", "清库存", "对清", "盘点", "盘货",
+                        "验收", "对账", "签收", "到场", "检查", "交接", "提货")
+        if "号" in text and any(kw in text for kw in _single_kws):
             days = self._parse_month_days(text)
             loc = self._match_coords(text, coords)
             if days and loc and not any(e["day"] == days[0] for e in rules.dated_single):
                 rules.dated_single.append(
                     {"day": days[0], "lat": loc[0], "lng": loc[1], "min_wait": self._parse_hours_minutes(text) or 120, "before": DAY_MINUTES}
                 )
-        # dated route: "三月三十一号...先过增城...中午十二点前赶到四会...赴宴到下午两点"
-        if "号" in text and ("赴宴" in text or "寿" in text or "赶到" in text) and "增城" in text:
-            days = self._parse_month_days(text)
-            if days and not any(e["day"] == days[0] for e in rules.dated_route):
-                stops = self._parse_route_stops(text, coords)
-                if stops:
-                    rules.dated_route.append({"day": days[0], "stops": stops})
+        # dated multi-stop route (generalised: any date + route keywords + 2+ coord places).
+        _route_kws = ("赴宴", "寿", "赶到", "先过", "先去", "先到", "再去",
+                       "再到", "然后", "捎上", "办事", "聚餐", "婚", "路线")
+        if "号" in text and any(kw in text for kw in _route_kws):
+            mentioned_locs = {coords[n] for n in coords if n in text}
+            if len(mentioned_locs) >= 2:
+                days = self._parse_month_days(text)
+                if days and not any(e["day"] == days[0] for e in rules.dated_route):
+                    stops = self._parse_route_stops(text, coords)
+                    if len(stops) >= 2:
+                        rules.dated_route.append({"day": days[0], "stops": stops})
 
     # ----------------------------------------------------- small text parsers
     @staticmethod
@@ -840,22 +881,28 @@ class ModelDecisionService:
 
     @staticmethod
     def _parse_forbidden_category(text: str) -> str | None:
-        m = re.search(r"凡是\s*([\u4e00-\u9fa5]{2,6}?)\s*货源", text)
-        if m:
-            return m.group(1)
-        m = re.search(r"([\u4e00-\u9fa5]{2,6}?)\s*这类", text)
-        if m:
-            return m.group(1)
+        for _fc_pat in (
+            r"凡是\s*([\u4e00-\u9fa5]{2,6}?)\s*货源",
+            r"([\u4e00-\u9fa5]{2,6}?)\s*这类",
+            r"([\u4e00-\u9fa5]{2,6}?)\s*(?:的活|类货)",
+        ):
+            m = re.search(_fc_pat, text)
+            if m and not any(c in m.group(1) for c in "地区市县省"):
+                return m.group(1)
         return None
 
     @staticmethod
     def _parse_blackout_region(text: str) -> str | None:
-        m = re.search(r"不往\s*([\u4e00-\u9fa5]{2,4}?)\s*跑", text)
-        if m:
-            return m.group(1)
-        m = re.search(r"不进\s*([\u4e00-\u9fa5]{2,4})", text)
-        if m:
-            return m.group(1)
+        for _bo_pat in (
+            r"不往\s*([\u4e00-\u9fa5]{2,4}?)\s*跑",
+            r"不进\s*([\u4e00-\u9fa5]{2,4})",
+            r"不去\s*([\u4e00-\u9fa5]{2,4})",
+            r"别.*?派.*?进.*?([\u4e00-\u9fa5]{2,4})",
+            r"不要.*?([\u4e00-\u9fa5]{2,4})的(?:活|货|单)",
+        ):
+            m = re.search(_bo_pat, text)
+            if m:
+                return m.group(1)
         return None
 
     @staticmethod
@@ -877,27 +924,53 @@ class ModelDecisionService:
         for name, loc in coords.items():
             if name in text:
                 return loc
-        if "增城" in text and "增城" in coords:
-            return coords["增城"]
         return None
 
     def _parse_route_stops(self, text: str, coords: dict[str, tuple[float, float]]):
-        stops = []
-        before = DAY_MINUTES
+        """从文本中按出现顺序提取多个站点（通用版，不硬编码地名）。"""
+        # Find all coordinated places, deduplicated by location.
+        mentions: list[tuple[int, str, tuple[float, float]]] = []
+        seen_locs: set[tuple[float, float]] = set()
+        for name, loc in coords.items():
+            idx = text.find(name)
+            if idx >= 0 and loc not in seen_locs:
+                mentions.append((idx, name, loc))
+                seen_locs.add(loc)
+        mentions.sort(key=lambda x: x[0])
+        if len(mentions) < 2:
+            return []
+
+        # Global "before" deadline from the full text.
+        global_before = DAY_MINUTES
         mb = re.search(r"([零一二两三四五六七八九十\d]+)\s*点前", text)
         if mb:
-            before = _cn_to_int(mb.group(1)) * 60
-        # first stop: 增城 (pick up gift, no wait)
-        if "增城" in coords:
-            stops.append({"lat": coords["增城"][0], "lng": coords["增城"][1], "min_wait": 0, "before": before})
-        # second stop: explicit-coord place (四会/县城) with a banquet wait
-        target = None
-        for key in ("四会", "县城"):
-            if key in coords:
-                target = coords[key]
-                break
-        if target is not None:
-            stops.append({"lat": target[0], "lng": target[1], "min_wait": 120, "before": before})
+            global_before = _cn_to_int(mb.group(1)) * 60
+
+        stops = []
+        n = len(mentions)
+        for i, (_idx, _name, loc) in enumerate(mentions):
+            # Use text between this stop and the next to avoid mis-attributing
+            # events (e.g. "寿礼" at stop 1 confused with banquet at stop 2).
+            if i + 1 < n:
+                ctx = text[_idx : mentions[i + 1][0]]
+            else:
+                ctx = text[_idx : _idx + 150]
+            # Parse wait time.
+            wait = 0
+            wm = re.search(
+                r"(?:花|停|待|逗留)\s*([零一二两三四五六七八九十\d]+)\s*(?:个)?\s*小时",
+                ctx[:120],
+            )
+            if wm:
+                wait = _cn_to_int(wm.group(1)) * 60
+            elif any(kw in ctx[:80] for kw in ("赴宴", "聚餐", "婚宴", "酒席", "做寿", "办事")):
+                wait = 120
+            # Per-stop "before" (falls back to the global deadline).
+            before = global_before
+            bm = re.search(r"([零一二两三四五六七八九十\d]+)\s*点前", ctx[:120])
+            if bm:
+                before = _cn_to_int(bm.group(1)) * 60
+            stops.append({"lat": loc[0], "lng": loc[1], "min_wait": wait, "before": before})
         return stops
 
 
