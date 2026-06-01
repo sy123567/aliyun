@@ -35,5 +35,8 @@ Thumbs.db
 
 
 
+# Config with secrets (use config.example.json as template)
+demo/server/config/config.json
+
 # Evaluation artifacts
 demo/results/
