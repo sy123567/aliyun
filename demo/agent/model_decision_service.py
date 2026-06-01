@@ -87,6 +87,7 @@ class DriverRules:
         self.required_region: tuple[str, int] | None = None  # (region, min_days)
         self.pickup_max_km: float | None = None
         self.blackout: list[tuple[str, set[int]]] = []  # (region, days)
+        self.blackout_coords: dict[str, tuple[float, float]] = {}  # region→(lat,lng)
         self.dated_single: list[dict[str, Any]] = []  # {day,lat,lng,min_wait,before}
         self.dated_route: list[dict[str, Any]] = []  # {day, stops:[{lat,lng,min_wait,before}]}
 
@@ -155,10 +156,20 @@ class ModelDecisionService:
         if day in plan["off_days"]:
             return self._wait(day_end - now)
 
-        # (A') blackout day while sitting inside a forbidden bbox: any move would be
-        # penalised, so idle the whole day (waiting is never penalised).
+        # (A') blackout day while sitting inside a forbidden region: idle the whole
+        # day (waiting is never penalised).  Uses a proximity check for regions that
+        # have known coordinates, plus the hard-coded Shenzhen bbox as fallback.
         for region, days in rules.blackout:
-            if day in days and region == "深圳" and _in_shenzhen(lat, lng):
+            if day not in days:
+                continue
+            in_region = False
+            if region == "深圳" and _in_shenzhen(lat, lng):
+                in_region = True
+            elif region in rules.blackout_coords:
+                rlat, rlng = rules.blackout_coords[region]
+                if _haversine_km(lat, lng, rlat, rlng) < 60:
+                    in_region = True
+            if in_region:
                 return self._wait(day_end - now)
 
         # (B) start-of-day rest (covers daily-rest & rest-window from 00:00).
@@ -358,6 +369,10 @@ class ModelDecisionService:
                 return None
             if region == "深圳" and (_in_shenzhen(slat, slng) or _in_shenzhen(elat, elng)):
                 return None
+            if region in rules.blackout_coords:
+                rlat, rlng = rules.blackout_coords[region]
+                if _haversine_km(slat, slng, rlat, rlng) < 60 or _haversine_km(elat, elng, rlat, rlng) < 60:
+                    return None
         move_km = _haversine_km(lat, lng, slat, slng)
         arrival = now + (_travel_minutes(move_km) if move_km > 1e-6 else 0)
         load_window = cargo.get("load_time")
@@ -398,6 +413,10 @@ class ModelDecisionService:
                 return None
             if region == "深圳" and (_in_shenzhen(slat, slng) or _in_shenzhen(elat, elng)):
                 return None
+            if region in rules.blackout_coords:
+                rlat, rlng = rules.blackout_coords[region]
+                if _haversine_km(slat, slng, rlat, rlng) < 60 or _haversine_km(elat, elng, rlat, rlng) < 60:
+                    return None
         pickup_km = _haversine_km(lat, lng, slat, slng)
         if rules.pickup_max_km is not None and pickup_km > rules.pickup_max_km:
             return None
@@ -495,18 +514,30 @@ class ModelDecisionService:
             return rules
 
         before = self._rules_fingerprint(rules)
+        coord_map = self._collect_coords(prefs)
         parsed_by_llm = self._llm_parse_preferences(driver_id, texts, rules)
         if not parsed_by_llm:
             # offline / model unavailable: fall back to the deterministic regex parser.
-            coord_map = self._collect_coords(prefs)
             for text in texts:
                 self._parse_one(text, rules, coord_map)
         else:
             # LLM succeeded: supplement with safe, high-confidence regex patterns
             # for basic scalar rules that are easy to verify and unlikely to
-            # false-match (rest hours, rest window, off days, pickup cap).
+            # false-match (rest hours, rest window, off days, pickup cap,
+            # forbidden categories/regions with very specific trigger patterns).
             for text in texts:
                 self._supplement_basic_rules(text, rules)
+        # Build blackout_coords: map blackout region names to nearby coordinates
+        # extracted from preference text. This lets the scheduler idle the driver
+        # on blackout days if they happen to be sitting inside the forbidden region.
+        for region, _days in rules.blackout:
+            if region in rules.blackout_coords:
+                continue
+            # Try exact match first, then norm_region match
+            for name, loc in coord_map.items():
+                if _region_in_city(region, name):
+                    rules.blackout_coords[region] = loc
+                    break
         seen.update(texts)
         if self._rules_fingerprint(rules) != before:
             self._logger.info(
@@ -584,7 +615,7 @@ class ModelDecisionService:
             data = self._extract_json(resp)
             if data is not None:
                 try:
-                    self._merge_llm_rules(rules, data)
+                    self._merge_llm_rules(rules, data, texts)
                 except Exception as exc:
                     self._logger.warning("llm parse: merge failed driver_id=%s err=%s", driver_id, exc)
                     continue
@@ -613,7 +644,8 @@ class ModelDecisionService:
                 return None
         return data if isinstance(data, dict) else None
 
-    def _merge_llm_rules(self, rules: DriverRules, data: dict[str, Any]) -> None:
+    def _merge_llm_rules(self, rules: DriverRules, data: dict[str, Any], texts: list[str] | None = None) -> None:
+        all_text = "\n".join(texts) if texts else ""
         rest_h = data.get("daily_rest_hours")
         if isinstance(rest_h, (int, float)) and rest_h > 0:
             rules.daily_rest_minutes = max(rules.daily_rest_minutes, int(round(rest_h * 60)))
@@ -627,10 +659,18 @@ class ModelDecisionService:
             rules.off_days_min = max(rules.off_days_min, int(off))
         for cat in data.get("forbidden_categories") or []:
             if isinstance(cat, str) and cat.strip():
-                rules.forbidden_categories.add(cat.strip())
+                c = cat.strip()
+                if not all_text or c in all_text or _norm_region(c) in all_text:
+                    rules.forbidden_categories.add(c)
+                else:
+                    self._logger.info("llm validation: rejected forbidden_category '%s' (not in texts)", c)
         for reg in data.get("forbidden_regions") or []:
             if isinstance(reg, str) and reg.strip():
-                rules.forbidden_regions.add(reg.strip())
+                r = reg.strip()
+                if not all_text or r in all_text or _norm_region(r) in all_text:
+                    rules.forbidden_regions.add(r)
+                else:
+                    self._logger.info("llm validation: rejected forbidden_region '%s' (not in texts)", r)
         rr = data.get("required_region")
         if isinstance(rr, dict):
             reg, md = rr.get("region"), rr.get("min_days")
@@ -645,7 +685,11 @@ class ModelDecisionService:
             reg = bo.get("region")
             days = {int(d) - 1 for d in (bo.get("dates") or []) if isinstance(d, (int, float)) and 1 <= d <= 31}
             if isinstance(reg, str) and reg.strip() and days and not any(r == reg.strip() for r, _ in rules.blackout):
-                rules.blackout.append((reg.strip(), days))
+                r = reg.strip()
+                if not all_text or r in all_text or _norm_region(r) in all_text:
+                    rules.blackout.append((r, days))
+                else:
+                    self._logger.info("llm validation: rejected blackout region '%s' (not in texts)", r)
         for ev in data.get("dated_single") or []:
             single = self._coerce_single(ev)
             if single is not None and not any(e["day"] == single["day"] for e in rules.dated_single):
@@ -744,10 +788,9 @@ class ModelDecisionService:
     def _supplement_basic_rules(self, text: str, rules: DriverRules) -> None:
         """Run after LLM to reinforce basic scalar rules that are easy to verify.
 
-        Only touches max/scalar rules (daily rest, rest window, off days, pickup
-        cap) that cannot create phantom constraints.  Set-based rules (forbidden
-        categories/regions, blackout, dated events) are deliberately excluded to
-        avoid false-positive matches on unseen driver wordings.
+        Covers scalar rules (daily rest, rest window, off days, pickup cap) plus
+        high-confidence forbidden category/region patterns with very specific
+        trigger phrases that are unlikely to false-match.
         """
         if ("连续" in text and "休息" in text) or ("连轴" in text):
             m = re.search(r"(\d+)\s*(?:个)?\s*小时", text)
@@ -765,6 +808,32 @@ class ModelDecisionService:
             km = self._parse_distance_km(text)
             if km:
                 rules.pickup_max_km = km
+        # forbidden category: patterns like "X的活/货...干不了/推掉/不接/不拉"
+        cat_m = re.search(
+            r"[\"\"「]?([\u4e00-\u9fa5]{2,6}?)[\"\"」]?"
+            r"(?:的活|的货|货源|类货|这类|那类).*?"
+            r"(?:干不了|推掉|不接|不拉|不碰|不做|碰不得|接不了)",
+            text,
+        )
+        if cat_m:
+            rules.forbidden_categories.add(cat_m.group(1))
+        # forbidden region: "在X的货...一律不接/不要/不跑/不去"
+        reg_m = re.search(
+            r"(?:装货地|卸货地|目的地)?在[\"\"「]?([\u4e00-\u9fa5]{2,4})[\"\"」]?"
+            r".*?(?:一律不接|不接|不要|不跑|不去|不做)",
+            text,
+        )
+        if reg_m:
+            rules.forbidden_regions.add(reg_m.group(1))
+        # blackout: "X号/X日不往Y跑" or "不进Y"
+        if "不往" in text and "跑" in text:
+            m2 = re.search(r"不往([\u4e00-\u9fa5]{2,4})跑", text)
+            if m2:
+                days = {int(d) - 1 for d in re.findall(r"(\d{1,2})[号日]", text) if 1 <= int(d) <= 31}
+                if days:
+                    region = m2.group(1)
+                    if not any(r == region for r, _ in rules.blackout):
+                        rules.blackout.append((region, days))
 
     def _parse_one(self, text: str, rules: DriverRules, coords: dict[str, tuple[float, float]]) -> None:
         # daily continuous rest: "每天至少连续...休息满8小时"
