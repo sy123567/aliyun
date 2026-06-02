@@ -585,34 +585,45 @@ class ModelDecisionService:
 
     # ----------------------------------------------------------- LLM preference parsing
     _PARSE_SYSTEM = (
-        "你是货运司机偏好抽取器。把司机的自然语言偏好转成严格 JSON，供调度器执行。\n"
-        "只输出一个 JSON 对象，禁止 markdown / 解释 / 多余文本。未提及的字段用 null 或空数组。\n"
-        "字段定义（含义务必准确，宁缺毋错）：\n"
-        '- daily_rest_hours: 数字或 null。每天必须「连续静止休息」的最少小时数（如“每天连续休息满8小时”→8）。\n'
-        '- rest_window: {"start_hour":整数,"end_hour":整数} 或 null。每天固定必须停车静止的时段（如“每天0点到6点必须停车熄火”→{"start_hour":0,"end_hour":6}）。\n'
-        '- off_days_min: 整数。整月需要的「一整天完全不出车」的天数（如“每月至少留3个整天休息”→3）；无则 0。\n'
-        '- forbidden_categories: 字符串数组。任何时候都禁止承运的货物名称（用货物本身的名字，如“机械设备”“蔬菜”）。\n'
-        '- forbidden_regions: 字符串数组。任何时候装货地或卸货地落在该城市/地区就不接（如“惠州”）。\n'
-        '- required_region: {"region":字符串,"min_days":整数} 或 null。每月在该地区接货需达到的不同天数。\n'
-        '- pickup_max_km: 数字或 null。赴装货的空驶里程上限（公里）。中文数字"五十五"→55。\n'
-        '- blackout: 数组，元素 {"region":字符串,"dates":[该月日期数字...]}。指定日期内不去某地区（如"三月四号五号不往深圳跑"→{"region":"深圳","dates":[4,5]}）。\n'
-        '- dated_single: 数组，元素 {"date":日期数字,"lat":数字,"lng":数字,"wait_minutes":整数,"before_hour":整数或null}。'
-        "某天必须亲自到某地点停留办事（盘库/清库存/对账/验收/盘点/提货/签收/检查等），即使不接单也要去；"
-        "wait_minutes 取需停留时长，before_hour 是当天必须到达的最晚整点，无明确时限则 null。\n"
-        '- dated_route: 数组，元素 {"date":日期数字,"stops":[{"lat":数字,"lng":数字,"wait_minutes":整数,"before_hour":整数或null}...]}。'
-        "某天按顺序经过多个地点的赴约/办事路线（如先取物再赴宴、先到A再到B），stops 按先后顺序排列。\n"
-        "通用规则：\n"
-        "1) 日期一律用该月的日数（1-31）。\n"
-        "2) 坐标提取：偏好文本中会出现'地名（纬度, 经度）'格式，如'增城区有家老档口（23.15，113.67）'→lat=23.15, lng=113.67。"
-        "输入中可能附带 known_coordinates 字段——那是从偏好文本预提取的地名→坐标映射，务必优先使用。"
-        "若某条偏好只说了地点名而 known_coordinates 或另一条偏好给出了同一地点的经纬度，则引用过来。\n"
-        "3) 停留时长：‘停一趟，花两小时’→wait_minutes=120；"
-        "‘赴宴到下午两点’且需中午前赶到→在该点停留到结束，wait_minutes 约等于(结束-到达)，按 120 估；"
-        "凡是‘到点办事/赴宴/盘点’类事件，wait_minutes 必须为正（>0），不能填 0。\n"
-        "4) 时刻换算：‘中午十二点前’→before_hour=12；‘下午两点’→14；‘早上六点’→6。\n"
-        "5) 重要：禁行区域(forbidden_regions)和禁接品类(forbidden_categories)要分清——带有'货源/这类活/类货'的是品类禁令；带有'装货地/卸货地在X'的是区域禁令。\n"
-        "6) dated_single 和 dated_route 是最重要的约束（错过惩罚极高）。只要偏好中提到特定日期要去某地办事/赴宴/取货/盘库等，必须抽取，坐标必须正确。\n"
-        "只抽取明确写出的约束，不要臆造未提及的规则。"
+        "你是货运司机偏好抽取器。把司机的自然语言偏好转成严格 JSON。\n"
+        "只输出一个 JSON 对象，禁止 markdown / 解释。未提及的字段用 null 或空数组。\n\n"
+        "字段定义（宁缺毋错）：\n"
+        '- daily_rest_hours: 每天连续休息最少小时数（数字或 null）\n'
+        '- rest_window: 每天固定停车时段 {"start_hour":整数,"end_hour":整数}（或 null）\n'
+        '- off_days_min: 整月完全不出车天数（整数，默认 0）\n'
+        '- forbidden_categories: 禁运货物名称数组\n'
+        '- forbidden_regions: 禁接的装/卸货城市数组\n'
+        '- required_region: 每月需在该区域接货天数 {"region":字符串,"min_days":整数}（或 null）\n'
+        '- pickup_max_km: 赴装空驶上限公里数（数字或 null）。中文数字要转换。\n'
+        '- blackout: 指定日期不去某地 [{"region":字符串,"dates":[日期...]}]\n'
+        '- dated_single: 某天必须到某地办事 [{"date":日期,"lat":纬度,"lng":经度,"wait_minutes":停留分钟,"before_hour":最晚到达整点或null}]\n'
+        '  触发词：盘库/清库存/对账/验收/盘点/提货/签收/检查/保养/检修/停一趟/办事/开会/取东西/交货/拿货/走一趟/回一趟/去一趟\n'
+        '- dated_route: 某天按顺序经过多个地点 [{"date":日期,"stops":[{"lat":纬度,"lng":经度,"wait_minutes":分钟,"before_hour":整点或null}...]}]\n'
+        '  触发词：赴宴/先到…再到/先去…再去/先过…赶到\n\n'
+        "关键规则：\n"
+        "1) 日期用该月日数 1-31。中文数字要转换（十二号→12，二十号→20，三十一号→31）。\n"
+        "2) 坐标：偏好中'地名（纬度,经度）'→直接取。输入若有 known_coordinates 优先使用。"
+        "若某偏好只说地名，而 known_coordinates 有同名坐标，直接引用。\n"
+        "3) wait_minutes：办事类事件必须 >0（默认 120）。\n"
+        "4) 时刻：'中午十二点前'→12，'下午两点'→14。\n"
+        "5) 区分品类禁令（货物名）和区域禁令（城市名）。\n"
+        "6) **dated_single 和 dated_route 惩罚最高，必须仔细抽取，坐标必须正确。**\n"
+        "7) 只抽取明确约束，不臆造。\n\n"
+        "示例1：\n"
+        '入: {"preferences":["每天零点到六点停着熄火睡觉","凡是生鲜货源碰不得","三月四号五号不往深圳（22.55，114.05）跑"]}\n'
+        '出: {"daily_rest_hours":null,"rest_window":{"start_hour":0,"end_hour":6},"off_days_min":0,'
+        '"forbidden_categories":["生鲜"],"forbidden_regions":[],"required_region":null,"pickup_max_km":null,'
+        '"blackout":[{"region":"深圳","dates":[4,5]}],"dated_single":[],"dated_route":[]}\n\n'
+        "示例2：\n"
+        '入: {"preferences":["十二号得去仓库（23.15，113.67）盘库，花两小时","连续休息满8小时","空驶超过五十五公里别接"]}\n'
+        '出: {"daily_rest_hours":8,"rest_window":null,"off_days_min":0,'
+        '"forbidden_categories":[],"forbidden_regions":[],"required_region":null,"pickup_max_km":55,'
+        '"blackout":[],"dated_single":[{"date":12,"lat":23.15,"lng":113.67,"wait_minutes":120,"before_hour":null}],"dated_route":[]}\n\n'
+        "示例3：\n"
+        '入: {"preferences":["三十一号先过档口（23.15，113.67）取礼物，中午十二点前赶到县城（23.35，112.47）赴宴到下午两点"]}\n'
+        '出: {"daily_rest_hours":null,"rest_window":null,"off_days_min":0,'
+        '"forbidden_categories":[],"forbidden_regions":[],"required_region":null,"pickup_max_km":null,'
+        '"blackout":[],"dated_single":[],"dated_route":[{"date":31,"stops":[{"lat":23.15,"lng":113.67,"wait_minutes":0,"before_hour":12},{"lat":23.35,"lng":112.47,"wait_minutes":120,"before_hour":12}]}]}'
     )
 
     def _llm_parse_preferences(
@@ -866,15 +877,30 @@ class ModelDecisionService:
         )
         if reg_m:
             rules.forbidden_regions.add(reg_m.group(1))
-        # blackout: "X号/X日不往Y跑" or "不进Y"
+        # blackout: various patterns for "don't go to region X on dates Y"
+        blackout_region = None
         if "不往" in text and "跑" in text:
             m2 = re.search(r"不往([\u4e00-\u9fa5]{2,4})跑", text)
             if m2:
-                days = {int(d) - 1 for d in re.findall(r"(\d{1,2})[号日]", text) if 1 <= int(d) <= 31}
-                if days:
-                    region = m2.group(1)
-                    if not any(r == region for r, _ in rules.blackout):
-                        rules.blackout.append((region, days))
+                blackout_region = m2.group(1)
+        if blackout_region is None and "不进" in text:
+            m2 = re.search(r"不进([\u4e00-\u9fa5]{2,4})", text)
+            if m2:
+                blackout_region = m2.group(1)
+        if blackout_region is None and "别给我派" in text:
+            m2 = re.search(r"别给我派.*?([\u4e00-\u9fa5]{2,4})", text)
+            if m2:
+                blackout_region = m2.group(1)
+        if blackout_region is None and ("不去" in text or "别去" in text):
+            m2 = re.search(r"(?:不去|别去)([\u4e00-\u9fa5]{2,4})", text)
+            if m2:
+                blackout_region = m2.group(1)
+        if blackout_region is not None:
+            days = set(self._parse_any_days(text))
+            if not days:
+                days = set(self._parse_month_days(text))
+            if days and not any(r == blackout_region for r, _ in rules.blackout):
+                rules.blackout.append((blackout_region, days))
 
     def _supplement_dated_events(
         self, text: str, rules: DriverRules, coord_map: dict[str, tuple[float, float]]
@@ -884,14 +910,13 @@ class ModelDecisionService:
         Catches dated_single/dated_route the LLM may have missed. Requires ALL
         three signals (date, coordinate, action keyword) to avoid false positives.
         """
-        # Skip blackout-style texts (those are about NOT going somewhere)
-        if any(kw in text for kw in ("不往", "不去", "不进", "别给我派")):
+        # Skip blackout-style / forbidden-style texts (about NOT going somewhere)
+        if any(kw in text for kw in ("不往", "不去", "不进", "别给我派", "别安排", "不跑", "不接", "一律不")):
             return
         # Extract dates from text
         days = self._parse_month_days(text)
         if not days:
-            plain = re.findall(r"(\d{1,2})[号日]", text)
-            days = sorted({int(d) - 1 for d in plain if 1 <= int(d) <= 31})
+            days = self._parse_any_days(text)
         if not days:
             return
         # Find coordinates: inline in this text + from coord_map if name appears
@@ -910,8 +935,16 @@ class ModelDecisionService:
         if not found:
             return
         # Determine event type by action keywords
-        single_kws = ("停一趟", "盘库", "清库存", "对清", "对账", "验收", "盘点", "提货", "签收", "检查", "保养", "检修")
-        route_kws = ("赴宴", "寿", "赶到", "先到", "先去", "先过", "再到", "再去")
+        single_kws = (
+            "停一趟", "盘库", "清库存", "对清", "对账", "验收", "盘点",
+            "提货", "签收", "检查", "保养", "检修", "办事", "开会",
+            "取东西", "拿货", "交货", "走一趟", "跑一趟", "回一趟",
+            "去一趟", "装货", "卸货",
+        )
+        route_kws = (
+            "赴宴", "寿", "赶到", "先到", "先去", "先过",
+            "再到", "再去", "然后到", "然后去", "接着到", "接着去",
+        )
         is_single = any(kw in text for kw in single_kws)
         is_route = len(found) >= 2 and any(kw in text for kw in route_kws)
         for day in days:
@@ -1073,6 +1106,26 @@ class ModelDecisionService:
             if 1 <= val <= 31:
                 out.append(val - 1)
         return sorted(set(out))
+
+    @staticmethod
+    def _parse_any_days(text: str) -> list[int]:
+        """Parse dates from text with both Arabic and Chinese numerals.
+
+        More flexible than _parse_month_days: handles bare '12号', '十二号',
+        '二十号', '三十一日' without requiring a '三月' prefix.
+        """
+        results: set[int] = set()
+        # Arabic numerals: "12号", "3日"
+        for m in re.finditer(r"(\d{1,2})[号日]", text):
+            d = int(m.group(1))
+            if 1 <= d <= 31:
+                results.add(d - 1)
+        # Chinese numerals: "十二号", "二十号", "三十一号"
+        for m in re.finditer(r"([零一二两三四五六七八九十百]+)[号日]", text):
+            d = _cn_to_int(m.group(1))
+            if 1 <= d <= 31:
+                results.add(d - 1)
+        return sorted(results)
 
     def _match_coords(self, text: str, coords: dict[str, tuple[float, float]]):
         for name, loc in coords.items():
