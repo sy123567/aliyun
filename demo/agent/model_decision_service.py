@@ -515,7 +515,7 @@ class ModelDecisionService:
 
         before = self._rules_fingerprint(rules)
         coord_map = self._collect_coords(prefs)
-        parsed_by_llm = self._llm_parse_preferences(driver_id, texts, rules)
+        parsed_by_llm = self._llm_parse_preferences(driver_id, texts, rules, coord_map)
         if not parsed_by_llm:
             # offline / model unavailable: fall back to the deterministic regex parser.
             for text in texts:
@@ -527,6 +527,32 @@ class ModelDecisionService:
             # forbidden categories/regions with very specific trigger patterns).
             for text in texts:
                 self._supplement_basic_rules(text, rules)
+            # Supplement dated events: detect date+coordinate patterns the LLM may
+            # have missed (e.g. wrong coords, missed events entirely).
+            for text in texts:
+                self._supplement_dated_events(text, rules, coord_map)
+            # Cross-check LLM dated event coords against text-extracted coords.
+            # If an LLM coord doesn't match any known coord, snap it to the
+            # nearest known one (LLM often inverts or rounds coordinates).
+            if coord_map:
+                known = list(coord_map.values())
+                for ev in rules.dated_single:
+                    if not any(_haversine_km(ev["lat"], ev["lng"], k[0], k[1]) < 20 for k in known):
+                        best = min(known, key=lambda k: _haversine_km(ev["lat"], ev["lng"], k[0], k[1]))
+                        self._logger.info(
+                            "coord fix: dated_single day=%d (%.2f,%.2f)→(%.2f,%.2f)",
+                            ev["day"], ev["lat"], ev["lng"], best[0], best[1],
+                        )
+                        ev["lat"], ev["lng"] = best[0], best[1]
+                for ev in rules.dated_route:
+                    for stop in ev.get("stops", []):
+                        if not any(_haversine_km(stop["lat"], stop["lng"], k[0], k[1]) < 20 for k in known):
+                            best = min(known, key=lambda k: _haversine_km(stop["lat"], stop["lng"], k[0], k[1]))
+                            self._logger.info(
+                                "coord fix: dated_route day=%d stop (%.2f,%.2f)→(%.2f,%.2f)",
+                                ev["day"], stop["lat"], stop["lng"], best[0], best[1],
+                            )
+                            stop["lat"], stop["lng"] = best[0], best[1]
         # Build blackout_coords: map blackout region names to nearby coordinates
         # extracted from preference text. This lets the scheduler idle the driver
         # on blackout days if they happen to be sitting inside the forbidden region.
@@ -577,17 +603,21 @@ class ModelDecisionService:
         "某天按顺序经过多个地点的赴约/办事路线（如先取物再赴宴、先到A再到B），stops 按先后顺序排列。\n"
         "通用规则：\n"
         "1) 日期一律用该月的日数（1-31）。\n"
-        "2) 坐标直接取经纬度数字；若某条偏好只说了地点名（如某档口/某仓库/某地区）却没给经纬度，"
-        "而另一条偏好给出了同一地点的经纬度，则跨偏好引用那个经纬度填进来。\n"
+        "2) 坐标提取：偏好文本中会出现'地名（纬度, 经度）'格式，如'增城区有家老档口（23.15，113.67）'→lat=23.15, lng=113.67。"
+        "输入中可能附带 known_coordinates 字段——那是从偏好文本预提取的地名→坐标映射，务必优先使用。"
+        "若某条偏好只说了地点名而 known_coordinates 或另一条偏好给出了同一地点的经纬度，则引用过来。\n"
         "3) 停留时长：‘停一趟，花两小时’→wait_minutes=120；"
         "‘赴宴到下午两点’且需中午前赶到→在该点停留到结束，wait_minutes 约等于(结束-到达)，按 120 估；"
         "凡是‘到点办事/赴宴/盘点’类事件，wait_minutes 必须为正（>0），不能填 0。\n"
         "4) 时刻换算：‘中午十二点前’→before_hour=12；‘下午两点’→14；‘早上六点’→6。\n"
-        "5) 重要：禁行区域(forbidden_regions)和禁接品类(forbidden_categories)要分清——带有'货源/这类活/类货'的是品类禁令；带有'装货地/卸货地在X'的是区域禁令。\n只抽取明确写出的约束，不要臆造未提及的规则。"
+        "5) 重要：禁行区域(forbidden_regions)和禁接品类(forbidden_categories)要分清——带有'货源/这类活/类货'的是品类禁令；带有'装货地/卸货地在X'的是区域禁令。\n"
+        "6) dated_single 和 dated_route 是最重要的约束（错过惩罚极高）。只要偏好中提到特定日期要去某地办事/赴宴/取货/盘库等，必须抽取，坐标必须正确。\n"
+        "只抽取明确写出的约束，不要臆造未提及的规则。"
     )
 
     def _llm_parse_preferences(
-        self, driver_id: str, texts: list[str], rules: DriverRules
+        self, driver_id: str, texts: list[str], rules: DriverRules,
+        coord_map: dict[str, tuple[float, float]] | None = None,
     ) -> bool:
         """用大模型把全部可见偏好解析成结构化规则并合并进 rules。
 
@@ -596,7 +626,12 @@ class ModelDecisionService:
         """
         if not texts:
             return False
-        user = json.dumps({"preferences": texts}, ensure_ascii=False)
+        payload: dict[str, Any] = {"preferences": texts}
+        if coord_map:
+            payload["known_coordinates"] = {
+                name: {"lat": loc[0], "lng": loc[1]} for name, loc in coord_map.items()
+            }
+        user = json.dumps(payload, ensure_ascii=False)
         msgs = [
             {"role": "system", "content": self._PARSE_SYSTEM},
             {"role": "user", "content": user},
@@ -713,6 +748,9 @@ class ModelDecisionService:
             return None
         if not (isinstance(lat, (int, float)) and isinstance(lng, (int, float))):
             return None
+        lat, lng = float(lat), float(lng)
+        if lat > 90 and lng < 90:
+            lat, lng = lng, lat
         wait = ev.get("wait_minutes")
         wait = int(wait) if isinstance(wait, (int, float)) and wait > 0 else 120
         return {
@@ -736,12 +774,15 @@ class ModelDecisionService:
             lat, lng = s.get("lat"), s.get("lng")
             if not (isinstance(lat, (int, float)) and isinstance(lng, (int, float))):
                 continue
+            lat, lng = float(lat), float(lng)
+            if lat > 90 and lng < 90:
+                lat, lng = lng, lat
             wait = s.get("wait_minutes")
             wait = int(wait) if isinstance(wait, (int, float)) and wait >= 0 else 0
             stops.append(
                 {
-                    "lat": float(lat),
-                    "lng": float(lng),
+                    "lat": lat,
+                    "lng": lng,
                     "min_wait": wait,
                     "before": self._coerce_before(s.get("before_hour")),
                 }
@@ -834,6 +875,64 @@ class ModelDecisionService:
                     region = m2.group(1)
                     if not any(r == region for r, _ in rules.blackout):
                         rules.blackout.append((region, days))
+
+    def _supplement_dated_events(
+        self, text: str, rules: DriverRules, coord_map: dict[str, tuple[float, float]]
+    ) -> None:
+        """After LLM, detect date+coordinate+action patterns for dated events.
+
+        Catches dated_single/dated_route the LLM may have missed. Requires ALL
+        three signals (date, coordinate, action keyword) to avoid false positives.
+        """
+        # Skip blackout-style texts (those are about NOT going somewhere)
+        if any(kw in text for kw in ("不往", "不去", "不进", "别给我派")):
+            return
+        # Extract dates from text
+        days = self._parse_month_days(text)
+        if not days:
+            plain = re.findall(r"(\d{1,2})[号日]", text)
+            days = sorted({int(d) - 1 for d in plain if 1 <= int(d) <= 31})
+        if not days:
+            return
+        # Find coordinates: inline in this text + from coord_map if name appears
+        coord_pat = re.compile(
+            r"([\u4e00-\u9fa5]{2,6}?)[（(]\s*([0-9]+\.?[0-9]*)\s*[，,]\s*([0-9]+\.?[0-9]*)\s*[)）]"
+        )
+        found: list[tuple[str, float, float]] = []
+        for m in coord_pat.finditer(text):
+            lat, lng = float(m.group(2)), float(m.group(3))
+            if lat > 90 and lng < 90:
+                lat, lng = lng, lat
+            found.append((m.group(1), lat, lng))
+        for name, loc in coord_map.items():
+            if name in text and not any(_haversine_km(loc[0], loc[1], f[1], f[2]) < 5 for f in found):
+                found.append((name, loc[0], loc[1]))
+        if not found:
+            return
+        # Determine event type by action keywords
+        single_kws = ("停一趟", "盘库", "清库存", "对清", "对账", "验收", "盘点", "提货", "签收", "检查", "保养", "检修")
+        route_kws = ("赴宴", "寿", "赶到", "先到", "先去", "先过", "再到", "再去")
+        is_single = any(kw in text for kw in single_kws)
+        is_route = len(found) >= 2 and any(kw in text for kw in route_kws)
+        for day in days:
+            if is_route and not any(e["day"] == day for e in rules.dated_route):
+                before = DAY_MINUTES
+                mb = re.search(r"([零一二两三四五六七八九十\d]+)\s*点前", text)
+                if mb:
+                    before = _cn_to_int(mb.group(1)) * 60
+                stops = []
+                for i, (_, lat, lng) in enumerate(found):
+                    wait = 0
+                    if i == len(found) - 1:
+                        wait = self._parse_hours_minutes(text) or 120
+                    stops.append({"lat": lat, "lng": lng, "min_wait": wait, "before": before})
+                rules.dated_route.append({"day": day, "stops": stops})
+                self._logger.info("supplement: added dated_route day=%d stops=%d", day, len(stops))
+            elif is_single and not any(e["day"] == day for e in rules.dated_single):
+                _, lat, lng = found[0]
+                wait = self._parse_hours_minutes(text) or 120
+                rules.dated_single.append({"day": day, "lat": lat, "lng": lng, "min_wait": wait, "before": DAY_MINUTES})
+                self._logger.info("supplement: added dated_single day=%d lat=%s lng=%s", day, lat, lng)
 
     def _parse_one(self, text: str, rules: DriverRules, coords: dict[str, tuple[float, float]]) -> None:
         # daily continuous rest: "每天至少连续...休息满8小时"
