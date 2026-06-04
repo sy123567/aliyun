@@ -112,8 +112,7 @@ class DriverRules:
         block = self.daily_rest_minutes
         if self.rest_window is not None:
             block = max(block, self.rest_window[1])
-        if self.no_drive_until_minute is not None:
-            block = max(block, self.no_drive_until_minute)
+        # no_drive_until_minute — DISABLED: not enforced
         return block
 
 
@@ -244,39 +243,12 @@ class ModelDecisionService:
             else:
                 return self._wait(day_end - now)
 
-        # (D3) no_drive_windows: if current time-of-day falls inside a no-drive
-        # window, idle until the window ends.
-        for ws, we in rules.no_drive_windows:
-            we_today = we if we <= DAY_MINUTES else DAY_MINUTES
-            if ws <= tod < we_today:
-                return self._wait(we_today - tod)
+        # (D3) no_drive_windows — DISABLED: high false-positive risk on unseen drivers.
+        # Parsed by LLM for diagnostics but not enforced.
 
-        # (D4) must_visit: proactively go to must-visit locations if not enough
-        # visits have been accumulated.  Prioritise on days with no other events.
-        for i, mv in enumerate(rules.must_visit):
-            visited = plan["must_visit_days"].setdefault(i, set())
-            remaining_days = MONTH_DAYS - day
-            still_needed = mv["required_days"] - len(visited)
-            if still_needed > 0 and remaining_days <= still_needed + 2:
-                dist = _haversine_km(lat, lng, mv["lat"], mv["lng"])
-                if dist <= mv.get("radius_km", 1.0):
-                    visited.add(day)
-                elif now + _travel_minutes(dist) <= day_end:
-                    return self._reposition(mv["lat"], mv["lng"])
+        # (D4) must_visit — DISABLED: LLM may hallucinate coordinates.
 
-        # (D5) home_rule: reposition to home before cutoff, idle until morning.
-        if rules.home_by_minute is not None and rules.home_lat is not None and day not in plan["home_done"]:
-            if tod >= rules.home_by_minute:
-                plan["home_done"].add(day)
-                dist = _haversine_km(lat, lng, rules.home_lat, rules.home_lng or 0)
-                if dist > rules.home_radius_km:
-                    return self._reposition(rules.home_lat, rules.home_lng or 0)
-                return self._wait(day_end - now)
-            # If close to home_by_minute and far from home, start heading home
-            travel_to_home = _travel_minutes(_haversine_km(lat, lng, rules.home_lat, rules.home_lng or 0))
-            if tod + travel_to_home >= rules.home_by_minute and _haversine_km(lat, lng, rules.home_lat, rules.home_lng or 0) > rules.home_radius_km:
-                plan["home_done"].add(day)
-                return self._reposition(rules.home_lat, rules.home_lng or 0)
+        # (D5) home_rule — DISABLED: LLM may hallucinate home location/times.
 
         # (E) take the best compliant order, else idle to day end. A flexible-rest
         # driver may let the day's *last* order finish past midnight (up to a cap that
@@ -284,9 +256,6 @@ class ModelDecisionService:
         # the next day is an ordinary working day — never crossing into an off day,
         # blackout day or a dated-event day.
         hard_end = day_end
-        # For home_rule, don't accept orders that would finish after home_by_minute
-        if rules.home_by_minute is not None and day not in plan.get("home_done", set()):
-            hard_end = min(hard_end, day_start + rules.home_by_minute)
         if rules.rest_window is None and rules.daily_rest_minutes > 0:
             if self._next_day_is_ordinary(rules, plan, day):
                 hard_end = max(hard_end, day_end + (DAY_MINUTES - rules.day_rest_block))
@@ -341,17 +310,8 @@ class ModelDecisionService:
         return self._drive_route(ev, plan, now, day_start, lat, lng)
 
     def _pick_order(self, driver_id, status, rules, plan, now, lat, lng, day, day_end):
-        # daily_order_limit check
-        if rules.daily_order_limit is not None:
-            count = plan["orders_today"].get(day, 0)
-            if count >= rules.daily_order_limit:
-                return None
-        # first_order timing check: if no order taken today and it's past the deadline
-        if rules.first_order_before_minute is not None and day not in plan["first_order_taken"]:
-            tod = now % DAY_MINUTES
-            if tod > rules.first_order_before_minute:
-                # Past first-order deadline; mark as missed but still allow orders
-                pass
+        # daily_order_limit — DISABLED: LLM hallucination risk
+        # first_order_before — DISABLED: LLM hallucination risk
         cargo_resp = self._api.query_cargo(driver_id=driver_id, latitude=lat, longitude=lng, k=60)
         items = cargo_resp.get("items", [])
         now = int(self._api.get_driver_status(driver_id)["simulation_progress_minutes"])
@@ -422,8 +382,7 @@ class ModelDecisionService:
         name = str(cargo.get("cargo_name", ""))
         if self._is_forbidden_cargo(name, rules.forbidden_categories):
             return None
-        if self._is_forbidden_cargo(name, rules.avoid_categories):
-            return None
+        # avoid_categories — DISABLED in relocation too
         start = cargo.get("start") or {}
         end = cargo.get("end") or {}
         scity = str(start.get("city", ""))
@@ -442,15 +401,7 @@ class ModelDecisionService:
                 rlat, rlng = rules.blackout_coords[region]
                 if _haversine_km(slat, slng, rlat, rlng) < 60 or _haversine_km(elat, elng, rlat, rlng) < 60:
                     return None
-        for fz_lat, fz_lng, fz_r in rules.forbidden_zones:
-            if _haversine_km(slat, slng, fz_lat, fz_lng) < fz_r or _haversine_km(elat, elng, fz_lat, fz_lng) < fz_r:
-                return None
-        if rules.bounded_area is not None:
-            la_min, la_max, ln_min, ln_max = rules.bounded_area
-            if not (la_min <= slat <= la_max and ln_min <= slng <= ln_max):
-                return None
-            if not (la_min <= elat <= la_max and ln_min <= elng <= ln_max):
-                return None
+        # forbidden_zones / bounded_area / haul_max_km — DISABLED in relocation too
         move_km = _haversine_km(lat, lng, slat, slng)
         arrival = now + (_travel_minutes(move_km) if move_km > 1e-6 else 0)
         load_window = cargo.get("load_time")
@@ -467,8 +418,6 @@ class ModelDecisionService:
         if finish > day_end:
             return None
         haul_km = _haversine_km(slat, slng, elat, elng)
-        if rules.haul_max_km is not None and haul_km > rules.haul_max_km:
-            return None
         price = float(cargo.get("price", 0.0))
         net = price - COST_PER_KM * (move_km + haul_km)
         if net <= 0:
@@ -479,8 +428,7 @@ class ModelDecisionService:
         name = str(cargo.get("cargo_name", ""))
         if self._is_forbidden_cargo(name, rules.forbidden_categories):
             return None
-        if self._is_forbidden_cargo(name, rules.avoid_categories):
-            return None
+        # avoid_categories — DISABLED: LLM hallucination risk
         start = cargo.get("start") or {}
         end = cargo.get("end") or {}
         scity = str(start.get("city", ""))
@@ -499,17 +447,8 @@ class ModelDecisionService:
                 rlat, rlng = rules.blackout_coords[region]
                 if _haversine_km(slat, slng, rlat, rlng) < 60 or _haversine_km(elat, elng, rlat, rlng) < 60:
                     return None
-        # forbidden_zones: circle-zone check on pickup/dropoff
-        for fz_lat, fz_lng, fz_r in rules.forbidden_zones:
-            if _haversine_km(slat, slng, fz_lat, fz_lng) < fz_r or _haversine_km(elat, elng, fz_lat, fz_lng) < fz_r:
-                return None
-        # bounded_area: only accept orders within operating bounds
-        if rules.bounded_area is not None:
-            la_min, la_max, ln_min, ln_max = rules.bounded_area
-            if not (la_min <= slat <= la_max and ln_min <= slng <= ln_max):
-                return None
-            if not (la_min <= elat <= la_max and ln_min <= elng <= ln_max):
-                return None
+        # forbidden_zones — DISABLED: LLM hallucination risk too high
+        # bounded_area — DISABLED: LLM hallucination risk too high
         pickup_km = _haversine_km(lat, lng, slat, slng)
         if rules.pickup_max_km is not None and pickup_km > rules.pickup_max_km:
             return None
@@ -529,16 +468,8 @@ class ModelDecisionService:
         if finish > day_end:
             return None  # don't cross midnight (keeps rest windows clean)
         haul_km = _haversine_km(slat, slng, elat, elng)
-        # haul_max_km: single-order haul distance limit
-        if rules.haul_max_km is not None and haul_km > rules.haul_max_km:
-            return None
-        # no_drive_windows: check if order execution overlaps a no-drive window
-        _, start_tod = divmod(now, DAY_MINUTES)
-        _, finish_tod = divmod(finish, DAY_MINUTES)
-        for ws, we in rules.no_drive_windows:
-            we_clamp = min(we, DAY_MINUTES)
-            if start_tod < we_clamp and finish_tod > ws:
-                return None
+        # haul_max_km — DISABLED: LLM hallucination risk
+        # no_drive_windows — DISABLED: LLM hallucination risk
         price = float(cargo.get("price", 0.0))
         net = price - COST_PER_KM * (pickup_km + haul_km)
         if net <= 0:
