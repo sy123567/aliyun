@@ -83,6 +83,7 @@ class DriverRules:
         self.rest_window: tuple[int, int] | None = None  # (start_min, end_min) within day, from 0
         self.off_days_min: int = 0
         self.forbidden_categories: set[str] = set()
+        self.avoid_categories: set[str] = set()  # soft avoid (still filter)
         self.forbidden_regions: set[str] = set()
         self.required_region: tuple[str, int] | None = None  # (region, min_days)
         self.pickup_max_km: float | None = None
@@ -90,6 +91,20 @@ class DriverRules:
         self.blackout_coords: dict[str, tuple[float, float]] = {}  # region→(lat,lng)
         self.dated_single: list[dict[str, Any]] = []  # {day,lat,lng,min_wait,before}
         self.dated_route: list[dict[str, Any]] = []  # {day, stops:[{lat,lng,min_wait,before}]}
+        # --- new rule types from 10-driver trained version ---
+        self.no_drive_windows: list[tuple[int, int]] = []  # (start_min, end_min) 0..2880
+        self.home_lat: float | None = None
+        self.home_lng: float | None = None
+        self.home_radius_km: float = 1.0
+        self.home_by_minute: int | None = None  # must be near home by this minute of day
+        self.no_drive_until_minute: int | None = None  # don't accept orders until this minute
+        self.daily_order_limit: int | None = None
+        self.haul_max_km: float | None = None  # max distance from pickup to dropoff
+        self.monthly_deadhead_max_km: float | None = None
+        self.forbidden_zones: list[tuple[float, float, float]] = []  # (lat, lng, radius_km)
+        self.bounded_area: tuple[float, float, float, float] | None = None  # (lat_min, lat_max, lng_min, lng_max)
+        self.must_visit: list[dict[str, Any]] = []  # {lat, lng, radius_km, required_days}
+        self.first_order_before_minute: int | None = None
 
     @property
     def day_rest_block(self) -> int:
@@ -97,6 +112,8 @@ class DriverRules:
         block = self.daily_rest_minutes
         if self.rest_window is not None:
             block = max(block, self.rest_window[1])
+        if self.no_drive_until_minute is not None:
+            block = max(block, self.no_drive_until_minute)
         return block
 
 
@@ -124,6 +141,11 @@ class ModelDecisionService:
                 "dated_single_done": set(),
                 "dated_route_done": set(),
                 "strand_repo": set(),
+                "orders_today": {},  # day → count
+                "total_deadhead_km": 0.0,
+                "must_visit_days": {},  # idx → set of days visited
+                "first_order_taken": set(),  # days where first order was already taken
+                "home_done": set(),  # days where home repositioning is done
             },
         )
         # Preferences may only become visible inside their date window, so the off-day
@@ -222,15 +244,52 @@ class ModelDecisionService:
             else:
                 return self._wait(day_end - now)
 
+        # (D3) no_drive_windows: if current time-of-day falls inside a no-drive
+        # window, idle until the window ends.
+        for ws, we in rules.no_drive_windows:
+            we_today = we if we <= DAY_MINUTES else DAY_MINUTES
+            if ws <= tod < we_today:
+                return self._wait(we_today - tod)
+
+        # (D4) must_visit: proactively go to must-visit locations if not enough
+        # visits have been accumulated.  Prioritise on days with no other events.
+        for i, mv in enumerate(rules.must_visit):
+            visited = plan["must_visit_days"].setdefault(i, set())
+            remaining_days = MONTH_DAYS - day
+            still_needed = mv["required_days"] - len(visited)
+            if still_needed > 0 and remaining_days <= still_needed + 2:
+                dist = _haversine_km(lat, lng, mv["lat"], mv["lng"])
+                if dist <= mv.get("radius_km", 1.0):
+                    visited.add(day)
+                elif now + _travel_minutes(dist) <= day_end:
+                    return self._reposition(mv["lat"], mv["lng"])
+
+        # (D5) home_rule: reposition to home before cutoff, idle until morning.
+        if rules.home_by_minute is not None and rules.home_lat is not None and day not in plan["home_done"]:
+            if tod >= rules.home_by_minute:
+                plan["home_done"].add(day)
+                dist = _haversine_km(lat, lng, rules.home_lat, rules.home_lng or 0)
+                if dist > rules.home_radius_km:
+                    return self._reposition(rules.home_lat, rules.home_lng or 0)
+                return self._wait(day_end - now)
+            # If close to home_by_minute and far from home, start heading home
+            travel_to_home = _travel_minutes(_haversine_km(lat, lng, rules.home_lat, rules.home_lng or 0))
+            if tod + travel_to_home >= rules.home_by_minute and _haversine_km(lat, lng, rules.home_lat, rules.home_lng or 0) > rules.home_radius_km:
+                plan["home_done"].add(day)
+                return self._reposition(rules.home_lat, rules.home_lng or 0)
+
         # (E) take the best compliant order, else idle to day end. A flexible-rest
         # driver may let the day's *last* order finish past midnight (up to a cap that
         # still leaves room for a full rest block inside the next day), but only when
         # the next day is an ordinary working day — never crossing into an off day,
         # blackout day or a dated-event day.
         hard_end = day_end
+        # For home_rule, don't accept orders that would finish after home_by_minute
+        if rules.home_by_minute is not None and day not in plan.get("home_done", set()):
+            hard_end = min(hard_end, day_start + rules.home_by_minute)
         if rules.rest_window is None and rules.daily_rest_minutes > 0:
             if self._next_day_is_ordinary(rules, plan, day):
-                hard_end = day_end + (DAY_MINUTES - rules.day_rest_block)
+                hard_end = max(hard_end, day_end + (DAY_MINUTES - rules.day_rest_block))
         order = self._pick_order(driver_id, status, rules, plan, now, lat, lng, day, hard_end)
         if order is not None:
             return order
@@ -282,6 +341,17 @@ class ModelDecisionService:
         return self._drive_route(ev, plan, now, day_start, lat, lng)
 
     def _pick_order(self, driver_id, status, rules, plan, now, lat, lng, day, day_end):
+        # daily_order_limit check
+        if rules.daily_order_limit is not None:
+            count = plan["orders_today"].get(day, 0)
+            if count >= rules.daily_order_limit:
+                return None
+        # first_order timing check: if no order taken today and it's past the deadline
+        if rules.first_order_before_minute is not None and day not in plan["first_order_taken"]:
+            tod = now % DAY_MINUTES
+            if tod > rules.first_order_before_minute:
+                # Past first-order deadline; mark as missed but still allow orders
+                pass
         cargo_resp = self._api.query_cargo(driver_id=driver_id, latitude=lat, longitude=lng, k=60)
         items = cargo_resp.get("items", [])
         now = int(self._api.get_driver_status(driver_id)["simulation_progress_minutes"])
@@ -299,14 +369,8 @@ class ModelDecisionService:
             if ev is None:
                 continue
             net, touches_required, occupied = ev
-            # Value-density selection: net income per occupied minute. Picking the
-            # single highest-net order is myopic — one long haul eats the whole day and
-            # blocks a second order. Maximising net/minute packs more profitable work
-            # into the fixed daily working window (rest windows stay clean), which both
-            # lifts gross and trims deadhead cost vs. plain max-net.
             score = net / occupied
             is_req = bool(need_zeng and touches_required)
-            # Prefer a required-region order (worth the monthly penalty) over plain net.
             if is_req and not best_is_required:
                 best, best_score, best_is_required = (cargo, score, True)
             elif is_req == best_is_required and score > best_score:
@@ -315,6 +379,9 @@ class ModelDecisionService:
             return None
         if best_is_required:
             plan["zeng_order_days"].add(day)
+        # Track order count and first-order flag
+        plan["orders_today"][day] = plan["orders_today"].get(day, 0) + 1
+        plan["first_order_taken"].add(day)
         return self._take_order(str(best.get("cargo_id")))
 
     def _anti_strand(self, driver_id, rules, plan, now, lat, lng, day, day_end):
@@ -355,6 +422,8 @@ class ModelDecisionService:
         name = str(cargo.get("cargo_name", ""))
         if self._is_forbidden_cargo(name, rules.forbidden_categories):
             return None
+        if self._is_forbidden_cargo(name, rules.avoid_categories):
+            return None
         start = cargo.get("start") or {}
         end = cargo.get("end") or {}
         scity = str(start.get("city", ""))
@@ -373,6 +442,15 @@ class ModelDecisionService:
                 rlat, rlng = rules.blackout_coords[region]
                 if _haversine_km(slat, slng, rlat, rlng) < 60 or _haversine_km(elat, elng, rlat, rlng) < 60:
                     return None
+        for fz_lat, fz_lng, fz_r in rules.forbidden_zones:
+            if _haversine_km(slat, slng, fz_lat, fz_lng) < fz_r or _haversine_km(elat, elng, fz_lat, fz_lng) < fz_r:
+                return None
+        if rules.bounded_area is not None:
+            la_min, la_max, ln_min, ln_max = rules.bounded_area
+            if not (la_min <= slat <= la_max and ln_min <= slng <= ln_max):
+                return None
+            if not (la_min <= elat <= la_max and ln_min <= elng <= ln_max):
+                return None
         move_km = _haversine_km(lat, lng, slat, slng)
         arrival = now + (_travel_minutes(move_km) if move_km > 1e-6 else 0)
         load_window = cargo.get("load_time")
@@ -389,6 +467,8 @@ class ModelDecisionService:
         if finish > day_end:
             return None
         haul_km = _haversine_km(slat, slng, elat, elng)
+        if rules.haul_max_km is not None and haul_km > rules.haul_max_km:
+            return None
         price = float(cargo.get("price", 0.0))
         net = price - COST_PER_KM * (move_km + haul_km)
         if net <= 0:
@@ -398,6 +478,8 @@ class ModelDecisionService:
     def _evaluate_cargo(self, cargo, item, rules, blackout_regions, now, day_end, lat, lng):
         name = str(cargo.get("cargo_name", ""))
         if self._is_forbidden_cargo(name, rules.forbidden_categories):
+            return None
+        if self._is_forbidden_cargo(name, rules.avoid_categories):
             return None
         start = cargo.get("start") or {}
         end = cargo.get("end") or {}
@@ -417,6 +499,17 @@ class ModelDecisionService:
                 rlat, rlng = rules.blackout_coords[region]
                 if _haversine_km(slat, slng, rlat, rlng) < 60 or _haversine_km(elat, elng, rlat, rlng) < 60:
                     return None
+        # forbidden_zones: circle-zone check on pickup/dropoff
+        for fz_lat, fz_lng, fz_r in rules.forbidden_zones:
+            if _haversine_km(slat, slng, fz_lat, fz_lng) < fz_r or _haversine_km(elat, elng, fz_lat, fz_lng) < fz_r:
+                return None
+        # bounded_area: only accept orders within operating bounds
+        if rules.bounded_area is not None:
+            la_min, la_max, ln_min, ln_max = rules.bounded_area
+            if not (la_min <= slat <= la_max and ln_min <= slng <= ln_max):
+                return None
+            if not (la_min <= elat <= la_max and ln_min <= elng <= ln_max):
+                return None
         pickup_km = _haversine_km(lat, lng, slat, slng)
         if rules.pickup_max_km is not None and pickup_km > rules.pickup_max_km:
             return None
@@ -436,6 +529,16 @@ class ModelDecisionService:
         if finish > day_end:
             return None  # don't cross midnight (keeps rest windows clean)
         haul_km = _haversine_km(slat, slng, elat, elng)
+        # haul_max_km: single-order haul distance limit
+        if rules.haul_max_km is not None and haul_km > rules.haul_max_km:
+            return None
+        # no_drive_windows: check if order execution overlaps a no-drive window
+        _, start_tod = divmod(now, DAY_MINUTES)
+        _, finish_tod = divmod(finish, DAY_MINUTES)
+        for ws, we in rules.no_drive_windows:
+            we_clamp = min(we, DAY_MINUTES)
+            if start_tod < we_clamp and finish_tod > ws:
+                return None
         price = float(cargo.get("price", 0.0))
         net = price - COST_PER_KM * (pickup_km + haul_km)
         if net <= 0:
@@ -579,19 +682,30 @@ class ModelDecisionService:
         seen.update(texts)
         if self._rules_fingerprint(rules) != before:
             self._logger.info(
-                "parsed rules driver_id=%s rest=%s window=%s off=%s forbid_cat=%s forbid_reg=%s "
-                "required=%s pickup_max=%s blackout=%s dated_single=%s dated_route=%s",
+                "parsed rules driver_id=%s rest=%s window=%s off=%s forbid_cat=%s avoid_cat=%s "
+                "forbid_reg=%s required=%s pickup_max=%s haul_max=%s blackout=%s "
+                "dated_single=%s dated_route=%s no_drive=%s order_limit=%s home=%s "
+                "forbidden_zones=%d bounded=%s must_visit=%d first_order=%s",
                 driver_id,
                 rules.daily_rest_minutes,
                 rules.rest_window,
                 rules.off_days_min,
                 rules.forbidden_categories,
+                rules.avoid_categories,
                 rules.forbidden_regions,
                 rules.required_region,
                 rules.pickup_max_km,
+                rules.haul_max_km,
                 rules.blackout,
                 rules.dated_single,
                 rules.dated_route,
+                rules.no_drive_windows,
+                rules.daily_order_limit,
+                (rules.home_lat, rules.home_lng, rules.home_by_minute),
+                len(rules.forbidden_zones),
+                rules.bounded_area,
+                len(rules.must_visit),
+                rules.first_order_before_minute,
             )
         return rules
 
@@ -602,18 +716,34 @@ class ModelDecisionService:
         "字段定义（宁缺毋错）：\n"
         '- daily_rest_hours: 每天连续休息最少小时数（数字或 null）\n'
         '- rest_window: 每天固定停车时段 {"start_hour":整数,"end_hour":整数}（或 null）\n'
+        '- no_drive_windows: 每天禁止接单/空驶的时段数组 [{"start_hour":整数,"end_hour":整数}]。\n'
+        '  适用于非休息类禁行（如"中午12点到1点不接单"）。跨午夜时 end_hour<start_hour，如23→5。\n'
+        '  注意：如果同一条偏好既有"休息"又有"不接单不空跑"，rest_window和no_drive_windows都填。\n'
         '- off_days_min: 整月完全不出车天数（整数，默认 0）\n'
         '- forbidden_categories: 禁运货物**品类名**数组（仅货物名称如"蔬菜""机械设备""生鲜"，'
         '绝不放城市/区域名！"在惠州的货"是区域禁令不是品类禁令）\n'
+        '- avoid_categories: 尽量避免的货物品类名数组（"尽量不拉""尽量不接"→放这里）\n'
         '- forbidden_regions: 禁接的装/卸货**城市/区域名**数组（仅地名如"惠州""深圳"，'
         '不带"的货""那一路"等后缀）\n'
+        '- forbidden_zones: 禁入圆形区域 [{"lat":纬度,"lng":经度,"radius_km":半径}]。\n'
+        '  适用于"以(lat,lng)为圆心、半径N公里内禁入"之类约束。\n'
+        '- bounded_area: 仅允许运营的经纬度矩形范围 {"lat_min":浮点,"lat_max":浮点,"lng_min":浮点,"lng_max":浮点}（或 null）。\n'
+        '  适用于"北纬X至Y、东经X至Y"之类限制。\n'
         '- required_region: 每月需在该区域接货天数 {"region":"纯地名","min_days":整数}（或 null）\n'
+        '- must_visit: 每月必须到达的地点 [{"lat":纬度,"lng":经度,"radius_km":半径,"required_days":整数}]。\n'
+        '  适用于"每月至少N天到过某地"之类约束。\n'
         '- pickup_max_km: 赴装空驶上限公里数（数字或 null）。中文数字要转换。\n'
+        '- haul_max_km: 单笔干线距离上限公里数（装货点到卸货点，数字或 null）\n'
+        '- monthly_deadhead_max_km: 月累计空驶上限公里数（数字或 null）\n'
+        '- daily_order_limit: 每天最多接几单（整数或 null）\n'
+        '- first_order_before_hour: 每天首单不得晚于几点（整数或 null）\n'
+        '- home_rule: 回家规则 {"lat":纬度,"lng":经度,"radius_km":半径,"home_by_hour":几点前到家,"no_drive_until_hour":次日几点前不接单}（或 null）\n'
+        '  适用于"每天X点前须在自家位置Y公里内，到次日Z点前不接单不空跑"之类约束。\n'
         '- blackout: 指定日期不去某地 [{"region":"纯地名","dates":[日期...]}]\n'
         '- dated_single: 某天必须到某地办事 [{"date":日期,"lat":纬度,"lng":经度,"wait_minutes":停留分钟,"before_hour":最晚到达整点或null}]\n'
         '  触发词：盘库/清库存/对账/验收/盘点/提货/签收/检查/保养/检修/停一趟/办事/开会/取东西/交货/拿货/走一趟/回一趟/去一趟/看看/办手续/送东西/存东西\n'
         '- dated_route: 某天按顺序经过多个地点 [{"date":日期,"stops":[{"lat":纬度,"lng":经度,"wait_minutes":分钟,"before_hour":整点或null}...]}]\n'
-        '  触发词：赴宴/做寿/先到…再到/先去…再去/先过…赶到/接人/送人/喝喜酒/吃饭\n\n'
+        '  触发词：赴宴/做寿/先到…再到/先去…再去/先过…赶到/接人/送人/喝喜酒/吃饭/接上配偶/接家人\n\n'
         "关键规则：\n"
         "1) 日期用该月日数 1-31。中文数字要转换（十二号→12，二十号→20，三十一号→31）。\n"
         "2) 坐标：偏好中'地名（纬度,经度）'→直接取。输入若有 known_coordinates 优先使用。"
@@ -623,28 +753,49 @@ class ModelDecisionService:
         "5) **严格区分品类和区域**：forbidden_categories 只放货物品类名（蔬菜、机械设备、危化品等）；"
         "forbidden_regions 只放纯地名（惠州、深圳等），不加任何修饰词。\n"
         "6) **dated_single 和 dated_route 惩罚最高，必须仔细抽取，坐标必须正确。**\n"
-        "7) 只抽取明确约束，不臆造。\n"
-        "8) 同一偏好可能同时包含多种约束（如禁区域+禁品类+日期事件），全部抽取。\n\n"
+        "7) 只抽取明确约束，不臆造。不确定的宁可不填也不要猜。\n"
+        "8) 同一偏好可能同时包含多种约束（如禁区域+禁品类+日期事件+回家规则），全部抽取。\n"
+        '9) "不接单不空跑/不空驶"类约束，如果含时间段→填no_drive_windows；'
+        '如果同时含"休息/睡觉"→也填rest_window或daily_rest_hours。\n'
+        '10) "接上配偶/家人→返回老家/进家门"是 dated_route 事件（多点路线），不是 home_rule。\n\n'
         "示例1：\n"
         '入: {"preferences":["每天零点到六点停着熄火睡觉","凡是生鲜货源碰不得","三月四号五号不往深圳（22.55，114.05）跑"]}\n'
-        '出: {"daily_rest_hours":null,"rest_window":{"start_hour":0,"end_hour":6},"off_days_min":0,'
-        '"forbidden_categories":["生鲜"],"forbidden_regions":[],"required_region":null,"pickup_max_km":null,'
+        '出: {"daily_rest_hours":null,"rest_window":{"start_hour":0,"end_hour":6},'
+        '"no_drive_windows":[{"start_hour":0,"end_hour":6}],"off_days_min":0,'
+        '"forbidden_categories":["生鲜"],"avoid_categories":[],"forbidden_regions":[],"forbidden_zones":[],"bounded_area":null,'
+        '"required_region":null,"must_visit":[],"pickup_max_km":null,"haul_max_km":null,"monthly_deadhead_max_km":null,'
+        '"daily_order_limit":null,"first_order_before_hour":null,"home_rule":null,'
         '"blackout":[{"region":"深圳","dates":[4,5]}],"dated_single":[],"dated_route":[]}\n\n'
         "示例2：\n"
         '入: {"preferences":["十二号得去仓库（23.15，113.67）盘库，花两小时","连续休息满8小时","空驶超过五十五公里别接"]}\n'
-        '出: {"daily_rest_hours":8,"rest_window":null,"off_days_min":0,'
-        '"forbidden_categories":[],"forbidden_regions":[],"required_region":null,"pickup_max_km":55,'
+        '出: {"daily_rest_hours":8,"rest_window":null,"no_drive_windows":[],"off_days_min":0,'
+        '"forbidden_categories":[],"avoid_categories":[],"forbidden_regions":[],"forbidden_zones":[],"bounded_area":null,'
+        '"required_region":null,"must_visit":[],"pickup_max_km":55,"haul_max_km":null,"monthly_deadhead_max_km":null,'
+        '"daily_order_limit":null,"first_order_before_hour":null,"home_rule":null,'
         '"blackout":[],"dated_single":[{"date":12,"lat":23.15,"lng":113.67,"wait_minutes":120,"before_hour":null}],"dated_route":[]}\n\n'
         "示例3：\n"
         '入: {"preferences":["三十一号先过档口（23.15，113.67）取礼物，中午十二点前赶到县城（23.35，112.47）赴宴到下午两点"]}\n'
-        '出: {"daily_rest_hours":null,"rest_window":null,"off_days_min":0,'
-        '"forbidden_categories":[],"forbidden_regions":[],"required_region":null,"pickup_max_km":null,'
+        '出: {"daily_rest_hours":null,"rest_window":null,"no_drive_windows":[],"off_days_min":0,'
+        '"forbidden_categories":[],"avoid_categories":[],"forbidden_regions":[],"forbidden_zones":[],"bounded_area":null,'
+        '"required_region":null,"must_visit":[],"pickup_max_km":null,"haul_max_km":null,"monthly_deadhead_max_km":null,'
+        '"daily_order_limit":null,"first_order_before_hour":null,"home_rule":null,'
         '"blackout":[],"dated_single":[],"dated_route":[{"date":31,"stops":[{"lat":23.15,"lng":113.67,"wait_minutes":0,"before_hour":12},{"lat":23.35,"lng":112.47,"wait_minutes":120,"before_hour":12}]}]}\n\n'
         "示例4：\n"
         '入: {"preferences":["龙门吊底座、机床铸件这类机械设备活儿干不了","装货地或卸货地在惠州的货一律不接"]}\n'
-        '出: {"daily_rest_hours":null,"rest_window":null,"off_days_min":0,'
-        '"forbidden_categories":["龙门吊底座","机床铸件","机械设备"],"forbidden_regions":["惠州"],'
-        '"required_region":null,"pickup_max_km":null,"blackout":[],"dated_single":[],"dated_route":[]}'
+        '出: {"daily_rest_hours":null,"rest_window":null,"no_drive_windows":[],"off_days_min":0,'
+        '"forbidden_categories":["龙门吊底座","机床铸件","机械设备"],"avoid_categories":[],"forbidden_regions":["惠州"],'
+        '"forbidden_zones":[],"bounded_area":null,"required_region":null,"must_visit":[],'
+        '"pickup_max_km":null,"haul_max_km":null,"monthly_deadhead_max_km":null,'
+        '"daily_order_limit":null,"first_order_before_hour":null,"home_rule":null,'
+        '"blackout":[],"dated_single":[],"dated_route":[]}\n\n'
+        "示例5：\n"
+        '入: {"preferences":["每天23点前车辆须在自家位置（23.10，113.50）1公里内，到次日8点前不接单不空跑","同一天接单不得超过3单"]}\n'
+        '出: {"daily_rest_hours":null,"rest_window":null,"no_drive_windows":[{"start_hour":23,"end_hour":8}],"off_days_min":0,'
+        '"forbidden_categories":[],"avoid_categories":[],"forbidden_regions":[],"forbidden_zones":[],"bounded_area":null,'
+        '"required_region":null,"must_visit":[],"pickup_max_km":null,"haul_max_km":null,"monthly_deadhead_max_km":null,'
+        '"daily_order_limit":3,"first_order_before_hour":null,'
+        '"home_rule":{"lat":23.10,"lng":113.50,"radius_km":1,"home_by_hour":23,"no_drive_until_hour":8},'
+        '"blackout":[],"dated_single":[],"dated_route":[]}'
     )
 
     def _llm_parse_preferences(
@@ -830,6 +981,118 @@ class ModelDecisionService:
             if route is not None and not any(e["day"] == route["day"] for e in rules.dated_route):
                 rules.dated_route.append(route)
 
+        # --- new rule types from old 10-driver version ---
+        # no_drive_windows
+        for ndw in data.get("no_drive_windows") or []:
+            if not isinstance(ndw, dict):
+                continue
+            sh, eh = ndw.get("start_hour"), ndw.get("end_hour")
+            if isinstance(sh, (int, float)) and isinstance(eh, (int, float)):
+                sh, eh = int(sh), int(eh)
+                if eh > sh:
+                    sm, em = sh * 60, eh * 60
+                elif sh > eh:
+                    sm, em = sh * 60, (24 + eh) * 60
+                else:
+                    continue
+                if not any(ws == sm and we == em for ws, we in rules.no_drive_windows):
+                    rules.no_drive_windows.append((sm, em))
+
+        # avoid_categories
+        for ac in data.get("avoid_categories") or []:
+            if isinstance(ac, str) and ac.strip():
+                s = re.sub(r"^(?:凡是|所有|一切|任何)", "", ac.strip()).strip()
+                if s:
+                    rules.avoid_categories.add(s)
+
+        # forbidden_zones
+        for fz in data.get("forbidden_zones") or []:
+            if not isinstance(fz, dict):
+                continue
+            try:
+                flat, flng, fr = float(fz["lat"]), float(fz["lng"]), float(fz.get("radius_km", 10))
+            except (TypeError, ValueError, KeyError):
+                continue
+            if flat > 90 and flng < 90:
+                flat, flng = flng, flat
+            rules.forbidden_zones.append((flat, flng, fr))
+
+        # bounded_area
+        ba = data.get("bounded_area")
+        if isinstance(ba, dict) and rules.bounded_area is None:
+            try:
+                la_min = float(ba["lat_min"])
+                la_max = float(ba["lat_max"])
+                ln_min = float(ba["lng_min"])
+                ln_max = float(ba["lng_max"])
+                rules.bounded_area = (la_min, la_max, ln_min, ln_max)
+            except (TypeError, ValueError, KeyError):
+                pass
+
+        # must_visit
+        for mv in data.get("must_visit") or []:
+            if not isinstance(mv, dict):
+                continue
+            try:
+                mlat, mlng = float(mv["lat"]), float(mv["lng"])
+                mrd = int(mv.get("required_days", 1))
+                mr = float(mv.get("radius_km", 1.0))
+            except (TypeError, ValueError, KeyError):
+                continue
+            if mlat > 90 and mlng < 90:
+                mlat, mlng = mlng, mlat
+            rules.must_visit.append({"lat": mlat, "lng": mlng, "radius_km": mr, "required_days": mrd})
+
+        # haul_max_km
+        hm = data.get("haul_max_km")
+        if isinstance(hm, (int, float)) and hm > 0:
+            rules.haul_max_km = float(hm)
+
+        # monthly_deadhead_max_km
+        mdh = data.get("monthly_deadhead_max_km")
+        if isinstance(mdh, (int, float)) and mdh > 0:
+            rules.monthly_deadhead_max_km = float(mdh)
+
+        # daily_order_limit
+        dol = data.get("daily_order_limit")
+        if isinstance(dol, (int, float)) and dol > 0:
+            rules.daily_order_limit = int(dol)
+        elif isinstance(dol, str):
+            dm = re.search(r'(\d+)', dol)
+            if dm:
+                rules.daily_order_limit = int(dm.group(1))
+
+        # first_order_before_hour
+        fob = data.get("first_order_before_hour")
+        if isinstance(fob, (int, float)) and 0 < fob <= 24:
+            rules.first_order_before_minute = int(fob) * 60
+        elif isinstance(fob, str):
+            fm = re.search(r'(\d+)', fob)
+            if fm:
+                h = int(fm.group(1))
+                if 0 < h <= 24:
+                    rules.first_order_before_minute = h * 60
+
+        # home_rule
+        hr = data.get("home_rule")
+        if isinstance(hr, dict) and rules.home_lat is None:
+            try:
+                hlat, hlng = float(hr["lat"]), float(hr["lng"])
+            except (TypeError, ValueError, KeyError):
+                hlat, hlng = None, None
+            if hlat is not None and hlng is not None:
+                if hlat > 90 and hlng < 90:
+                    hlat, hlng = hlng, hlat
+                rules.home_lat = hlat
+                rules.home_lng = hlng
+                rules.home_radius_km = float(hr.get("radius_km", 1.0))
+                hby = hr.get("home_by_hour")
+                if isinstance(hby, (int, float)) and 0 < hby <= 24:
+                    rules.home_by_minute = int(hby) * 60
+                nduh = hr.get("no_drive_until_hour")
+                if isinstance(nduh, (int, float)) and 0 < nduh <= 24:
+                    rules.no_drive_until_minute = int(nduh) * 60
+
     @staticmethod
     def _coerce_before(before_hour: Any) -> int:
         if isinstance(before_hour, (int, float)) and 0 < before_hour <= 24:
@@ -931,6 +1194,16 @@ class ModelDecisionService:
                 [(r, sorted(d)) for r, d in rules.blackout],
                 [e["day"] for e in rules.dated_single],
                 [e["day"] for e in rules.dated_route],
+                rules.no_drive_windows,
+                rules.daily_order_limit,
+                rules.haul_max_km,
+                rules.monthly_deadhead_max_km,
+                rules.home_by_minute,
+                rules.bounded_area,
+                len(rules.forbidden_zones),
+                len(rules.must_visit),
+                rules.first_order_before_minute,
+                sorted(rules.avoid_categories),
             )
         )
 
@@ -1039,6 +1312,35 @@ class ModelDecisionService:
                 days = set(self._parse_month_days(text))
             if days and not any(r == blackout_region for r, _ in rules.blackout):
                 rules.blackout.append((blackout_region, days))
+        # --- new rule type regex supplements ---
+        # daily_order_limit: "同一天不超过N单" / "每天最多接N单"
+        if rules.daily_order_limit is None and ("单" in text or "接单" in text):
+            dol_m = re.search(r"(?:不超过|不得超过|最多|上限)\s*([一二两三四五六七八九十\d]+)\s*(?:个)?\s*单", text)
+            if dol_m:
+                rules.daily_order_limit = _cn_to_int(dol_m.group(1))
+        # haul_max_km: "干线/单笔距离不超过N公里"
+        if rules.haul_max_km is None and ("干线" in text or "单笔" in text) and ("公里" in text or "距离" in text):
+            hm_m = re.search(r"(?:不超过|不得超过|上限)\s*([零一二两三四五六七八九十百千\d]+)\s*公里", text)
+            if hm_m:
+                rules.haul_max_km = float(_cn_to_int(hm_m.group(1)))
+        # no_drive_window: "N点到M点不接单/不空跑/不出车"
+        if ("不接单" in text or "不空跑" in text or "不出车" in text or "不空驶" in text) and "点" in text:
+            ndw_window = self._parse_time_window(text)
+            if ndw_window is not None:
+                sm, em = ndw_window
+                if not any(ws == sm and we == em for ws, we in rules.no_drive_windows):
+                    rules.no_drive_windows.append((sm, em))
+        # home_rule: "X点前须在自家/回家/到家...Y公里" (complex, rely more on LLM)
+        # monthly_deadhead_max_km: "月累计空驶不超过N公里"
+        if rules.monthly_deadhead_max_km is None and "月" in text and "空驶" in text and "公里" in text:
+            mdh_m = re.search(r"(?:不超过|不得超过|上限)\s*([零一二两三四五六七八九十百千\d]+)\s*公里", text)
+            if mdh_m:
+                rules.monthly_deadhead_max_km = float(_cn_to_int(mdh_m.group(1)))
+        # first_order_before: "首单不得晚于N点"
+        if rules.first_order_before_minute is None and ("首单" in text or "第一单" in text):
+            fob_m = re.search(r"(?:不得晚于|不迟于|之前)\s*([零一二两三四五六七八九十\d]+)\s*点", text)
+            if fob_m:
+                rules.first_order_before_minute = _cn_to_int(fob_m.group(1)) * 60
 
     def _supplement_dated_events(
         self, text: str, rules: DriverRules, coord_map: dict[str, tuple[float, float]]
@@ -1162,6 +1464,24 @@ class ModelDecisionService:
                 stops = self._parse_route_stops(text, coords)
                 if stops:
                     rules.dated_route.append({"day": days[0], "stops": stops})
+        # --- new rule type regex patterns in fallback ---
+        # no_drive_window: "N点到M点不接单/不空跑"
+        if ("不接单" in text or "不空跑" in text or "不出车" in text or "不空驶" in text) and "点" in text:
+            ndw_window = self._parse_time_window(text)
+            if ndw_window is not None:
+                sm, em = ndw_window
+                if not any(ws == sm and we == em for ws, we in rules.no_drive_windows):
+                    rules.no_drive_windows.append((sm, em))
+        # daily_order_limit: "同一天不超过N单"
+        if rules.daily_order_limit is None and ("单" in text or "接单" in text):
+            dol_m = re.search(r"(?:不超过|不得超过|最多|上限)\s*([一二两三四五六七八九十\d]+)\s*(?:个)?\s*单", text)
+            if dol_m:
+                rules.daily_order_limit = _cn_to_int(dol_m.group(1))
+        # haul_max_km: "干线距离不超过N公里"
+        if rules.haul_max_km is None and ("干线" in text or "单笔" in text) and "公里" in text:
+            hm_m = re.search(r"(?:不超过|不得超过|上限)\s*([零一二两三四五六七八九十百千\d]+)\s*公里", text)
+            if hm_m:
+                rules.haul_max_km = float(_cn_to_int(hm_m.group(1)))
 
     # ----------------------------------------------------- small text parsers
     @staticmethod
