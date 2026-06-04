@@ -353,7 +353,7 @@ class ModelDecisionService:
         (so the per-order deadhead cap does not apply) and measures arrival from the
         pickup. Returns (net, pickup_lat, pickup_lng) or None."""
         name = str(cargo.get("cargo_name", ""))
-        if name in rules.forbidden_categories:
+        if self._is_forbidden_cargo(name, rules.forbidden_categories):
             return None
         start = cargo.get("start") or {}
         end = cargo.get("end") or {}
@@ -397,7 +397,7 @@ class ModelDecisionService:
 
     def _evaluate_cargo(self, cargo, item, rules, blackout_regions, now, day_end, lat, lng):
         name = str(cargo.get("cargo_name", ""))
-        if name in rules.forbidden_categories:
+        if self._is_forbidden_cargo(name, rules.forbidden_categories):
             return None
         start = cargo.get("start") or {}
         end = cargo.get("end") or {}
@@ -446,6 +446,18 @@ class ModelDecisionService:
             touches_required = _region_in_city(region, scity) or _region_in_city(region, ecity)
         occupied = max(1, finish - now)
         return net, touches_required, occupied
+
+    @staticmethod
+    def _is_forbidden_cargo(cargo_name: str, forbidden: set[str]) -> bool:
+        """Substring-based category matching: 'cargo_name' is forbidden if any
+        forbidden category is a substring of the cargo name, or vice versa."""
+        if not cargo_name or not forbidden:
+            return False
+        cn = cargo_name.strip()
+        for cat in forbidden:
+            if cat in cn or cn in cat:
+                return True
+        return False
 
     # ------------------------------------------------------------- action dsl
     @staticmethod
@@ -586,29 +598,33 @@ class ModelDecisionService:
     # ----------------------------------------------------------- LLM preference parsing
     _PARSE_SYSTEM = (
         "你是货运司机偏好抽取器。把司机的自然语言偏好转成严格 JSON。\n"
-        "只输出一个 JSON 对象，禁止 markdown / 解释。未提及的字段用 null 或空数组。\n\n"
+        "只输出一个 JSON 对象，禁止 markdown / 解释 / think标签。未提及的字段用 null 或空数组。\n\n"
         "字段定义（宁缺毋错）：\n"
         '- daily_rest_hours: 每天连续休息最少小时数（数字或 null）\n'
         '- rest_window: 每天固定停车时段 {"start_hour":整数,"end_hour":整数}（或 null）\n'
         '- off_days_min: 整月完全不出车天数（整数，默认 0）\n'
-        '- forbidden_categories: 禁运货物名称数组\n'
-        '- forbidden_regions: 禁接的装/卸货城市数组\n'
-        '- required_region: 每月需在该区域接货天数 {"region":字符串,"min_days":整数}（或 null）\n'
+        '- forbidden_categories: 禁运货物**品类名**数组（仅货物名称如"蔬菜""机械设备""生鲜"，'
+        '绝不放城市/区域名！"在惠州的货"是区域禁令不是品类禁令）\n'
+        '- forbidden_regions: 禁接的装/卸货**城市/区域名**数组（仅地名如"惠州""深圳"，'
+        '不带"的货""那一路"等后缀）\n'
+        '- required_region: 每月需在该区域接货天数 {"region":"纯地名","min_days":整数}（或 null）\n'
         '- pickup_max_km: 赴装空驶上限公里数（数字或 null）。中文数字要转换。\n'
-        '- blackout: 指定日期不去某地 [{"region":字符串,"dates":[日期...]}]\n'
+        '- blackout: 指定日期不去某地 [{"region":"纯地名","dates":[日期...]}]\n'
         '- dated_single: 某天必须到某地办事 [{"date":日期,"lat":纬度,"lng":经度,"wait_minutes":停留分钟,"before_hour":最晚到达整点或null}]\n'
-        '  触发词：盘库/清库存/对账/验收/盘点/提货/签收/检查/保养/检修/停一趟/办事/开会/取东西/交货/拿货/走一趟/回一趟/去一趟\n'
+        '  触发词：盘库/清库存/对账/验收/盘点/提货/签收/检查/保养/检修/停一趟/办事/开会/取东西/交货/拿货/走一趟/回一趟/去一趟/看看/办手续/送东西/存东西\n'
         '- dated_route: 某天按顺序经过多个地点 [{"date":日期,"stops":[{"lat":纬度,"lng":经度,"wait_minutes":分钟,"before_hour":整点或null}...]}]\n'
-        '  触发词：赴宴/先到…再到/先去…再去/先过…赶到\n\n'
+        '  触发词：赴宴/做寿/先到…再到/先去…再去/先过…赶到/接人/送人/喝喜酒/吃饭\n\n'
         "关键规则：\n"
         "1) 日期用该月日数 1-31。中文数字要转换（十二号→12，二十号→20，三十一号→31）。\n"
         "2) 坐标：偏好中'地名（纬度,经度）'→直接取。输入若有 known_coordinates 优先使用。"
         "若某偏好只说地名，而 known_coordinates 有同名坐标，直接引用。\n"
-        "3) wait_minutes：办事类事件必须 >0（默认 120）。\n"
-        "4) 时刻：'中午十二点前'→12，'下午两点'→14。\n"
-        "5) 区分品类禁令（货物名）和区域禁令（城市名）。\n"
+        "3) wait_minutes：办事类事件必须 >0（默认 120）。路过/取东西类 wait_minutes=0。\n"
+        "4) 时刻：'中午十二点前'→12，'下午两点'→14，'上午十点'→10。\n"
+        "5) **严格区分品类和区域**：forbidden_categories 只放货物品类名（蔬菜、机械设备、危化品等）；"
+        "forbidden_regions 只放纯地名（惠州、深圳等），不加任何修饰词。\n"
         "6) **dated_single 和 dated_route 惩罚最高，必须仔细抽取，坐标必须正确。**\n"
-        "7) 只抽取明确约束，不臆造。\n\n"
+        "7) 只抽取明确约束，不臆造。\n"
+        "8) 同一偏好可能同时包含多种约束（如禁区域+禁品类+日期事件），全部抽取。\n\n"
         "示例1：\n"
         '入: {"preferences":["每天零点到六点停着熄火睡觉","凡是生鲜货源碰不得","三月四号五号不往深圳（22.55，114.05）跑"]}\n'
         '出: {"daily_rest_hours":null,"rest_window":{"start_hour":0,"end_hour":6},"off_days_min":0,'
@@ -623,7 +639,12 @@ class ModelDecisionService:
         '入: {"preferences":["三十一号先过档口（23.15，113.67）取礼物，中午十二点前赶到县城（23.35，112.47）赴宴到下午两点"]}\n'
         '出: {"daily_rest_hours":null,"rest_window":null,"off_days_min":0,'
         '"forbidden_categories":[],"forbidden_regions":[],"required_region":null,"pickup_max_km":null,'
-        '"blackout":[],"dated_single":[],"dated_route":[{"date":31,"stops":[{"lat":23.15,"lng":113.67,"wait_minutes":0,"before_hour":12},{"lat":23.35,"lng":112.47,"wait_minutes":120,"before_hour":12}]}]}'
+        '"blackout":[],"dated_single":[],"dated_route":[{"date":31,"stops":[{"lat":23.15,"lng":113.67,"wait_minutes":0,"before_hour":12},{"lat":23.35,"lng":112.47,"wait_minutes":120,"before_hour":12}]}]}\n\n'
+        "示例4：\n"
+        '入: {"preferences":["龙门吊底座、机床铸件这类机械设备活儿干不了","装货地或卸货地在惠州的货一律不接"]}\n'
+        '出: {"daily_rest_hours":null,"rest_window":null,"off_days_min":0,'
+        '"forbidden_categories":["龙门吊底座","机床铸件","机械设备"],"forbidden_regions":["惠州"],'
+        '"required_region":null,"pickup_max_km":null,"blackout":[],"dated_single":[],"dated_route":[]}'
     )
 
     def _llm_parse_preferences(
@@ -678,6 +699,8 @@ class ModelDecisionService:
         if not isinstance(content, str) or not content.strip():
             return None
         text = content.strip()
+        # Strip <think>...</think> tags from reasoning models
+        text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
         try:
             data = json.loads(text)
         except json.JSONDecodeError:
@@ -689,6 +712,28 @@ class ModelDecisionService:
             except json.JSONDecodeError:
                 return None
         return data if isinstance(data, dict) else None
+
+    # Suffixes / patterns that indicate the LLM put a *region* into forbidden_categories
+    _REGION_HINT_RE = re.compile(
+        r"(?:装货|卸货|目的)(?:地|地点)?在|"          # "卸货地在惠州"
+        r"在[\u4e00-\u9fa5]{2,4}(?:的货|那|路|边|方向)|"  # "在惠州的货"
+        r"(?:省|市|区|县|镇|村)$"
+    )
+
+    @staticmethod
+    def _clean_region_name(raw: str) -> str:
+        """Strip common decorative suffixes so 'region' values are bare place-names."""
+        r = raw.strip()
+        # Strip prefix patterns like "卸货地在", "装货地在", "在"
+        prefix_m = re.match(r"(?:装货|卸货|目的)(?:地|地点)?在([\u4e00-\u9fa5]+)", r)
+        if prefix_m:
+            r = prefix_m.group(1)
+        elif r.startswith("在") and len(r) > 1:
+            r = r[1:]
+        for tail in ("的货", "那一路", "方向", "那边", "一带"):
+            if r.endswith(tail) and len(r) > len(tail):
+                r = r[:-len(tail)]
+        return r.strip()
 
     def _merge_llm_rules(self, rules: DriverRules, data: dict[str, Any], texts: list[str] | None = None) -> None:
         all_text = "\n".join(texts) if texts else ""
@@ -703,25 +748,50 @@ class ModelDecisionService:
         off = data.get("off_days_min")
         if isinstance(off, (int, float)) and off > 0:
             rules.off_days_min = max(rules.off_days_min, int(off))
+
+        # Collect raw categories and regions, then cross-validate & clean
+        raw_cats: list[str] = []
+        raw_regs: list[str] = []
         for cat in data.get("forbidden_categories") or []:
             if isinstance(cat, str) and cat.strip():
-                c = cat.strip()
-                if not all_text or c in all_text or _norm_region(c) in all_text:
-                    rules.forbidden_categories.add(c)
-                else:
-                    self._logger.info("llm validation: rejected forbidden_category '%s' (not in texts)", c)
+                raw_cats.append(cat.strip())
         for reg in data.get("forbidden_regions") or []:
             if isinstance(reg, str) and reg.strip():
-                r = reg.strip()
-                if not all_text or r in all_text or _norm_region(r) in all_text:
-                    rules.forbidden_regions.add(r)
-                else:
-                    self._logger.info("llm validation: rejected forbidden_region '%s' (not in texts)", r)
+                raw_regs.append(reg.strip())
+
+        # Move misclassified regions out of categories
+        clean_cats: list[str] = []
+        for c in raw_cats:
+            if self._REGION_HINT_RE.search(c):
+                # This looks like a region constraint, not a category
+                cleaned = self._clean_region_name(c)
+                if cleaned:
+                    self._logger.info("llm cleanup: moved '%s' from categories to regions as '%s'", c, cleaned)
+                    raw_regs.append(cleaned)
+                continue
+            # Strip common LLM prefixes like "凡是"
+            stripped = re.sub(r"^(?:凡是|所有|一切|任何)", "", c).strip()
+            clean_cats.append(stripped if stripped else c)
+
+        for c in clean_cats:
+            if not all_text or c in all_text or _norm_region(c) in all_text:
+                rules.forbidden_categories.add(c)
+            else:
+                self._logger.info("llm validation: rejected forbidden_category '%s' (not in texts)", c)
+
+        for reg in raw_regs:
+            r = self._clean_region_name(reg)
+            if not r:
+                continue
+            if not all_text or r in all_text or _norm_region(r) in all_text:
+                rules.forbidden_regions.add(r)
+            else:
+                self._logger.info("llm validation: rejected forbidden_region '%s' (not in texts)", r)
         rr = data.get("required_region")
         if isinstance(rr, dict):
             reg, md = rr.get("region"), rr.get("min_days")
             if isinstance(reg, str) and reg.strip() and isinstance(md, (int, float)) and md > 0:
-                rules.required_region = (reg.strip(), int(md))
+                rules.required_region = (self._clean_region_name(reg), int(md))
         pk = data.get("pickup_max_km")
         if isinstance(pk, (int, float)) and pk > 0:
             rules.pickup_max_km = float(pk)
@@ -730,8 +800,10 @@ class ModelDecisionService:
                 continue
             reg = bo.get("region")
             days = {int(d) - 1 for d in (bo.get("dates") or []) if isinstance(d, (int, float)) and 1 <= d <= 31}
-            if isinstance(reg, str) and reg.strip() and days and not any(r == reg.strip() for r, _ in rules.blackout):
-                r = reg.strip()
+            if isinstance(reg, str) and reg.strip() and days and not any(r == self._clean_region_name(reg) for r, _ in rules.blackout):
+                r = self._clean_region_name(reg)
+                if not r:
+                    continue
                 if not all_text or r in all_text or _norm_region(r) in all_text:
                     rules.blackout.append((r, days))
                 else:
@@ -868,7 +940,24 @@ class ModelDecisionService:
             text,
         )
         if cat_m:
-            rules.forbidden_categories.add(cat_m.group(1))
+            cat_val = cat_m.group(1)
+            cat_val = re.sub(r"^(?:凡是|所有|一切|任何)", "", cat_val).strip()
+            if cat_val and not self._REGION_HINT_RE.search(cat_val):
+                rules.forbidden_categories.add(cat_val)
+            elif cat_val:
+                cleaned = self._clean_region_name(cat_val)
+                if cleaned:
+                    rules.forbidden_regions.add(cleaned)
+        # Also catch "凡是X...碰不得/不接/推掉"
+        cat_m2 = re.search(
+            r"凡是\s*([\u4e00-\u9fa5]{2,6}?)\s*(?:货源|的货|货).*?"
+            r"(?:碰不得|不接|推掉|不拉|不碰|干不了)",
+            text,
+        )
+        if cat_m2:
+            cat_val2 = re.sub(r"^(?:凡是|所有|一切|任何)", "", cat_m2.group(1)).strip()
+            if cat_val2:
+                rules.forbidden_categories.add(cat_val2)
         # forbidden region: "在X的货...一律不接/不要/不跑/不去"
         reg_m = re.search(
             r"(?:装货地|卸货地|目的地)?在[\"\"「]?([\u4e00-\u9fa5]{2,4})[\"\"」]?"
@@ -876,7 +965,13 @@ class ModelDecisionService:
             text,
         )
         if reg_m:
-            rules.forbidden_regions.add(reg_m.group(1))
+            rules.forbidden_regions.add(self._clean_region_name(reg_m.group(1)))
+        # required region: "在X的货...接够N个不同的日子"
+        if ("不同的日子" in text or "不同日子" in text) and rules.required_region is None:
+            mr = re.search(r"在([\u4e00-\u9fa5]{2,4})的货", text)
+            cnt = self._parse_cn_count(text)
+            if mr and cnt:
+                rules.required_region = (mr.group(1), cnt)
         # blackout: various patterns for "don't go to region X on dates Y"
         blackout_region = None
         if "不往" in text and "跑" in text:
