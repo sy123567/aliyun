@@ -681,6 +681,7 @@ class ModelDecisionService:
                 continue
             data = self._extract_json(resp)
             if data is not None:
+                self._logger.info("llm raw output driver_id=%s data=%s", driver_id, json.dumps(data, ensure_ascii=False)[:800])
                 try:
                     self._merge_llm_rules(rules, data, texts)
                 except Exception as exc:
@@ -743,8 +744,16 @@ class ModelDecisionService:
         rw = data.get("rest_window")
         if isinstance(rw, dict):
             sh, eh = rw.get("start_hour"), rw.get("end_hour")
-            if isinstance(sh, (int, float)) and isinstance(eh, (int, float)) and eh > sh:
-                rules.rest_window = (int(sh) * 60, int(eh) * 60)
+            if isinstance(sh, (int, float)) and isinstance(eh, (int, float)):
+                if eh > sh:
+                    rules.rest_window = (int(sh) * 60, int(eh) * 60)
+                elif sh > eh > 0:
+                    # Overnight window (e.g. 22:00-05:00): morning part as rest_window
+                    rules.rest_window = (0, int(eh) * 60)
+                    overnight_hours = 24 - int(sh) + int(eh)
+                    rules.daily_rest_minutes = max(rules.daily_rest_minutes, overnight_hours * 60)
+                    self._logger.info("llm: overnight rest_window %d-%d -> rest_window=(0,%d) rest_min=%d",
+                                      int(sh), int(eh), int(eh)*60, overnight_hours*60)
         off = data.get("off_days_min")
         if isinstance(off, (int, float)) and off > 0:
             rules.off_days_min = max(rules.off_days_min, int(off))
@@ -799,7 +808,11 @@ class ModelDecisionService:
             if not isinstance(bo, dict):
                 continue
             reg = bo.get("region")
-            days = {int(d) - 1 for d in (bo.get("dates") or []) if isinstance(d, (int, float)) and 1 <= d <= 31}
+            days = set()
+            for d in bo.get("dates") or []:
+                dv = self._coerce_date(d)
+                if dv is not None:
+                    days.add(dv - 1)
             if isinstance(reg, str) and reg.strip() and days and not any(r == self._clean_region_name(reg) for r, _ in rules.blackout):
                 r = self._clean_region_name(reg)
                 if not r:
@@ -821,20 +834,45 @@ class ModelDecisionService:
     def _coerce_before(before_hour: Any) -> int:
         if isinstance(before_hour, (int, float)) and 0 < before_hour <= 24:
             return int(before_hour) * 60
+        if isinstance(before_hour, str):
+            m = re.search(r'(\d+)', before_hour)
+            if m:
+                h = int(m.group(1))
+                if 0 < h <= 24:
+                    return h * 60
         return DAY_MINUTES
+
+    @staticmethod
+    def _coerce_date(val: Any) -> int | None:
+        """Convert various date formats to int 1-31. Handles int, float, '15号', '15日', '15'."""
+        if isinstance(val, (int, float)):
+            d = int(val)
+            return d if 1 <= d <= 31 else None
+        if isinstance(val, str):
+            m = re.search(r'(\d+)', val)
+            if m:
+                d = int(m.group(1))
+                return d if 1 <= d <= 31 else None
+        return None
 
     def _coerce_single(self, ev: Any) -> dict[str, Any] | None:
         if not isinstance(ev, dict):
             return None
-        date, lat, lng = ev.get("date"), ev.get("lat"), ev.get("lng")
-        if not (isinstance(date, (int, float)) and 1 <= date <= 31):
+        date_val = self._coerce_date(ev.get("date"))
+        lat, lng = ev.get("lat"), ev.get("lng")
+        if date_val is None:
             return None
-        if not (isinstance(lat, (int, float)) and isinstance(lng, (int, float))):
+        date = date_val
+        try:
+            lat, lng = float(lat), float(lng)
+        except (TypeError, ValueError):
             return None
-        lat, lng = float(lat), float(lng)
         if lat > 90 and lng < 90:
             lat, lng = lng, lat
         wait = ev.get("wait_minutes")
+        if isinstance(wait, str):
+            wm = re.search(r'(\d+)', wait)
+            wait = int(wm.group(1)) if wm else 120
         wait = int(wait) if isinstance(wait, (int, float)) and wait > 0 else 120
         return {
             "day": int(date) - 1,
@@ -847,20 +885,25 @@ class ModelDecisionService:
     def _coerce_route(self, ev: Any) -> dict[str, Any] | None:
         if not isinstance(ev, dict):
             return None
-        date = ev.get("date")
-        if not (isinstance(date, (int, float)) and 1 <= date <= 31):
+        date_val = self._coerce_date(ev.get("date"))
+        if date_val is None:
             return None
+        date = date_val
         stops: list[dict[str, Any]] = []
         for s in ev.get("stops") or []:
             if not isinstance(s, dict):
                 continue
             lat, lng = s.get("lat"), s.get("lng")
-            if not (isinstance(lat, (int, float)) and isinstance(lng, (int, float))):
+            try:
+                lat, lng = float(lat), float(lng)
+            except (TypeError, ValueError):
                 continue
-            lat, lng = float(lat), float(lng)
             if lat > 90 and lng < 90:
                 lat, lng = lng, lat
             wait = s.get("wait_minutes")
+            if isinstance(wait, str):
+                wm = re.search(r'(\d+)', wait)
+                wait = int(wm.group(1)) if wm else 0
             wait = int(wait) if isinstance(wait, (int, float)) and wait >= 0 else 0
             stops.append(
                 {
