@@ -753,7 +753,8 @@ class ModelDecisionService:
         "5) **严格区分品类和区域**：forbidden_categories 只放货物品类名（蔬菜、机械设备、危化品等）；"
         "forbidden_regions 只放纯地名（惠州、深圳等），不加任何修饰词。\n"
         "6) **dated_single 和 dated_route 惩罚最高，必须仔细抽取，坐标必须正确。**\n"
-        "7) 只抽取明确约束，不臆造。不确定的宁可不填也不要猜。\n"
+        "7) **极其重要**：只抽取文本中**明确提到**的约束。如果文本没有提到回家/活动范围/禁入区域/接单上限等，"
+        "对应字段**必须**为null或空数组。宁可漏掉也绝不臆造。错误的约束比缺少约束惩罚更大。\n"
         "8) 同一偏好可能同时包含多种约束（如禁区域+禁品类+日期事件+回家规则），全部抽取。\n"
         '9) "不接单不空跑/不空驶"类约束，如果含时间段→填no_drive_windows；'
         '如果同时含"休息/睡觉"→也填rest_window或daily_rest_hours。\n'
@@ -982,116 +983,160 @@ class ModelDecisionService:
                 rules.dated_route.append(route)
 
         # --- new rule types from old 10-driver version ---
-        # no_drive_windows
-        for ndw in data.get("no_drive_windows") or []:
-            if not isinstance(ndw, dict):
-                continue
-            sh, eh = ndw.get("start_hour"), ndw.get("end_hour")
-            if isinstance(sh, (int, float)) and isinstance(eh, (int, float)):
-                sh, eh = int(sh), int(eh)
-                if eh > sh:
-                    sm, em = sh * 60, eh * 60
-                elif sh > eh:
-                    sm, em = sh * 60, (24 + eh) * 60
-                else:
+        # Text-grounding: only accept a new rule if the preference text contains
+        # matching keywords.  This prevents LLM hallucinations on unseen drivers.
+        _NDW_KW = ("不出车", "不接单", "不开车", "不跑车", "不空跑", "不空驶", "不运营", "休息", "不工作", "不干活")
+        _AVOID_KW = ("少接", "尽量不", "尽量少", "避免", "不太想", "不愿意", "不喜欢")
+        _FZ_KW = ("不进", "不去", "禁止进入", "不要去", "别去", "远离", "不往", "不到")
+        _BA_KW = ("范围", "区域内", "不超出", "只在", "仅在", "限定", "活动区域")
+        _MV_KW = ("必须去", "一定要到", "每月去", "至少去", "必须到", "必访", "定期去")
+        _HOME_KW = ("回家", "到家", "家里", "返回住所", "回住处", "回去", "回到家")
+        _DOL_KW = ("单", "接单", "订单", "不超过", "上限", "最多")
+        _HAUL_KW = ("干线", "距离", "公里", "单笔", "运距", "里程")
+        _FOB_KW = ("首单", "第一单", "第一趟", "最早", "点前出发", "点前接")
+
+        def _text_has_any(keywords: tuple[str, ...]) -> bool:
+            return any(kw in all_text for kw in keywords)
+
+        # no_drive_windows — grounded
+        if _text_has_any(_NDW_KW):
+            for ndw in data.get("no_drive_windows") or []:
+                if not isinstance(ndw, dict):
                     continue
-                if not any(ws == sm and we == em for ws, we in rules.no_drive_windows):
-                    rules.no_drive_windows.append((sm, em))
+                sh, eh = ndw.get("start_hour"), ndw.get("end_hour")
+                if isinstance(sh, (int, float)) and isinstance(eh, (int, float)):
+                    sh, eh = int(sh), int(eh)
+                    if eh > sh:
+                        sm, em = sh * 60, eh * 60
+                    elif sh > eh:
+                        sm, em = sh * 60, (24 + eh) * 60
+                    else:
+                        continue
+                    if not any(ws == sm and we == em for ws, we in rules.no_drive_windows):
+                        rules.no_drive_windows.append((sm, em))
+        elif data.get("no_drive_windows"):
+            self._logger.info("llm grounding: rejected no_drive_windows (no keywords in text)")
 
-        # avoid_categories
-        for ac in data.get("avoid_categories") or []:
-            if isinstance(ac, str) and ac.strip():
-                s = re.sub(r"^(?:凡是|所有|一切|任何)", "", ac.strip()).strip()
-                if s:
-                    rules.avoid_categories.add(s)
+        # avoid_categories — grounded
+        if _text_has_any(_AVOID_KW):
+            for ac in data.get("avoid_categories") or []:
+                if isinstance(ac, str) and ac.strip():
+                    s = re.sub(r"^(?:凡是|所有|一切|任何)", "", ac.strip()).strip()
+                    if s and (s in all_text or _norm_region(s) in all_text):
+                        rules.avoid_categories.add(s)
+                    elif s:
+                        self._logger.info("llm grounding: rejected avoid_category '%s' (not in text)", s)
+        elif data.get("avoid_categories"):
+            self._logger.info("llm grounding: rejected avoid_categories (no keywords in text)")
 
-        # forbidden_zones
-        for fz in data.get("forbidden_zones") or []:
-            if not isinstance(fz, dict):
-                continue
-            try:
-                flat, flng, fr = float(fz["lat"]), float(fz["lng"]), float(fz.get("radius_km", 10))
-            except (TypeError, ValueError, KeyError):
-                continue
-            if flat > 90 and flng < 90:
-                flat, flng = flng, flat
-            rules.forbidden_zones.append((flat, flng, fr))
+        # forbidden_zones — grounded
+        if _text_has_any(_FZ_KW):
+            for fz in data.get("forbidden_zones") or []:
+                if not isinstance(fz, dict):
+                    continue
+                try:
+                    flat, flng, fr = float(fz["lat"]), float(fz["lng"]), float(fz.get("radius_km", 10))
+                except (TypeError, ValueError, KeyError):
+                    continue
+                if flat > 90 and flng < 90:
+                    flat, flng = flng, flat
+                rules.forbidden_zones.append((flat, flng, fr))
+        elif data.get("forbidden_zones"):
+            self._logger.info("llm grounding: rejected forbidden_zones (no keywords in text)")
 
-        # bounded_area
+        # bounded_area — grounded
         ba = data.get("bounded_area")
         if isinstance(ba, dict) and rules.bounded_area is None:
-            try:
-                la_min = float(ba["lat_min"])
-                la_max = float(ba["lat_max"])
-                ln_min = float(ba["lng_min"])
-                ln_max = float(ba["lng_max"])
-                rules.bounded_area = (la_min, la_max, ln_min, ln_max)
-            except (TypeError, ValueError, KeyError):
-                pass
+            if _text_has_any(_BA_KW):
+                try:
+                    la_min = float(ba["lat_min"])
+                    la_max = float(ba["lat_max"])
+                    ln_min = float(ba["lng_min"])
+                    ln_max = float(ba["lng_max"])
+                    rules.bounded_area = (la_min, la_max, ln_min, ln_max)
+                except (TypeError, ValueError, KeyError):
+                    pass
+            else:
+                self._logger.info("llm grounding: rejected bounded_area (no keywords in text)")
 
-        # must_visit
-        for mv in data.get("must_visit") or []:
-            if not isinstance(mv, dict):
-                continue
-            try:
-                mlat, mlng = float(mv["lat"]), float(mv["lng"])
-                mrd = int(mv.get("required_days", 1))
-                mr = float(mv.get("radius_km", 1.0))
-            except (TypeError, ValueError, KeyError):
-                continue
-            if mlat > 90 and mlng < 90:
-                mlat, mlng = mlng, mlat
-            rules.must_visit.append({"lat": mlat, "lng": mlng, "radius_km": mr, "required_days": mrd})
+        # must_visit — grounded
+        if _text_has_any(_MV_KW):
+            for mv in data.get("must_visit") or []:
+                if not isinstance(mv, dict):
+                    continue
+                try:
+                    mlat, mlng = float(mv["lat"]), float(mv["lng"])
+                    mrd = int(mv.get("required_days", 1))
+                    mr = float(mv.get("radius_km", 1.0))
+                except (TypeError, ValueError, KeyError):
+                    continue
+                if mlat > 90 and mlng < 90:
+                    mlat, mlng = mlng, mlat
+                rules.must_visit.append({"lat": mlat, "lng": mlng, "radius_km": mr, "required_days": mrd})
+        elif data.get("must_visit"):
+            self._logger.info("llm grounding: rejected must_visit (no keywords in text)")
 
-        # haul_max_km
+        # haul_max_km — grounded
         hm = data.get("haul_max_km")
         if isinstance(hm, (int, float)) and hm > 0:
-            rules.haul_max_km = float(hm)
+            if _text_has_any(_HAUL_KW):
+                rules.haul_max_km = float(hm)
+            else:
+                self._logger.info("llm grounding: rejected haul_max_km=%s (no keywords in text)", hm)
 
-        # monthly_deadhead_max_km
+        # monthly_deadhead_max_km (keep as before — low risk, rarely hallucinated)
         mdh = data.get("monthly_deadhead_max_km")
         if isinstance(mdh, (int, float)) and mdh > 0:
             rules.monthly_deadhead_max_km = float(mdh)
 
-        # daily_order_limit
+        # daily_order_limit — grounded
         dol = data.get("daily_order_limit")
-        if isinstance(dol, (int, float)) and dol > 0:
-            rules.daily_order_limit = int(dol)
-        elif isinstance(dol, str):
-            dm = re.search(r'(\d+)', dol)
-            if dm:
-                rules.daily_order_limit = int(dm.group(1))
+        if _text_has_any(_DOL_KW):
+            if isinstance(dol, (int, float)) and dol > 0:
+                rules.daily_order_limit = int(dol)
+            elif isinstance(dol, str):
+                dm = re.search(r'(\d+)', dol)
+                if dm:
+                    rules.daily_order_limit = int(dm.group(1))
+        elif dol is not None:
+            self._logger.info("llm grounding: rejected daily_order_limit=%s (no keywords in text)", dol)
 
-        # first_order_before_hour
+        # first_order_before_hour — grounded
         fob = data.get("first_order_before_hour")
-        if isinstance(fob, (int, float)) and 0 < fob <= 24:
-            rules.first_order_before_minute = int(fob) * 60
-        elif isinstance(fob, str):
-            fm = re.search(r'(\d+)', fob)
-            if fm:
-                h = int(fm.group(1))
-                if 0 < h <= 24:
-                    rules.first_order_before_minute = h * 60
+        if fob is not None and _text_has_any(_FOB_KW):
+            if isinstance(fob, (int, float)) and 0 < fob <= 24:
+                rules.first_order_before_minute = int(fob) * 60
+            elif isinstance(fob, str):
+                fm = re.search(r'(\d+)', fob)
+                if fm:
+                    h = int(fm.group(1))
+                    if 0 < h <= 24:
+                        rules.first_order_before_minute = h * 60
+        elif fob is not None:
+            self._logger.info("llm grounding: rejected first_order_before_hour=%s (no keywords in text)", fob)
 
-        # home_rule
+        # home_rule — grounded
         hr = data.get("home_rule")
         if isinstance(hr, dict) and rules.home_lat is None:
-            try:
-                hlat, hlng = float(hr["lat"]), float(hr["lng"])
-            except (TypeError, ValueError, KeyError):
-                hlat, hlng = None, None
-            if hlat is not None and hlng is not None:
-                if hlat > 90 and hlng < 90:
-                    hlat, hlng = hlng, hlat
-                rules.home_lat = hlat
-                rules.home_lng = hlng
-                rules.home_radius_km = float(hr.get("radius_km", 1.0))
-                hby = hr.get("home_by_hour")
-                if isinstance(hby, (int, float)) and 0 < hby <= 24:
-                    rules.home_by_minute = int(hby) * 60
-                nduh = hr.get("no_drive_until_hour")
-                if isinstance(nduh, (int, float)) and 0 < nduh <= 24:
-                    rules.no_drive_until_minute = int(nduh) * 60
+            if _text_has_any(_HOME_KW):
+                try:
+                    hlat, hlng = float(hr["lat"]), float(hr["lng"])
+                except (TypeError, ValueError, KeyError):
+                    hlat, hlng = None, None
+                if hlat is not None and hlng is not None:
+                    if hlat > 90 and hlng < 90:
+                        hlat, hlng = hlng, hlat
+                    rules.home_lat = hlat
+                    rules.home_lng = hlng
+                    rules.home_radius_km = float(hr.get("radius_km", 1.0))
+                    hby = hr.get("home_by_hour")
+                    if isinstance(hby, (int, float)) and 0 < hby <= 24:
+                        rules.home_by_minute = int(hby) * 60
+                    nduh = hr.get("no_drive_until_hour")
+                    if isinstance(nduh, (int, float)) and 0 < nduh <= 24:
+                        rules.no_drive_until_minute = int(nduh) * 60
+            else:
+                self._logger.info("llm grounding: rejected home_rule (no keywords in text)")
 
     @staticmethod
     def _coerce_before(before_hour: Any) -> int:
