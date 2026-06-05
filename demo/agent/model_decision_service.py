@@ -363,25 +363,31 @@ class ModelDecisionService:
         best = None
         best_score = 0.0
         best_is_required = False
+        best_pickup_km = 0.0
         for item in items:
             cargo = item.get("cargo", {})
             ev = self._evaluate_cargo(cargo, item, rules, blackout_regions, now, day_end, lat, lng)
             if ev is None:
                 continue
-            net, touches_required, occupied = ev
+            net, touches_required, occupied, pkm = ev
+            # monthly deadhead cap: skip if this order would exceed limit
+            if rules.monthly_deadhead_max_km is not None:
+                if plan["total_deadhead_km"] + pkm > rules.monthly_deadhead_max_km:
+                    continue
             score = net / occupied
             is_req = bool(need_zeng and touches_required)
             if is_req and not best_is_required:
-                best, best_score, best_is_required = (cargo, score, True)
+                best, best_score, best_is_required, best_pickup_km = (cargo, score, True, pkm)
             elif is_req == best_is_required and score > best_score:
-                best, best_score, best_is_required = (cargo, score, is_req)
+                best, best_score, best_is_required, best_pickup_km = (cargo, score, is_req, pkm)
         if best is None:
             return None
         if best_is_required:
             plan["zeng_order_days"].add(day)
-        # Track order count and first-order flag
+        # Track order count, first-order flag, and deadhead
         plan["orders_today"][day] = plan["orders_today"].get(day, 0) + 1
         plan["first_order_taken"].add(day)
+        plan["total_deadhead_km"] += best_pickup_km
         return self._take_order(str(best.get("cargo_id")))
 
     def _anti_strand(self, driver_id, rules, plan, now, lat, lng, day, day_end):
@@ -548,7 +554,7 @@ class ModelDecisionService:
             region = rules.required_region[0]
             touches_required = _region_in_city(region, scity) or _region_in_city(region, ecity)
         occupied = max(1, finish - now)
-        return net, touches_required, occupied
+        return net, touches_required, occupied, pickup_km
 
     @staticmethod
     def _is_forbidden_cargo(cargo_name: str, forbidden: set[str]) -> bool:
@@ -985,15 +991,15 @@ class ModelDecisionService:
         # --- new rule types from old 10-driver version ---
         # Text-grounding: only accept a new rule if the preference text contains
         # matching keywords.  This prevents LLM hallucinations on unseen drivers.
-        _NDW_KW = ("不出车", "不接单", "不开车", "不跑车", "不空跑", "不空驶", "不运营", "休息", "不工作", "不干活")
+        _NDW_KW = ("不出车", "不接单", "不开车", "不跑车", "不空跑", "不空驶", "不运营", "休息", "不工作", "不干活", "不接", "不赶")
         _AVOID_KW = ("少接", "尽量不", "尽量少", "避免", "不太想", "不愿意", "不喜欢")
-        _FZ_KW = ("不进", "不去", "禁止进入", "不要去", "别去", "远离", "不往", "不到")
-        _BA_KW = ("范围", "区域内", "不超出", "只在", "仅在", "限定", "活动区域")
-        _MV_KW = ("必须去", "一定要到", "每月去", "至少去", "必须到", "必访", "定期去")
-        _HOME_KW = ("回家", "到家", "家里", "返回住所", "回住处", "回去", "回到家")
-        _DOL_KW = ("单", "接单", "订单", "不超过", "上限", "最多")
-        _HAUL_KW = ("干线", "距离", "公里", "单笔", "运距", "里程")
-        _FOB_KW = ("首单", "第一单", "第一趟", "最早", "点前出发", "点前接")
+        _FZ_KW = ("不进", "不去", "禁止进入", "不要去", "别去", "远离", "不往", "不到", "不可进", "不得进", "禁入", "不允许进")
+        _BA_KW = ("范围", "区域内", "不超出", "只在", "仅在", "限定", "活动区域", "纬度", "经度")
+        _MV_KW = ("必须去", "一定要到", "每月去", "至少去", "必须到", "必访", "定期去", "经过")
+        _HOME_KW = ("回家", "到家", "家里", "返回住所", "回住处", "回去", "回到家", "到家", "归家")
+        _DOL_KW = ("不超过", "上限", "最多", "不得超过", "不得多于")
+        _HAUL_KW = ("装货", "卸货", "干线", "运距", "里程", "运输距离")
+        _FOB_KW = ("首单", "第一单", "第一趟", "最早", "点前出发", "点前接", "点前开")
 
         def _text_has_any(keywords: tuple[str, ...]) -> bool:
             return any(kw in all_text for kw in keywords)
@@ -1289,9 +1295,9 @@ class ModelDecisionService:
             cnt = self._parse_cn_count(text)
             if cnt:
                 rules.off_days_min = max(rules.off_days_min, cnt)
-        if "空驶" in text and "超过" in text:
+        if "空驶" in text and "超过" in text and "月" not in text:
             km = self._parse_distance_km(text)
-            if km:
+            if km and rules.pickup_max_km is None:
                 rules.pickup_max_km = km
         # forbidden category: patterns like "X的活/货...干不了/推掉/不接/不拉"
         cat_m = re.search(
@@ -1369,12 +1375,14 @@ class ModelDecisionService:
             if hm_m:
                 rules.haul_max_km = float(_cn_to_int(hm_m.group(1)))
         # no_drive_window: "N点到M点不接单/不空跑/不出车"
-        if ("不接单" in text or "不空跑" in text or "不出车" in text or "不空驶" in text) and "点" in text:
+        if not rules.no_drive_windows and ("不接单" in text or "不空跑" in text or "不出车" in text or "不空驶" in text) and "点" in text:
             ndw_window = self._parse_time_window(text)
             if ndw_window is not None:
                 sm, em = ndw_window
-                if not any(ws == sm and we == em for ws, we in rules.no_drive_windows):
-                    rules.no_drive_windows.append((sm, em))
+                # handle cross-midnight: end < start → wrap to next day
+                if em <= sm:
+                    em += DAY_MINUTES
+                rules.no_drive_windows.append((sm, em))
         # home_rule: "X点前须在自家/回家/到家...Y公里" (complex, rely more on LLM)
         # monthly_deadhead_max_km: "月累计空驶不超过N公里"
         if rules.monthly_deadhead_max_km is None and "月" in text and "空驶" in text and "公里" in text:
@@ -1566,13 +1574,18 @@ class ModelDecisionService:
                 continue
             mm = re.search(r"([零一二两三四五六七八九十\d]+)\s*点", token)
             if mm:
-                hours.append(_cn_to_int(mm.group(1)))
+                h = _cn_to_int(mm.group(1))
+                hours.append(h)
         if "零点" in text and len(hours) >= 1:
             end = next((h for h in hours if h > 0), None)
             if end is not None:
                 return (0, end * 60)
         if len(hours) >= 2:
-            return (hours[0] * 60, hours[1] * 60)
+            h1, h2 = hours[0], hours[1]
+            # fix PM context: "中午12点到下午1点" → h2=1 should be 13
+            if h1 >= 12 and h2 < 12 and ("下午" in text or "中午" in text):
+                h2 += 12
+            return (h1 * 60, h2 * 60)
         return None
 
     @staticmethod
