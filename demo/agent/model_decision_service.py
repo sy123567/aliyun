@@ -802,7 +802,15 @@ class ModelDecisionService:
         '"required_region":null,"must_visit":[],"pickup_max_km":null,"haul_max_km":null,"monthly_deadhead_max_km":null,'
         '"daily_order_limit":3,"first_order_before_hour":null,'
         '"home_rule":{"lat":23.10,"lng":113.50,"radius_km":1,"home_by_hour":23,"no_drive_until_hour":8},'
-        '"blackout":[],"dated_single":[],"dated_route":[]}'
+        '"blackout":[],"dated_single":[],"dated_route":[]}\n\n'
+        "示例6：\n"
+        '入: {"preferences":["十一点半到下午一点半歇晌，雷打不动","二十号去老李仓库（23.25，113.40）对账，大概两小时"]}\n'
+        '出: {"daily_rest_hours":null,"rest_window":{"start_hour":11.5,"end_hour":13.5},'
+        '"no_drive_windows":[],"off_days_min":0,'
+        '"forbidden_categories":[],"avoid_categories":[],"forbidden_regions":[],"forbidden_zones":[],"bounded_area":null,'
+        '"required_region":null,"must_visit":[],"pickup_max_km":null,"haul_max_km":null,"monthly_deadhead_max_km":null,'
+        '"daily_order_limit":null,"first_order_before_hour":null,"home_rule":null,'
+        '"blackout":[],"dated_single":[{"date":20,"lat":23.25,"lng":113.40,"wait_minutes":120,"before_hour":null}],"dated_route":[]}'
     )
 
     def _llm_parse_preferences(
@@ -1358,6 +1366,14 @@ class ModelDecisionService:
             m2 = re.search(r"(?:不去|别去)([\u4e00-\u9fa5]{2,4})", text)
             if m2:
                 blackout_region = m2.group(1)
+        if blackout_region is None and "别安排" in text:
+            m2 = re.search(r"别安排.*?([\u4e00-\u9fa5]{2,4})", text)
+            if m2:
+                blackout_region = m2.group(1)
+        if blackout_region is None and ("不跑" in text or "不接" in text):
+            m2 = re.search(r"(?:不跑|不接)([\u4e00-\u9fa5]{2,4})(?:的[活单货])?", text)
+            if m2 and ("号" in text or "日" in text):
+                blackout_region = m2.group(1)
         if blackout_region is not None:
             days = set(self._parse_any_days(text))
             if not days:
@@ -1504,15 +1520,28 @@ class ModelDecisionService:
             if region and days and not any(r == region for r, _ in rules.blackout):
                 rules.blackout.append((region, set(days)))
         # dated single stop: "三月十二号...到增城区停一趟,花两小时"
-        if "号" in text and ("停一趟" in text or "盘库" in text or "清库存" in text or "对清" in text):
+        _dated_single_kws = (
+            "停一趟", "盘库", "清库存", "对清", "对账", "验收", "盘点",
+            "提货", "签收", "检查", "保养", "检修", "办事", "开会",
+            "取东西", "拿货", "交货", "走一趟", "跑一趟", "回一趟",
+            "去一趟", "装货", "卸货", "看看", "办手续", "送东西", "存东西",
+        )
+        if ("号" in text or "日" in text) and any(kw in text for kw in _dated_single_kws):
             days = self._parse_month_days(text)
+            if not days:
+                days = self._parse_any_days(text)
             loc = self._match_coords(text, coords)
             if days and loc and not any(e["day"] == days[0] for e in rules.dated_single):
                 rules.dated_single.append(
                     {"day": days[0], "lat": loc[0], "lng": loc[1], "min_wait": self._parse_hours_minutes(text) or 120, "before": DAY_MINUTES}
                 )
         # dated route: "三月三十一号...先过增城...中午十二点前赶到四会...赴宴到下午两点"
-        if "号" in text and ("赴宴" in text or "寿" in text or "赶到" in text) and "增城" in text:
+        _dated_route_kws = (
+            "赴宴", "寿", "赶到", "先到", "先去", "先过",
+            "再到", "再去", "然后到", "然后去", "接着到", "接着去",
+            "接人", "送人", "喝喜酒", "吃饭", "接上",
+        )
+        if ("号" in text or "日" in text) and any(kw in text for kw in _dated_route_kws):
             days = self._parse_month_days(text)
             if days and not any(e["day"] == days[0] for e in rules.dated_route):
                 stops = self._parse_route_stops(text, coords)
@@ -1559,9 +1588,13 @@ class ModelDecisionService:
 
     @staticmethod
     def _parse_hours_minutes(text: str) -> int | None:
-        m = re.search(r"(?:花|停)\s*([零一二两三四五六七八九十\d]+)\s*(?:个)?\s*小时", text)
+        m = re.search(r"(?:花|停|耗|待|等|逗留|用|需要|大概|大约)\s*([零一二两三四五六七八九十\d]+)\s*(?:个)?\s*小时", text)
         if m:
             return _cn_to_int(m.group(1)) * 60
+        # "N小时" without explicit prefix
+        m2 = re.search(r"([零一二两三四五六七八九十\d]+)\s*(?:个)?\s*小时", text)
+        if m2:
+            return _cn_to_int(m2.group(1)) * 60
         return None
 
     @staticmethod
