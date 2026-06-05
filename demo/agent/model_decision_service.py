@@ -1095,16 +1095,16 @@ class ModelDecisionService:
         # Compound grounding: require BOTH a time indicator AND an action keyword
         # to reduce false positives from common words like "休息" or "不接"
         _NDW_TIME_KW = ("点", "时", "小时", "上午", "下午", "中午", "凌晨", "晚上", "早上")
-        _NDW_ACTION_KW = ("不出车", "不接单", "不开车", "不跑车", "不空跑", "不空驶", "不运营", "不工作", "不干活", "不接活", "不赶路", "不许出", "不允许出", "别派活", "别赶路", "停车熄火", "禁止出车", "不准出车", "别开车", "别跑车")
+        _NDW_ACTION_KW = ("不出车", "不接单", "不开车", "不跑车", "不空跑", "不空驶", "不运营", "不工作", "不干活", "不接活", "不赶路", "不许出", "不允许出", "别派活", "别赶路", "停车熄火", "禁止出车", "不准出车", "别开车", "别跑车", "收工", "歇着", "休息", "睡觉", "不动弹", "不跑", "不接")
         _NDW_KW = _NDW_ACTION_KW  # for logging compatibility
-        _AVOID_KW = ("少接", "尽量不", "尽量少", "避免", "不太想", "不愿意", "不喜欢", "最好别", "别给我", "尽量别")
-        _FZ_KW = ("不进", "不去", "禁止进入", "不要去", "不要进", "别去", "远离", "不往", "不到", "不可进", "不得进", "禁入", "不允许进", "严禁", "禁驶入", "禁止驶入", "堵", "修路")
-        _BA_KW = ("范围", "区域内", "不超出", "只在", "仅在", "限定", "活动区域", "纬度", "经度")
-        _MV_KW = ("必须去", "一定要到", "每月去", "至少去", "必须到", "必访", "定期去", "经过")
+        _AVOID_KW = ("少接", "尽量不", "尽量少", "避免", "不太想", "不愿意", "不喜欢", "最好别", "别给我", "尽量别", "能不接", "嫌麻烦", "不是绝对", "除非价钱", "能换就换", "不太愿意", "能不碰")
+        _FZ_KW = ("不进", "不去", "禁止进入", "不要去", "不要进", "别去", "远离", "不往", "不到", "不可进", "不得进", "禁入", "不允许进", "严禁", "禁驶入", "禁止驶入", "堵", "修路", "不想跑", "不做")
+        _BA_KW = ("范围", "区域内", "不超出", "只在", "仅在", "限定", "活动区域", "纬度", "经度", "运营区域", "只做", "只跑")
+        _MV_KW = ("必须去", "一定要到", "每月去", "至少去", "必须到", "必访", "定期去", "经过", "起码", "至少", "接够")
         _HOME_KW = ("回家", "到家", "家里", "返回住所", "回住处", "回去", "回到家", "归家", "在家", "家附近", "停在家")
         _DOL_KW = ("不超过", "上限", "最多", "不得超过", "不得多于", "顶多")
-        _HAUL_KW = ("装货", "卸货", "干线", "运距", "里程", "运输距离", "运输", "提货", "交货", "运货", "距离", "公里", "不超")
-        _FOB_KW = ("首单", "第一单", "第一趟", "最早", "点前出发", "点前接", "点前开")
+        _HAUL_KW = ("装货", "卸货", "干线", "运距", "里程", "运输距离", "运输", "提货", "交货", "运货", "距离", "公里", "不超", "单趟")
+        _FOB_KW = ("首单", "第一单", "第一趟", "最早", "点前出发", "点前接", "点前开", "点之前", "出第一")
 
         def _text_has_any(keywords: tuple[str, ...]) -> bool:
             return any(kw in all_text for kw in keywords)
@@ -1449,7 +1449,6 @@ class ModelDecisionService:
             if km and rules.pickup_max_km is None:
                 rules.pickup_max_km = km
         # forbidden/avoid category: patterns like "X的活/货...干不了/推掉/不接/不拉"
-        # If text contains soft-avoid keywords, add to avoid_categories instead of forbidden
         _is_soft = any(kw in text for kw in ("尽量不", "尽量少", "尽量别", "最好别", "不太想", "不愿意"))
         cat_m = re.search(
             r"[\"\"「]?([\u4e00-\u9fa5]{2,6}?)[\"\"」]?"
@@ -1642,11 +1641,11 @@ class ModelDecisionService:
             if cnt:
                 rules.off_days_min = max(rules.off_days_min, cnt)
         # forbidden/avoid category: "X这类活儿...干不了" / "凡是X货源...推掉"
-        _is_soft = any(kw in text for kw in ("尽量不", "尽量少", "尽量别", "最好别", "不太想", "不愿意"))
+        _is_soft2 = any(kw in text for kw in ("尽量不", "尽量少", "尽量别", "最好别", "不太想", "不愿意"))
         if ("干不了" in text or "推掉" in text or ("一律不接" in text and "货源" not in text[:0])) and "扣" in text:
             cat = self._parse_forbidden_category(text)
             if cat:
-                if _is_soft:
+                if _is_soft2:
                     rules.avoid_categories.add(cat)
                 else:
                     rules.forbidden_categories.add(cat)
@@ -1712,8 +1711,8 @@ class ModelDecisionService:
             dol_m = re.search(r"(?:不超过|不得超过|最多|上限|顶多)\s*(?:跑|接)?\s*([一二两三四五六七八九十\d]+)\s*(?:个)?\s*(?:单|趟)", text)
             if dol_m:
                 rules.daily_order_limit = _cn_to_int(dol_m.group(1))
-        # haul_max_km: "干线距离不超过N公里"
-        if rules.haul_max_km is None and ("干线" in text or "单笔" in text) and "公里" in text:
+        # haul_max_km: "干线距离不超过N公里" / "单趟运距不能超过N公里" / "运货距离最多N公里"
+        if rules.haul_max_km is None and ("干线" in text or "单笔" in text or "单趟" in text or "运距" in text or "运货" in text) and "公里" in text:
             hm_m = re.search(r"(?:不超过|不得超过|上限)\s*([零一二两三四五六七八九十百千\d]+)\s*公里", text)
             if hm_m:
                 rules.haul_max_km = float(_cn_to_int(hm_m.group(1)))
