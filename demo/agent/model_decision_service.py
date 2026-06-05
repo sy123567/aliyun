@@ -1146,6 +1146,8 @@ class ModelDecisionService:
         elif data.get("avoid_categories"):
             self._logger.info("llm grounding: rejected avoid_categories (no keywords in text)")
 
+        # NOTE: avoid/forbidden dedup moved to _dedup_avoid_forbidden (runs after supplement)
+
         # forbidden_zones — grounded + coordinate validation
         if _text_has_any(_FZ_KW):
             for fz in data.get("forbidden_zones") or []:
