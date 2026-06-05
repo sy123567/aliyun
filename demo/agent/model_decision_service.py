@@ -324,7 +324,12 @@ class ModelDecisionService:
         strand = self._anti_strand(driver_id, rules, plan, now, lat, lng, day, hard_end)
         if strand is not None:
             return strand
-        return self._wait(max(day_end - now, 1))
+        # (E'') Instead of idling until day end, wait 2-4 hours and retry.
+        # This avoids wasting entire days when cargo becomes available later.
+        remaining = day_end - now
+        if remaining > 240:
+            return self._wait(180)  # wait 3 hours then retry
+        return self._wait(max(remaining, 1))
 
     def _next_day_is_ordinary(self, rules, plan, day) -> bool:
         nxt = day + 1
@@ -403,6 +408,26 @@ class ModelDecisionService:
                 best, best_score, best_is_required, best_pickup_km = (cargo, score, True, pkm)
             elif is_req == best_is_required and score > best_score:
                 best, best_score, best_is_required, best_pickup_km = (cargo, score, is_req, pkm)
+        # Widen search if k=60 found no compliant order — try k=200 for a larger radius
+        if best is None:
+            cargo_resp2 = self._api.query_cargo(driver_id=driver_id, latitude=lat, longitude=lng, k=200)
+            items2 = cargo_resp2.get("items", [])
+            now = int(self._api.get_driver_status(driver_id)["simulation_progress_minutes"])
+            for item in items2:
+                cargo = item.get("cargo", {})
+                ev = self._evaluate_cargo(cargo, item, rules, blackout_regions, now, day_end, lat, lng)
+                if ev is None:
+                    continue
+                net, touches_required, occupied, pkm = ev
+                if rules.monthly_deadhead_max_km is not None:
+                    if plan["total_deadhead_km"] + pkm > rules.monthly_deadhead_max_km:
+                        continue
+                score = net / occupied
+                is_req = bool(need_zeng and touches_required)
+                if is_req and not best_is_required:
+                    best, best_score, best_is_required, best_pickup_km = (cargo, score, True, pkm)
+                elif is_req == best_is_required and score > best_score:
+                    best, best_score, best_is_required, best_pickup_km = (cargo, score, is_req, pkm)
         if best is None:
             return None
         if best_is_required:
@@ -419,9 +444,10 @@ class ModelDecisionService:
         idle the whole day. Scan a wide radius for the best order that becomes workable
         *after a single reposition to its pickup*, and move toward it. The reposition
         deadhead is already folded into `net`, and the post-reposition pickup is ~0 km,
-        so the deadhead cap is never tripped (penalty stays 0). At most one reposition
-        per day; never on a planned off day (handled before this point)."""
-        if day in plan["strand_repo"]:
+        so the deadhead cap is never tripped (penalty stays 0). Allow up to 2 repositions
+        per day to avoid wasting entire days when first target has no cargo."""
+        strand_count = plan.get("strand_count", {}).get(day, 0)
+        if strand_count >= 2:
             return None
         if day_end - now < _STRAND_MIN_BUDGET:
             return None
@@ -441,6 +467,8 @@ class ModelDecisionService:
         if best_target is None:
             return None
         plan["strand_repo"].add(day)
+        plan.setdefault("strand_count", {})
+        plan["strand_count"][day] = plan["strand_count"].get(day, 0) + 1
         return self._reposition(best_target[0], best_target[1])
 
     def _evaluate_relocation(self, cargo, rules, blackout_regions, now, day_end, lat, lng):
