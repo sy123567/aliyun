@@ -991,14 +991,14 @@ class ModelDecisionService:
         # --- new rule types from old 10-driver version ---
         # Text-grounding: only accept a new rule if the preference text contains
         # matching keywords.  This prevents LLM hallucinations on unseen drivers.
-        _NDW_KW = ("不出车", "不接单", "不开车", "不跑车", "不空跑", "不空驶", "不运营", "休息", "不工作", "不干活", "不接", "不赶")
-        _AVOID_KW = ("少接", "尽量不", "尽量少", "避免", "不太想", "不愿意", "不喜欢")
-        _FZ_KW = ("不进", "不去", "禁止进入", "不要去", "别去", "远离", "不往", "不到", "不可进", "不得进", "禁入", "不允许进")
+        _NDW_KW = ("不出车", "不接单", "不开车", "不跑车", "不空跑", "不空驶", "不运营", "休息", "不工作", "不干活", "不接", "不赶", "不许", "不允许", "别派", "别赶", "停车熄火", "禁止出", "不准出", "别开车", "别跑车")
+        _AVOID_KW = ("少接", "尽量不", "尽量少", "避免", "不太想", "不愿意", "不喜欢", "最好别", "别给我", "尽量别")
+        _FZ_KW = ("不进", "不去", "禁止进入", "不要去", "别去", "远离", "不往", "不到", "不可进", "不得进", "禁入", "不允许进", "严禁", "禁驶入", "禁止驶入")
         _BA_KW = ("范围", "区域内", "不超出", "只在", "仅在", "限定", "活动区域", "纬度", "经度")
         _MV_KW = ("必须去", "一定要到", "每月去", "至少去", "必须到", "必访", "定期去", "经过")
-        _HOME_KW = ("回家", "到家", "家里", "返回住所", "回住处", "回去", "回到家", "到家", "归家")
-        _DOL_KW = ("不超过", "上限", "最多", "不得超过", "不得多于")
-        _HAUL_KW = ("装货", "卸货", "干线", "运距", "里程", "运输距离")
+        _HOME_KW = ("回家", "到家", "家里", "返回住所", "回住处", "回去", "回到家", "归家", "在家", "家附近", "停在家")
+        _DOL_KW = ("不超过", "上限", "最多", "不得超过", "不得多于", "顶多")
+        _HAUL_KW = ("装货", "卸货", "干线", "运距", "里程", "运输距离", "运输", "提货", "交货")
         _FOB_KW = ("首单", "第一单", "第一趟", "最早", "点前出发", "点前接", "点前开")
 
         def _text_has_any(keywords: tuple[str, ...]) -> bool:
@@ -1331,7 +1331,7 @@ class ModelDecisionService:
             r".*?(?:一律不接|不接|不要|不跑|不去|不做)",
             text,
         )
-        if reg_m:
+        if reg_m and rules.bounded_area is None:
             rules.forbidden_regions.add(self._clean_region_name(reg_m.group(1)))
         # required region: "在X的货...接够N个不同的日子"
         if ("不同的日子" in text or "不同日子" in text) and rules.required_region is None:
@@ -1364,9 +1364,9 @@ class ModelDecisionService:
             if days and not any(r == blackout_region for r, _ in rules.blackout):
                 rules.blackout.append((blackout_region, days))
         # --- new rule type regex supplements ---
-        # daily_order_limit: "同一天不超过N单" / "每天最多接N单"
-        if rules.daily_order_limit is None and ("单" in text or "接单" in text):
-            dol_m = re.search(r"(?:不超过|不得超过|最多|上限)\s*([一二两三四五六七八九十\d]+)\s*(?:个)?\s*单", text)
+        # daily_order_limit: "同一天不超过N单" / "顶多跑N趟"
+        if rules.daily_order_limit is None and ("单" in text or "接单" in text or "趟" in text):
+            dol_m = re.search(r"(?:不超过|不得超过|最多|上限|顶多)\s*(?:跑|接)?\s*([一二两三四五六七八九十\d]+)\s*(?:个)?\s*(?:单|趟)", text)
             if dol_m:
                 rules.daily_order_limit = _cn_to_int(dol_m.group(1))
         # haul_max_km: "干线/单笔距离不超过N公里"
@@ -1375,7 +1375,7 @@ class ModelDecisionService:
             if hm_m:
                 rules.haul_max_km = float(_cn_to_int(hm_m.group(1)))
         # no_drive_window: "N点到M点不接单/不空跑/不出车"
-        if not rules.no_drive_windows and ("不接单" in text or "不空跑" in text or "不出车" in text or "不空驶" in text) and "点" in text:
+        if not rules.no_drive_windows and ("不接单" in text or "不空跑" in text or "不出车" in text or "不空驶" in text or "不跑车" in text or "不接活" in text or "别派" in text or "别赶" in text or "不许" in text or "不允许" in text) and "点" in text:
             ndw_window = self._parse_time_window(text)
             if ndw_window is not None:
                 sm, em = ndw_window
@@ -1525,9 +1525,9 @@ class ModelDecisionService:
                 sm, em = ndw_window
                 if not any(ws == sm and we == em for ws, we in rules.no_drive_windows):
                     rules.no_drive_windows.append((sm, em))
-        # daily_order_limit: "同一天不超过N单"
-        if rules.daily_order_limit is None and ("单" in text or "接单" in text):
-            dol_m = re.search(r"(?:不超过|不得超过|最多|上限)\s*([一二两三四五六七八九十\d]+)\s*(?:个)?\s*单", text)
+        # daily_order_limit: "同一天不超过N单" / "顶多跑N趟"
+        if rules.daily_order_limit is None and ("单" in text or "接单" in text or "趟" in text):
+            dol_m = re.search(r"(?:不超过|不得超过|最多|上限|顶多)\s*(?:跑|接)?\s*([一二两三四五六七八九十\d]+)\s*(?:个)?\s*(?:单|趟)", text)
             if dol_m:
                 rules.daily_order_limit = _cn_to_int(dol_m.group(1))
         # haul_max_km: "干线距离不超过N公里"
@@ -1680,16 +1680,22 @@ def _cn_to_int(token: str) -> int:
         return int(token)
     if token in _CN_DIGITS:
         return _CN_DIGITS[token]
-    # handle 十/二十/十二 etc.
-    if "十" in token:
-        parts = token.split("十")
-        tens = _CN_DIGITS.get(parts[0], 1) if parts[0] else 1
-        ones = _CN_DIGITS.get(parts[1], 0) if len(parts) > 1 and parts[1] else 0
-        return tens * 10 + ones
+    # handle composite Chinese numbers: 二百, 三百五十, 一千二百, 二十五, etc.
     total = 0
+    current = 0
     for ch in token:
         if ch in _CN_DIGITS:
-            total = total * 10 + _CN_DIGITS[ch]
+            current = _CN_DIGITS[ch]
+        elif ch == "十":
+            total += (current if current else 1) * 10
+            current = 0
+        elif ch == "百":
+            total += (current if current else 1) * 100
+            current = 0
+        elif ch == "千":
+            total += (current if current else 1) * 1000
+            current = 0
+    total += current
     return total
 
 
