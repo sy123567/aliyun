@@ -721,8 +721,8 @@ class ModelDecisionService:
         "只输出一个 JSON 对象，禁止 markdown / 解释 / think标签。未提及的字段用 null 或空数组。\n\n"
         "字段定义（宁缺毋错）：\n"
         '- daily_rest_hours: 每天连续休息最少小时数（数字或 null）\n'
-        '- rest_window: 每天固定停车时段 {"start_hour":整数,"end_hour":整数}（或 null）\n'
-        '- no_drive_windows: 每天禁止接单/空驶的时段数组 [{"start_hour":整数,"end_hour":整数}]。\n'
+        '- rest_window: 每天固定停车时段 {"start_hour":数字,"end_hour":数字}（或 null）。半小时用0.5，如11点半→11.5\n'
+        '- no_drive_windows: 每天禁止接单/空驶的时段数组 [{"start_hour":数字,"end_hour":数字}]。半小时用0.5。\n'
         '  适用于非休息类禁行（如"中午12点到1点不接单"）。跨午夜时 end_hour<start_hour，如23→5。\n'
         '  注意：如果同一条偏好既有"休息"又有"不接单不空跑"，rest_window和no_drive_windows都填。\n'
         '- off_days_min: 整月完全不出车天数（整数，默认 0）\n'
@@ -903,15 +903,16 @@ class ModelDecisionService:
         if isinstance(rw, dict):
             sh, eh = rw.get("start_hour"), rw.get("end_hour")
             if isinstance(sh, (int, float)) and isinstance(eh, (int, float)):
-                if eh > sh:
-                    rules.rest_window = (int(sh) * 60, int(eh) * 60)
-                elif sh > eh > 0:
+                sm, em = int(round(sh * 60)), int(round(eh * 60))
+                if em > sm:
+                    rules.rest_window = (sm, em)
+                elif sm > em > 0:
                     # Overnight window (e.g. 22:00-05:00): morning part as rest_window
-                    rules.rest_window = (0, int(eh) * 60)
-                    overnight_hours = 24 - int(sh) + int(eh)
-                    rules.daily_rest_minutes = max(rules.daily_rest_minutes, overnight_hours * 60)
+                    rules.rest_window = (0, em)
+                    overnight_min = 24 * 60 - sm + em
+                    rules.daily_rest_minutes = max(rules.daily_rest_minutes, overnight_min)
                     self._logger.info("llm: overnight rest_window %d-%d -> rest_window=(0,%d) rest_min=%d",
-                                      int(sh), int(eh), int(eh)*60, overnight_hours*60)
+                                      sm, em, em, overnight_min)
         off = data.get("off_days_min")
         if isinstance(off, (int, float)) and off > 0:
             rules.off_days_min = max(rules.off_days_min, int(off))
@@ -1011,11 +1012,11 @@ class ModelDecisionService:
                     continue
                 sh, eh = ndw.get("start_hour"), ndw.get("end_hour")
                 if isinstance(sh, (int, float)) and isinstance(eh, (int, float)):
-                    sh, eh = int(sh), int(eh)
-                    if eh > sh:
-                        sm, em = sh * 60, eh * 60
-                    elif sh > eh:
-                        sm, em = sh * 60, (24 + eh) * 60
+                    sm, em = int(round(sh * 60)), int(round(eh * 60))
+                    if em > sm:
+                        pass  # normal range
+                    elif sm > em:
+                        em += 24 * 60  # cross-midnight
                     else:
                         continue
                     if not any(ws == sm and we == em for ws, we in rules.no_drive_windows):
@@ -1565,27 +1566,33 @@ class ModelDecisionService:
 
     @staticmethod
     def _parse_time_window(text: str) -> tuple[int, int] | None:
-        # handle "零点...六点" style
-        nums = re.findall(r"(零点|凌晨|早上\s*[零一二两三四五六七八九十\d]+\s*点|[零一二两三四五六七八九十\d]+\s*点)", text)
-        hours: list[int] = []
+        # handle "零点...六点" style, including "点半" (half-hour)
+        nums = re.findall(
+            r"(零点半?|凌晨|早上\s*[零一二两三四五六七八九十\d]+\s*点半?"
+            r"|[零一二两三四五六七八九十\d]+\s*点半?)",
+            text,
+        )
+        minutes: list[int] = []
         for token in nums:
-            if "零点" in token:
-                hours.append(0)
+            if token.startswith("零点"):
+                minutes.append(30 if "半" in token else 0)
                 continue
-            mm = re.search(r"([零一二两三四五六七八九十\d]+)\s*点", token)
+            mm = re.search(r"([零一二两三四五六七八九十\d]+)\s*点(半)?", token)
             if mm:
                 h = _cn_to_int(mm.group(1))
-                hours.append(h)
-        if "零点" in text and len(hours) >= 1:
-            end = next((h for h in hours if h > 0), None)
+                m = 30 if mm.group(2) else 0
+                minutes.append(h * 60 + m)
+        if "零点" in text and len(minutes) >= 1:
+            end = next((m for m in minutes if m > 0), None)
             if end is not None:
-                return (0, end * 60)
-        if len(hours) >= 2:
-            h1, h2 = hours[0], hours[1]
-            # fix PM context: "中午12点到下午1点" → h2=1 should be 13
-            if h1 >= 12 and h2 < 12 and ("下午" in text or "中午" in text):
-                h2 += 12
-            return (h1 * 60, h2 * 60)
+                return (0, end)
+        if len(minutes) >= 2:
+            m1, m2 = minutes[0], minutes[1]
+            # fix PM context: "十一点半到下午一点半" → h2=1 should be 13
+            h1, h2 = m1 // 60, m2 // 60
+            if h2 < h1 and h2 < 12 and ("下午" in text or "中午" in text):
+                m2 += 12 * 60
+            return (m1, m2)
         return None
 
     @staticmethod
