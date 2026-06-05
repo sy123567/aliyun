@@ -111,7 +111,14 @@ class DriverRules:
         """每日开工前在 00:00 起需要的连续静止分钟数。"""
         block = self.daily_rest_minutes
         if self.rest_window is not None:
-            block = max(block, self.rest_window[1])
+            rw_start, rw_end = self.rest_window
+            # Only use rest_window end as day_rest_block for overnight windows
+            # (end < start means it wraps around midnight, e.g. 22:00-06:00 → (0,360)).
+            # For daytime windows (e.g. 11:00-13:30 → (660,810)), the no_drive_windows
+            # handles enforcement; we must NOT inflate day_rest_block or the driver
+            # will idle the entire morning.
+            if rw_end <= rw_start or rw_start == 0:
+                block = max(block, rw_end)
         if self.no_drive_until_minute is not None:
             block = max(block, self.no_drive_until_minute)
         return block
@@ -317,7 +324,12 @@ class ModelDecisionService:
         strand = self._anti_strand(driver_id, rules, plan, now, lat, lng, day, hard_end)
         if strand is not None:
             return strand
-        return self._wait(max(day_end - now, 1))
+        # (E'') Instead of idling until day end, wait 2-4 hours and retry.
+        # This avoids wasting entire days when cargo becomes available later.
+        remaining = day_end - now
+        if remaining > 240:
+            return self._wait(180)  # wait 3 hours then retry
+        return self._wait(max(remaining, 1))
 
     def _next_day_is_ordinary(self, rules, plan, day) -> bool:
         nxt = day + 1
@@ -396,6 +408,26 @@ class ModelDecisionService:
                 best, best_score, best_is_required, best_pickup_km = (cargo, score, True, pkm)
             elif is_req == best_is_required and score > best_score:
                 best, best_score, best_is_required, best_pickup_km = (cargo, score, is_req, pkm)
+        # Widen search if k=60 found no compliant order — try k=200 for a larger radius
+        if best is None:
+            cargo_resp2 = self._api.query_cargo(driver_id=driver_id, latitude=lat, longitude=lng, k=200)
+            items2 = cargo_resp2.get("items", [])
+            now = int(self._api.get_driver_status(driver_id)["simulation_progress_minutes"])
+            for item in items2:
+                cargo = item.get("cargo", {})
+                ev = self._evaluate_cargo(cargo, item, rules, blackout_regions, now, day_end, lat, lng)
+                if ev is None:
+                    continue
+                net, touches_required, occupied, pkm = ev
+                if rules.monthly_deadhead_max_km is not None:
+                    if plan["total_deadhead_km"] + pkm > rules.monthly_deadhead_max_km:
+                        continue
+                score = net / occupied
+                is_req = bool(need_zeng and touches_required)
+                if is_req and not best_is_required:
+                    best, best_score, best_is_required, best_pickup_km = (cargo, score, True, pkm)
+                elif is_req == best_is_required and score > best_score:
+                    best, best_score, best_is_required, best_pickup_km = (cargo, score, is_req, pkm)
         if best is None:
             return None
         if best_is_required:
@@ -412,9 +444,10 @@ class ModelDecisionService:
         idle the whole day. Scan a wide radius for the best order that becomes workable
         *after a single reposition to its pickup*, and move toward it. The reposition
         deadhead is already folded into `net`, and the post-reposition pickup is ~0 km,
-        so the deadhead cap is never tripped (penalty stays 0). At most one reposition
-        per day; never on a planned off day (handled before this point)."""
-        if day in plan["strand_repo"]:
+        so the deadhead cap is never tripped (penalty stays 0). Allow up to 2 repositions
+        per day to avoid wasting entire days when first target has no cargo."""
+        strand_count = plan.get("strand_count", {}).get(day, 0)
+        if strand_count >= 2:
             return None
         if day_end - now < _STRAND_MIN_BUDGET:
             return None
@@ -434,6 +467,8 @@ class ModelDecisionService:
         if best_target is None:
             return None
         plan["strand_repo"].add(day)
+        plan.setdefault("strand_count", {})
+        plan["strand_count"][day] = plan["strand_count"].get(day, 0) + 1
         return self._reposition(best_target[0], best_target[1])
 
     def _evaluate_relocation(self, cargo, rules, blackout_regions, now, day_end, lat, lng):
@@ -723,6 +758,8 @@ class ModelDecisionService:
                     rules.blackout_coords[region] = loc
                     break
         seen.update(texts)
+        # Dedup avoid/forbidden AFTER supplement so regex-added items are also cleaned
+        self._dedup_avoid_forbidden(rules)
         if self._rules_fingerprint(rules) != before:
             self._logger.info(
                 "parsed rules driver_id=%s rest=%s window=%s off=%s forbid_cat=%s avoid_cat=%s "
@@ -751,6 +788,23 @@ class ModelDecisionService:
                 rules.first_order_before_minute,
             )
         return rules
+
+    def _dedup_avoid_forbidden(self, rules: DriverRules) -> None:
+        """Remove from forbidden_categories anything that semantically overlaps
+        with avoid_categories.  "尽量不拉" means soft-avoid, not hard-reject.
+        Uses substring matching so '石材类' vs '石材' are treated as the same item."""
+        if not rules.avoid_categories or not rules.forbidden_categories:
+            return
+        to_remove: set[str] = set()
+        for fc in rules.forbidden_categories:
+            for ac in rules.avoid_categories:
+                # substring match in either direction
+                if ac in fc or fc in ac:
+                    to_remove.add(fc)
+                    break
+        if to_remove:
+            rules.forbidden_categories -= to_remove
+            self._logger.info("dedup: removed %s from forbidden (overlap with avoid)", to_remove)
 
     # ----------------------------------------------------------- LLM preference parsing
     _PARSE_SYSTEM = (
@@ -1041,16 +1095,16 @@ class ModelDecisionService:
         # Compound grounding: require BOTH a time indicator AND an action keyword
         # to reduce false positives from common words like "休息" or "不接"
         _NDW_TIME_KW = ("点", "时", "小时", "上午", "下午", "中午", "凌晨", "晚上", "早上")
-        _NDW_ACTION_KW = ("不出车", "不接单", "不开车", "不跑车", "不空跑", "不空驶", "不运营", "不工作", "不干活", "不接活", "不赶路", "不许出", "不允许出", "别派活", "别赶路", "停车熄火", "禁止出车", "不准出车", "别开车", "别跑车")
+        _NDW_ACTION_KW = ("不出车", "不接单", "不开车", "不跑车", "不空跑", "不空驶", "不运营", "不工作", "不干活", "不接活", "不赶路", "不许出", "不允许出", "别派活", "别赶路", "停车熄火", "禁止出车", "不准出车", "别开车", "别跑车", "收工", "歇着", "休息", "睡觉", "不动弹", "不跑", "不接")
         _NDW_KW = _NDW_ACTION_KW  # for logging compatibility
-        _AVOID_KW = ("少接", "尽量不", "尽量少", "避免", "不太想", "不愿意", "不喜欢", "最好别", "别给我", "尽量别")
-        _FZ_KW = ("不进", "不去", "禁止进入", "不要去", "别去", "远离", "不往", "不到", "不可进", "不得进", "禁入", "不允许进", "严禁", "禁驶入", "禁止驶入")
-        _BA_KW = ("范围", "区域内", "不超出", "只在", "仅在", "限定", "活动区域", "纬度", "经度")
-        _MV_KW = ("必须去", "一定要到", "每月去", "至少去", "必须到", "必访", "定期去", "经过")
+        _AVOID_KW = ("少接", "尽量不", "尽量少", "避免", "不太想", "不愿意", "不喜欢", "最好别", "别给我", "尽量别", "能不接", "嫌麻烦", "不是绝对", "除非价钱", "能换就换", "不太愿意", "能不碰")
+        _FZ_KW = ("不进", "不去", "禁止进入", "不要去", "不要进", "别去", "远离", "不往", "不到", "不可进", "不得进", "禁入", "不允许进", "严禁", "禁驶入", "禁止驶入", "堵", "修路", "不想跑", "不做")
+        _BA_KW = ("范围", "区域内", "不超出", "只在", "仅在", "限定", "活动区域", "纬度", "经度", "运营区域", "只做", "只跑")
+        _MV_KW = ("必须去", "一定要到", "每月去", "至少去", "必须到", "必访", "定期去", "经过", "起码", "至少", "接够")
         _HOME_KW = ("回家", "到家", "家里", "返回住所", "回住处", "回去", "回到家", "归家", "在家", "家附近", "停在家")
         _DOL_KW = ("不超过", "上限", "最多", "不得超过", "不得多于", "顶多")
-        _HAUL_KW = ("装货", "卸货", "干线", "运距", "里程", "运输距离", "运输", "提货", "交货")
-        _FOB_KW = ("首单", "第一单", "第一趟", "最早", "点前出发", "点前接", "点前开")
+        _HAUL_KW = ("装货", "卸货", "干线", "运距", "里程", "运输距离", "运输", "提货", "交货", "运货", "距离", "公里", "不超", "单趟")
+        _FOB_KW = ("首单", "第一单", "第一趟", "最早", "点前出发", "点前接", "点前开", "点之前", "出第一")
 
         def _text_has_any(keywords: tuple[str, ...]) -> bool:
             return any(kw in all_text for kw in keywords)
@@ -1392,7 +1446,8 @@ class ModelDecisionService:
             km = self._parse_distance_km(text)
             if km and rules.pickup_max_km is None:
                 rules.pickup_max_km = km
-        # forbidden category: patterns like "X的活/货...干不了/推掉/不接/不拉"
+        # forbidden/avoid category: patterns like "X的活/货...干不了/推掉/不接/不拉"
+        _is_soft = any(kw in text for kw in ("尽量不", "尽量少", "尽量别", "最好别", "不太想", "不愿意"))
         cat_m = re.search(
             r"[\"\"「]?([\u4e00-\u9fa5]{2,6}?)[\"\"」]?"
             r"(?:的活|的货|货源|类货|这类|那类).*?"
@@ -1403,7 +1458,10 @@ class ModelDecisionService:
             cat_val = cat_m.group(1)
             cat_val = re.sub(r"^(?:凡是|所有|一切|任何)", "", cat_val).strip()
             if cat_val and not self._REGION_HINT_RE.search(cat_val):
-                rules.forbidden_categories.add(cat_val)
+                if _is_soft:
+                    rules.avoid_categories.add(cat_val)
+                else:
+                    rules.forbidden_categories.add(cat_val)
             elif cat_val:
                 cleaned = self._clean_region_name(cat_val)
                 if cleaned:
@@ -1417,7 +1475,10 @@ class ModelDecisionService:
         if cat_m2:
             cat_val2 = re.sub(r"^(?:凡是|所有|一切|任何)", "", cat_m2.group(1)).strip()
             if cat_val2:
-                rules.forbidden_categories.add(cat_val2)
+                if _is_soft:
+                    rules.avoid_categories.add(cat_val2)
+                else:
+                    rules.forbidden_categories.add(cat_val2)
         # forbidden region: "在X的货...一律不接/不要/不跑/不去"
         reg_m = re.search(
             r"(?:装货地|卸货地|目的地)?在[\"\"「]?([\u4e00-\u9fa5]{2,4})[\"\"」]?"
@@ -1577,11 +1638,15 @@ class ModelDecisionService:
             cnt = self._parse_cn_count(text)
             if cnt:
                 rules.off_days_min = max(rules.off_days_min, cnt)
-        # forbidden category: "X这类活儿...干不了" / "凡是X货源...推掉"
+        # forbidden/avoid category: "X这类活儿...干不了" / "凡是X货源...推掉"
+        _is_soft2 = any(kw in text for kw in ("尽量不", "尽量少", "尽量别", "最好别", "不太想", "不愿意"))
         if ("干不了" in text or "推掉" in text or ("一律不接" in text and "货源" not in text[:0])) and "扣" in text:
             cat = self._parse_forbidden_category(text)
             if cat:
-                rules.forbidden_categories.add(cat)
+                if _is_soft2:
+                    rules.avoid_categories.add(cat)
+                else:
+                    rules.forbidden_categories.add(cat)
         # forbidden region: "装货地或卸货地在X的货,我一律不接"
         m = re.search(r"在([\u4e00-\u9fa5]{2,4}?)的货[，,]?\s*我一律不接", text)
         if m:
@@ -1644,8 +1709,8 @@ class ModelDecisionService:
             dol_m = re.search(r"(?:不超过|不得超过|最多|上限|顶多)\s*(?:跑|接)?\s*([一二两三四五六七八九十\d]+)\s*(?:个)?\s*(?:单|趟)", text)
             if dol_m:
                 rules.daily_order_limit = _cn_to_int(dol_m.group(1))
-        # haul_max_km: "干线距离不超过N公里"
-        if rules.haul_max_km is None and ("干线" in text or "单笔" in text) and "公里" in text:
+        # haul_max_km: "干线距离不超过N公里" / "单趟运距不能超过N公里" / "运货距离最多N公里"
+        if rules.haul_max_km is None and ("干线" in text or "单笔" in text or "单趟" in text or "运距" in text or "运货" in text) and "公里" in text:
             hm_m = re.search(r"(?:不超过|不得超过|上限)\s*([零一二两三四五六七八九十百千\d]+)\s*公里", text)
             if hm_m:
                 rules.haul_max_km = float(_cn_to_int(hm_m.group(1)))
