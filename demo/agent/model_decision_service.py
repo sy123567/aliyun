@@ -245,36 +245,48 @@ class ModelDecisionService:
                 return self._wait(day_end - now)
 
         # (D3) no_drive_windows: if current time-of-day falls inside a no-drive
-        # window, idle until the window ends.
+        # window, idle until the window ends.  Skip windows that are fully covered
+        # by rest_window to avoid double-idle.
         for ws, we in rules.no_drive_windows:
+            if rules.rest_window is not None:
+                rws, rwe = rules.rest_window
+                if rws <= ws and rwe >= min(we, DAY_MINUTES):
+                    continue  # already covered by rest_window
             we_today = we if we <= DAY_MINUTES else DAY_MINUTES
             if ws <= tod < we_today:
                 return self._wait(we_today - tod)
 
         # (D4) must_visit: proactively go to must-visit locations if not enough
-        # visits have been accumulated.  Prioritise on days with no other events.
+        # visits have been accumulated.  Only navigate when urgency is very high
+        # (remaining days == still_needed) AND coordinates are explicitly from text
+        # (to avoid LLM-hallucinated must_visit wasting entire days).
         for i, mv in enumerate(rules.must_visit):
             visited = plan["must_visit_days"].setdefault(i, set())
             remaining_days = MONTH_DAYS - day
             still_needed = mv["required_days"] - len(visited)
-            if still_needed > 0 and remaining_days <= still_needed + 2:
+            if still_needed > 0 and remaining_days <= still_needed:
                 dist = _haversine_km(lat, lng, mv["lat"], mv["lng"])
                 if dist <= mv.get("radius_km", 1.0):
                     visited.add(day)
-                elif now + _travel_minutes(dist) <= day_end:
+                elif dist < 150 and now + _travel_minutes(dist) <= day_end:
                     return self._reposition(mv["lat"], mv["lng"])
 
         # (D5) home_rule: reposition to home before cutoff, idle until morning.
+        # Only enforce when home coordinates were explicitly found in preference text.
         if rules.home_by_minute is not None and rules.home_lat is not None and day not in plan["home_done"]:
             if tod >= rules.home_by_minute:
                 plan["home_done"].add(day)
                 dist = _haversine_km(lat, lng, rules.home_lat, rules.home_lng or 0)
                 if dist > rules.home_radius_km:
-                    return self._reposition(rules.home_lat, rules.home_lng or 0)
+                    if dist < 100:  # only reposition if reasonably close
+                        return self._reposition(rules.home_lat, rules.home_lng or 0)
+                    else:
+                        return self._wait(day_end - now)
                 return self._wait(day_end - now)
             # If close to home_by_minute and far from home, start heading home
             travel_to_home = _travel_minutes(_haversine_km(lat, lng, rules.home_lat, rules.home_lng or 0))
-            if tod + travel_to_home >= rules.home_by_minute and _haversine_km(lat, lng, rules.home_lat, rules.home_lng or 0) > rules.home_radius_km:
+            dist_home = _haversine_km(lat, lng, rules.home_lat, rules.home_lng or 0)
+            if tod + travel_to_home >= rules.home_by_minute and dist_home > rules.home_radius_km and dist_home < 100:
                 plan["home_done"].add(day)
                 return self._reposition(rules.home_lat, rules.home_lng or 0)
 
@@ -284,9 +296,13 @@ class ModelDecisionService:
         # the next day is an ordinary working day — never crossing into an off day,
         # blackout day or a dated-event day.
         hard_end = day_end
-        # For home_rule, don't accept orders that would finish after home_by_minute
+        # For home_rule, give a buffer before home_by_minute instead of hard-cutting.
+        # Allow orders that finish up to 60 min before home_by_minute (leaves time to travel home).
         if rules.home_by_minute is not None and day not in plan.get("home_done", set()):
-            hard_end = min(hard_end, day_start + rules.home_by_minute)
+            buffer = max(60, _travel_minutes(rules.home_radius_km * 5) if rules.home_lat else 60)
+            cutoff = day_start + rules.home_by_minute - buffer
+            if cutoff > now:
+                hard_end = min(hard_end, cutoff)
         if rules.rest_window is None and rules.daily_rest_minutes > 0:
             if self._next_day_is_ordinary(rules, plan, day):
                 hard_end = max(hard_end, day_end + (DAY_MINUTES - rules.day_rest_block))
@@ -428,8 +444,8 @@ class ModelDecisionService:
         name = str(cargo.get("cargo_name", ""))
         if self._is_forbidden_cargo(name, rules.forbidden_categories):
             return None
-        if self._is_forbidden_cargo(name, rules.avoid_categories):
-            return None
+        # avoid_categories: soft penalty for relocation too
+        avoid_penalty = 0.5 if self._is_forbidden_cargo(name, rules.avoid_categories) else 1.0
         start = cargo.get("start") or {}
         end = cargo.get("end") or {}
         scity = str(start.get("city", ""))
@@ -449,14 +465,19 @@ class ModelDecisionService:
                 if _haversine_km(slat, slng, rlat, rlng) < 60 or _haversine_km(elat, elng, rlat, rlng) < 60:
                     return None
         for fz_lat, fz_lng, fz_r in rules.forbidden_zones:
+            if not (18 <= fz_lat <= 55 and 70 <= fz_lng <= 140):
+                continue
             if _haversine_km(slat, slng, fz_lat, fz_lng) < fz_r or _haversine_km(elat, elng, fz_lat, fz_lng) < fz_r:
                 return None
         if rules.bounded_area is not None:
             la_min, la_max, ln_min, ln_max = rules.bounded_area
-            if not (la_min <= slat <= la_max and ln_min <= slng <= ln_max):
-                return None
-            if not (la_min <= elat <= la_max and ln_min <= elng <= ln_max):
-                return None
+            area_lat_span = la_max - la_min
+            area_lng_span = ln_max - ln_min
+            if area_lat_span >= 0.5 and area_lng_span >= 0.5 and 18 <= la_min and la_max <= 55 and 70 <= ln_min and ln_max <= 140:
+                if not (la_min <= slat <= la_max and ln_min <= slng <= ln_max):
+                    return None
+                if not (la_min <= elat <= la_max and ln_min <= elng <= ln_max):
+                    return None
         move_km = _haversine_km(lat, lng, slat, slng)
         arrival = now + (_travel_minutes(move_km) if move_km > 1e-6 else 0)
         load_window = cargo.get("load_time")
@@ -479,14 +500,15 @@ class ModelDecisionService:
         net = price - COST_PER_KM * (move_km + haul_km)
         if net <= 0:
             return None
+        net *= avoid_penalty
         return net, slat, slng
 
     def _evaluate_cargo(self, cargo, item, rules, blackout_regions, now, day_end, lat, lng):
         name = str(cargo.get("cargo_name", ""))
         if self._is_forbidden_cargo(name, rules.forbidden_categories):
             return None
-        if self._is_forbidden_cargo(name, rules.avoid_categories):
-            return None
+        # avoid_categories: soft penalty (50% score reduction) rather than hard rejection
+        avoid_penalty = 0.5 if self._is_forbidden_cargo(name, rules.avoid_categories) else 1.0
         start = cargo.get("start") or {}
         end = cargo.get("end") or {}
         scity = str(start.get("city", ""))
@@ -506,16 +528,24 @@ class ModelDecisionService:
                 if _haversine_km(slat, slng, rlat, rlng) < 60 or _haversine_km(elat, elng, rlat, rlng) < 60:
                     return None
         # forbidden_zones: circle-zone check on pickup/dropoff
+        # Only enforce if coordinates look reasonable (latitude 18-55, longitude 70-140 for China)
         for fz_lat, fz_lng, fz_r in rules.forbidden_zones:
+            if not (18 <= fz_lat <= 55 and 70 <= fz_lng <= 140):
+                continue  # likely hallucinated coordinates
             if _haversine_km(slat, slng, fz_lat, fz_lng) < fz_r or _haversine_km(elat, elng, fz_lat, fz_lng) < fz_r:
                 return None
         # bounded_area: only accept orders within operating bounds
+        # Only enforce if the area looks reasonable (not too small / not covering all of China)
         if rules.bounded_area is not None:
             la_min, la_max, ln_min, ln_max = rules.bounded_area
-            if not (la_min <= slat <= la_max and ln_min <= slng <= ln_max):
-                return None
-            if not (la_min <= elat <= la_max and ln_min <= elng <= ln_max):
-                return None
+            area_lat_span = la_max - la_min
+            area_lng_span = ln_max - ln_min
+            # Skip if area is unreasonably small (<0.5 degree) or coordinates out of China range
+            if area_lat_span >= 0.5 and area_lng_span >= 0.5 and 18 <= la_min and la_max <= 55 and 70 <= ln_min and ln_max <= 140:
+                if not (la_min <= slat <= la_max and ln_min <= slng <= ln_max):
+                    return None
+                if not (la_min <= elat <= la_max and ln_min <= elng <= ln_max):
+                    return None
         pickup_km = _haversine_km(lat, lng, slat, slng)
         if rules.pickup_max_km is not None and pickup_km > rules.pickup_max_km:
             return None
@@ -539,9 +569,14 @@ class ModelDecisionService:
         if rules.haul_max_km is not None and haul_km > rules.haul_max_km:
             return None
         # no_drive_windows: check if order execution overlaps a no-drive window
+        # Skip windows fully covered by rest_window (already handled in schedule)
         _, start_tod = divmod(now, DAY_MINUTES)
         _, finish_tod = divmod(finish, DAY_MINUTES)
         for ws, we in rules.no_drive_windows:
+            if rules.rest_window is not None:
+                rws, rwe = rules.rest_window
+                if rws <= ws and rwe >= min(we, DAY_MINUTES):
+                    continue  # already covered by rest_window
             we_clamp = min(we, DAY_MINUTES)
             if start_tod < we_clamp and finish_tod > ws:
                 return None
@@ -549,6 +584,8 @@ class ModelDecisionService:
         net = price - COST_PER_KM * (pickup_km + haul_km)
         if net <= 0:
             return None
+        # Apply avoid_categories soft penalty
+        net *= avoid_penalty
         touches_required = False
         if rules.required_region is not None:
             region = rules.required_region[0]
@@ -760,7 +797,8 @@ class ModelDecisionService:
         "forbidden_regions 只放纯地名（惠州、深圳等），不加任何修饰词。\n"
         "6) **dated_single 和 dated_route 惩罚最高，必须仔细抽取，坐标必须正确。**\n"
         "7) **极其重要**：只抽取文本中**明确提到**的约束。如果文本没有提到回家/活动范围/禁入区域/接单上限等，"
-        "对应字段**必须**为null或空数组。宁可漏掉也绝不臆造。错误的约束比缺少约束惩罚更大。\n"
+        "对应字段**必须**为null或空数组。宁可漏掉也绝不臆造。**错误的约束比缺少约束惩罚高10倍。**"
+        "特别是：forbidden_zones/bounded_area/must_visit/home_rule这些高风险字段，除非文本中有非常明确的描述和坐标，否则一律为null/空数组。\n"
         "8) 同一偏好可能同时包含多种约束（如禁区域+禁品类+日期事件+回家规则），全部抽取。\n"
         '9) "不接单不空跑/不空驶"类约束，如果含时间段→填no_drive_windows；'
         '如果同时含"休息/睡觉"→也填rest_window或daily_rest_hours。\n'
@@ -1000,7 +1038,11 @@ class ModelDecisionService:
         # --- new rule types from old 10-driver version ---
         # Text-grounding: only accept a new rule if the preference text contains
         # matching keywords.  This prevents LLM hallucinations on unseen drivers.
-        _NDW_KW = ("不出车", "不接单", "不开车", "不跑车", "不空跑", "不空驶", "不运营", "休息", "不工作", "不干活", "不接", "不赶", "不许", "不允许", "别派", "别赶", "停车熄火", "禁止出", "不准出", "别开车", "别跑车")
+        # Compound grounding: require BOTH a time indicator AND an action keyword
+        # to reduce false positives from common words like "休息" or "不接"
+        _NDW_TIME_KW = ("点", "时", "小时", "上午", "下午", "中午", "凌晨", "晚上", "早上")
+        _NDW_ACTION_KW = ("不出车", "不接单", "不开车", "不跑车", "不空跑", "不空驶", "不运营", "不工作", "不干活", "不接活", "不赶路", "不许出", "不允许出", "别派活", "别赶路", "停车熄火", "禁止出车", "不准出车", "别开车", "别跑车")
+        _NDW_KW = _NDW_ACTION_KW  # for logging compatibility
         _AVOID_KW = ("少接", "尽量不", "尽量少", "避免", "不太想", "不愿意", "不喜欢", "最好别", "别给我", "尽量别")
         _FZ_KW = ("不进", "不去", "禁止进入", "不要去", "别去", "远离", "不往", "不到", "不可进", "不得进", "禁入", "不允许进", "严禁", "禁驶入", "禁止驶入")
         _BA_KW = ("范围", "区域内", "不超出", "只在", "仅在", "限定", "活动区域", "纬度", "经度")
@@ -1013,8 +1055,14 @@ class ModelDecisionService:
         def _text_has_any(keywords: tuple[str, ...]) -> bool:
             return any(kw in all_text for kw in keywords)
 
-        # no_drive_windows — grounded
-        if _text_has_any(_NDW_KW):
+        def _ndw_grounded() -> bool:
+            """no_drive_windows requires BOTH time + action keywords."""
+            has_time = any(kw in all_text for kw in _NDW_TIME_KW)
+            has_action = any(kw in all_text for kw in _NDW_ACTION_KW)
+            return has_time and has_action
+
+        # no_drive_windows — grounded with compound check
+        if _ndw_grounded():
             for ndw in data.get("no_drive_windows") or []:
                 if not isinstance(ndw, dict):
                     continue
@@ -1044,7 +1092,7 @@ class ModelDecisionService:
         elif data.get("avoid_categories"):
             self._logger.info("llm grounding: rejected avoid_categories (no keywords in text)")
 
-        # forbidden_zones — grounded
+        # forbidden_zones — grounded + coordinate validation
         if _text_has_any(_FZ_KW):
             for fz in data.get("forbidden_zones") or []:
                 if not isinstance(fz, dict):
@@ -1055,27 +1103,45 @@ class ModelDecisionService:
                     continue
                 if flat > 90 and flng < 90:
                     flat, flng = flng, flat
+                # Validate coordinates are in China range
+                if not (18 <= flat <= 55 and 70 <= flng <= 140):
+                    self._logger.info("llm grounding: rejected forbidden_zone (%.2f,%.2f) out of range", flat, flng)
+                    continue
+                # Validate radius is reasonable (not too large)
+                if fr > 100:
+                    self._logger.info("llm grounding: clamped forbidden_zone radius %.0f→100 km", fr)
+                    fr = 100
                 rules.forbidden_zones.append((flat, flng, fr))
         elif data.get("forbidden_zones"):
             self._logger.info("llm grounding: rejected forbidden_zones (no keywords in text)")
 
-        # bounded_area — grounded
+        # bounded_area — grounded + coordinate validation
         ba = data.get("bounded_area")
         if isinstance(ba, dict) and rules.bounded_area is None:
-            if _text_has_any(_BA_KW):
+            # Require BOTH keyword AND explicit lat/lng numbers in the text
+            has_kw = _text_has_any(_BA_KW)
+            has_coords = bool(re.search(r'(?:纬度|经度|[纬经]\s*[0-9]|\d{2,3}\.\d)', all_text))
+            if has_kw and has_coords:
                 try:
                     la_min = float(ba["lat_min"])
                     la_max = float(ba["lat_max"])
                     ln_min = float(ba["lng_min"])
                     ln_max = float(ba["lng_max"])
-                    rules.bounded_area = (la_min, la_max, ln_min, ln_max)
+                    # Validate range
+                    if la_max - la_min >= 0.5 and ln_max - ln_min >= 0.5 and 18 <= la_min and la_max <= 55 and 70 <= ln_min and ln_max <= 140:
+                        rules.bounded_area = (la_min, la_max, ln_min, ln_max)
+                    else:
+                        self._logger.info("llm grounding: rejected bounded_area (unreasonable range)")
                 except (TypeError, ValueError, KeyError):
                     pass
+            elif has_kw:
+                self._logger.info("llm grounding: rejected bounded_area (keywords found but no explicit coordinates)")
             else:
                 self._logger.info("llm grounding: rejected bounded_area (no keywords in text)")
 
-        # must_visit — grounded
+        # must_visit — grounded + coordinate validation
         if _text_has_any(_MV_KW):
+            has_coords = bool(re.search(r'\d{2,3}\.\d{1,}', all_text))
             for mv in data.get("must_visit") or []:
                 if not isinstance(mv, dict):
                     continue
@@ -1087,6 +1153,13 @@ class ModelDecisionService:
                     continue
                 if mlat > 90 and mlng < 90:
                     mlat, mlng = mlng, mlat
+                # Validate coordinates
+                if not (18 <= mlat <= 55 and 70 <= mlng <= 140):
+                    self._logger.info("llm grounding: rejected must_visit (coords out of range: %.2f,%.2f)", mlat, mlng)
+                    continue
+                if not has_coords:
+                    self._logger.info("llm grounding: rejected must_visit (no explicit coords in text)")
+                    continue
                 rules.must_visit.append({"lat": mlat, "lng": mlng, "radius_km": mr, "required_days": mrd})
         elif data.get("must_visit"):
             self._logger.info("llm grounding: rejected must_visit (no keywords in text)")
@@ -1130,10 +1203,15 @@ class ModelDecisionService:
         elif fob is not None:
             self._logger.info("llm grounding: rejected first_order_before_hour=%s (no keywords in text)", fob)
 
-        # home_rule — grounded
+        # home_rule — grounded + coordinate validation
+        # Require both home keywords AND explicit coordinates in text to reduce
+        # hallucination risk (home_rule with wrong coordinates is very costly).
         hr = data.get("home_rule")
         if isinstance(hr, dict) and rules.home_lat is None:
-            if _text_has_any(_HOME_KW):
+            has_home_kw = _text_has_any(_HOME_KW)
+            # Check if text contains explicit coordinate-like numbers (e.g., "23.10" or "(23.10,113.50)")
+            has_coords_in_text = bool(re.search(r'\d{2,3}\.\d{1,}', all_text))
+            if has_home_kw and has_coords_in_text:
                 try:
                     hlat, hlng = float(hr["lat"]), float(hr["lng"])
                 except (TypeError, ValueError, KeyError):
@@ -1141,15 +1219,21 @@ class ModelDecisionService:
                 if hlat is not None and hlng is not None:
                     if hlat > 90 and hlng < 90:
                         hlat, hlng = hlng, hlat
-                    rules.home_lat = hlat
-                    rules.home_lng = hlng
-                    rules.home_radius_km = float(hr.get("radius_km", 1.0))
-                    hby = hr.get("home_by_hour")
-                    if isinstance(hby, (int, float)) and 0 < hby <= 24:
-                        rules.home_by_minute = int(hby) * 60
-                    nduh = hr.get("no_drive_until_hour")
-                    if isinstance(nduh, (int, float)) and 0 < nduh <= 24:
-                        rules.no_drive_until_minute = int(nduh) * 60
+                    # Validate coordinates in China range
+                    if 18 <= hlat <= 55 and 70 <= hlng <= 140:
+                        rules.home_lat = hlat
+                        rules.home_lng = hlng
+                        rules.home_radius_km = float(hr.get("radius_km", 1.0))
+                        hby = hr.get("home_by_hour")
+                        if isinstance(hby, (int, float)) and 0 < hby <= 24:
+                            rules.home_by_minute = int(hby) * 60
+                        nduh = hr.get("no_drive_until_hour")
+                        if isinstance(nduh, (int, float)) and 0 < nduh <= 24:
+                            rules.no_drive_until_minute = int(nduh) * 60
+                    else:
+                        self._logger.info("llm grounding: rejected home_rule (coordinates out of range: %.2f,%.2f)", hlat, hlng)
+            elif has_home_kw:
+                self._logger.info("llm grounding: rejected home_rule (keywords found but no explicit coordinates in text)")
             else:
                 self._logger.info("llm grounding: rejected home_rule (no keywords in text)")
 
