@@ -111,7 +111,14 @@ class DriverRules:
         """每日开工前在 00:00 起需要的连续静止分钟数。"""
         block = self.daily_rest_minutes
         if self.rest_window is not None:
-            block = max(block, self.rest_window[1])
+            rw_start, rw_end = self.rest_window
+            # Only use rest_window end as day_rest_block for overnight windows
+            # (end < start means it wraps around midnight, e.g. 22:00-06:00 → (0,360)).
+            # For daytime windows (e.g. 11:00-13:30 → (660,810)), the no_drive_windows
+            # handles enforcement; we must NOT inflate day_rest_block or the driver
+            # will idle the entire morning.
+            if rw_end <= rw_start or rw_start == 0:
+                block = max(block, rw_end)
         if self.no_drive_until_minute is not None:
             block = max(block, self.no_drive_until_minute)
         return block
@@ -723,6 +730,8 @@ class ModelDecisionService:
                     rules.blackout_coords[region] = loc
                     break
         seen.update(texts)
+        # Dedup avoid/forbidden AFTER supplement so regex-added items are also cleaned
+        self._dedup_avoid_forbidden(rules)
         if self._rules_fingerprint(rules) != before:
             self._logger.info(
                 "parsed rules driver_id=%s rest=%s window=%s off=%s forbid_cat=%s avoid_cat=%s "
@@ -751,6 +760,23 @@ class ModelDecisionService:
                 rules.first_order_before_minute,
             )
         return rules
+
+    def _dedup_avoid_forbidden(self, rules: DriverRules) -> None:
+        """Remove from forbidden_categories anything that semantically overlaps
+        with avoid_categories.  "尽量不拉" means soft-avoid, not hard-reject.
+        Uses substring matching so '石材类' vs '石材' are treated as the same item."""
+        if not rules.avoid_categories or not rules.forbidden_categories:
+            return
+        to_remove: set[str] = set()
+        for fc in rules.forbidden_categories:
+            for ac in rules.avoid_categories:
+                # substring match in either direction
+                if ac in fc or fc in ac:
+                    to_remove.add(fc)
+                    break
+        if to_remove:
+            rules.forbidden_categories -= to_remove
+            self._logger.info("dedup: removed %s from forbidden (overlap with avoid)", to_remove)
 
     # ----------------------------------------------------------- LLM preference parsing
     _PARSE_SYSTEM = (
@@ -1044,12 +1070,12 @@ class ModelDecisionService:
         _NDW_ACTION_KW = ("不出车", "不接单", "不开车", "不跑车", "不空跑", "不空驶", "不运营", "不工作", "不干活", "不接活", "不赶路", "不许出", "不允许出", "别派活", "别赶路", "停车熄火", "禁止出车", "不准出车", "别开车", "别跑车")
         _NDW_KW = _NDW_ACTION_KW  # for logging compatibility
         _AVOID_KW = ("少接", "尽量不", "尽量少", "避免", "不太想", "不愿意", "不喜欢", "最好别", "别给我", "尽量别")
-        _FZ_KW = ("不进", "不去", "禁止进入", "不要去", "别去", "远离", "不往", "不到", "不可进", "不得进", "禁入", "不允许进", "严禁", "禁驶入", "禁止驶入")
+        _FZ_KW = ("不进", "不去", "禁止进入", "不要去", "不要进", "别去", "远离", "不往", "不到", "不可进", "不得进", "禁入", "不允许进", "严禁", "禁驶入", "禁止驶入", "堵", "修路")
         _BA_KW = ("范围", "区域内", "不超出", "只在", "仅在", "限定", "活动区域", "纬度", "经度")
         _MV_KW = ("必须去", "一定要到", "每月去", "至少去", "必须到", "必访", "定期去", "经过")
         _HOME_KW = ("回家", "到家", "家里", "返回住所", "回住处", "回去", "回到家", "归家", "在家", "家附近", "停在家")
         _DOL_KW = ("不超过", "上限", "最多", "不得超过", "不得多于", "顶多")
-        _HAUL_KW = ("装货", "卸货", "干线", "运距", "里程", "运输距离", "运输", "提货", "交货")
+        _HAUL_KW = ("装货", "卸货", "干线", "运距", "里程", "运输距离", "运输", "提货", "交货", "运货", "距离", "公里", "不超")
         _FOB_KW = ("首单", "第一单", "第一趟", "最早", "点前出发", "点前接", "点前开")
 
         def _text_has_any(keywords: tuple[str, ...]) -> bool:
@@ -1091,6 +1117,8 @@ class ModelDecisionService:
                         self._logger.info("llm grounding: rejected avoid_category '%s' (not in text)", s)
         elif data.get("avoid_categories"):
             self._logger.info("llm grounding: rejected avoid_categories (no keywords in text)")
+
+        # NOTE: avoid/forbidden dedup moved to _dedup_avoid_forbidden (runs after supplement)
 
         # forbidden_zones — grounded + coordinate validation
         if _text_has_any(_FZ_KW):
@@ -1392,7 +1420,9 @@ class ModelDecisionService:
             km = self._parse_distance_km(text)
             if km and rules.pickup_max_km is None:
                 rules.pickup_max_km = km
-        # forbidden category: patterns like "X的活/货...干不了/推掉/不接/不拉"
+        # forbidden/avoid category: patterns like "X的活/货...干不了/推掉/不接/不拉"
+        # If text contains soft-avoid keywords, add to avoid_categories instead of forbidden
+        _is_soft = any(kw in text for kw in ("尽量不", "尽量少", "尽量别", "最好别", "不太想", "不愿意"))
         cat_m = re.search(
             r"[\"\"「]?([\u4e00-\u9fa5]{2,6}?)[\"\"」]?"
             r"(?:的活|的货|货源|类货|这类|那类).*?"
@@ -1403,7 +1433,10 @@ class ModelDecisionService:
             cat_val = cat_m.group(1)
             cat_val = re.sub(r"^(?:凡是|所有|一切|任何)", "", cat_val).strip()
             if cat_val and not self._REGION_HINT_RE.search(cat_val):
-                rules.forbidden_categories.add(cat_val)
+                if _is_soft:
+                    rules.avoid_categories.add(cat_val)
+                else:
+                    rules.forbidden_categories.add(cat_val)
             elif cat_val:
                 cleaned = self._clean_region_name(cat_val)
                 if cleaned:
@@ -1417,7 +1450,10 @@ class ModelDecisionService:
         if cat_m2:
             cat_val2 = re.sub(r"^(?:凡是|所有|一切|任何)", "", cat_m2.group(1)).strip()
             if cat_val2:
-                rules.forbidden_categories.add(cat_val2)
+                if _is_soft:
+                    rules.avoid_categories.add(cat_val2)
+                else:
+                    rules.forbidden_categories.add(cat_val2)
         # forbidden region: "在X的货...一律不接/不要/不跑/不去"
         reg_m = re.search(
             r"(?:装货地|卸货地|目的地)?在[\"\"「]?([\u4e00-\u9fa5]{2,4})[\"\"」]?"
@@ -1577,11 +1613,15 @@ class ModelDecisionService:
             cnt = self._parse_cn_count(text)
             if cnt:
                 rules.off_days_min = max(rules.off_days_min, cnt)
-        # forbidden category: "X这类活儿...干不了" / "凡是X货源...推掉"
+        # forbidden/avoid category: "X这类活儿...干不了" / "凡是X货源...推掉"
+        _is_soft = any(kw in text for kw in ("尽量不", "尽量少", "尽量别", "最好别", "不太想", "不愿意"))
         if ("干不了" in text or "推掉" in text or ("一律不接" in text and "货源" not in text[:0])) and "扣" in text:
             cat = self._parse_forbidden_category(text)
             if cat:
-                rules.forbidden_categories.add(cat)
+                if _is_soft:
+                    rules.avoid_categories.add(cat)
+                else:
+                    rules.forbidden_categories.add(cat)
         # forbidden region: "装货地或卸货地在X的货,我一律不接"
         m = re.search(r"在([\u4e00-\u9fa5]{2,4}?)的货[，,]?\s*我一律不接", text)
         if m:
