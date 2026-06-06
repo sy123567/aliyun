@@ -307,19 +307,15 @@ class ModelDecisionService:
                 dist = _haversine_km(lat, lng, rules.home_lat, rules.home_lng or 0)
                 if dist > rules.home_radius_km:
                     if now + _travel_minutes(dist) <= day_end:
-                        repo = self._planned_reposition(rules, plan, lat, lng, rules.home_lat, rules.home_lng or 0)
-                        if repo is not None:
-                            return repo
+                        return self._reposition(rules.home_lat, rules.home_lng or 0)
                     return self._wait(day_end - now)
                 return self._wait(day_end - now)
             # If close to home_by_minute and far from home, start heading home
             travel_to_home = _travel_minutes(_haversine_km(lat, lng, rules.home_lat, rules.home_lng or 0))
             dist_home = _haversine_km(lat, lng, rules.home_lat, rules.home_lng or 0)
-            if tod + travel_to_home >= rules.home_by_minute and dist_home > rules.home_radius_km:
+            if tod + travel_to_home + 180 >= rules.home_by_minute and dist_home > rules.home_radius_km:
                 plan["home_done"].add(day)
-                repo = self._planned_reposition(rules, plan, lat, lng, rules.home_lat, rules.home_lng or 0)
-                if repo is not None:
-                    return repo
+                return self._reposition(rules.home_lat, rules.home_lng or 0)
 
         # (D6) bounded_area: if the driver is parked OUTSIDE its declared operating
         # area, the cargo query (centred on the driver) only ever returns out-of-area
@@ -388,9 +384,18 @@ class ModelDecisionService:
         if remaining > 240:
             hour_of_day = (now % DAY_MINUTES) // 60
             if 8 <= hour_of_day < 18:
-                return self._wait(90)   # peak hours: retry every 1.5h
+                retry = 90   # peak hours: retry every 1.5h
             else:
-                return self._wait(150)  # off-peak: retry every 2.5h
+                retry = 150  # off-peak: retry every 2.5h
+            if rules.home_by_minute is not None and rules.home_lat is not None and day not in plan.get("home_done", set()):
+                dist_home = _haversine_km(lat, lng, rules.home_lat, rules.home_lng or 0)
+                if dist_home > rules.home_radius_km:
+                    latest_depart = day_start + rules.home_by_minute - _travel_minutes(dist_home) - 180
+                    if latest_depart <= now:
+                        plan["home_done"].add(day)
+                        return self._reposition(rules.home_lat, rules.home_lng or 0)
+                    retry = min(retry, max(1, latest_depart - now))
+            return self._wait(retry)
         return self._wait(max(remaining, 1))
 
     def _next_day_is_ordinary(self, rules, plan, day) -> bool:
@@ -459,7 +464,7 @@ class ModelDecisionService:
         best_pickup_km = 0.0
         for item in items:
             cargo = item.get("cargo", {})
-            ev = self._evaluate_cargo(cargo, item, rules, blackout_regions, now, day_end, lat, lng)
+            ev = self._evaluate_cargo(cargo, item, rules, blackout_regions, plan, now, day_end, lat, lng)
             if ev is None:
                 continue
             net, touches_required, occupied, pkm, hkm = ev
@@ -484,7 +489,7 @@ class ModelDecisionService:
             now = int(self._api.get_driver_status(driver_id)["simulation_progress_minutes"])
             for item in items2:
                 cargo = item.get("cargo", {})
-                ev = self._evaluate_cargo(cargo, item, rules, blackout_regions, now, day_end, lat, lng)
+                ev = self._evaluate_cargo(cargo, item, rules, blackout_regions, plan, now, day_end, lat, lng)
                 if ev is None:
                     continue
                 net, touches_required, occupied, pkm, hkm = ev
@@ -672,7 +677,7 @@ class ModelDecisionService:
         net *= avoid_penalty
         return net, slat, slng
 
-    def _evaluate_cargo(self, cargo, item, rules, blackout_regions, now, day_end, lat, lng):
+    def _evaluate_cargo(self, cargo, item, rules, blackout_regions, plan, now, day_end, lat, lng):
         name = str(cargo.get("cargo_name", ""))
         preference_penalty = 0.0
         if self._is_forbidden_cargo(name, rules.forbidden_categories):
@@ -735,6 +740,21 @@ class ModelDecisionService:
         finish = ready + cost_time
         if finish > day_end:
             return None  # don't cross midnight (keeps rest windows clean)
+        if rules.rest_window is not None:
+            rs, re = rules.rest_window
+            if re <= rs:
+                re += DAY_MINUTES
+            for base in (now // DAY_MINUTES - 1, now // DAY_MINUTES, now // DAY_MINUTES + 1):
+                ws, we = base * DAY_MINUTES + rs, base * DAY_MINUTES + re
+                if now < we and finish > ws:
+                    return None
+        if rules.home_by_minute is not None and rules.home_lat is not None:
+            day = now // DAY_MINUTES
+            deadline = day * DAY_MINUTES + rules.home_by_minute
+            if day not in plan.get("home_done", set()) and now < deadline:
+                travel_home = _travel_minutes(_haversine_km(elat, elng, rules.home_lat, rules.home_lng or 0))
+                if finish + travel_home + 180 > deadline:
+                    return None
         haul_km = _haversine_km(slat, slng, elat, elng)
         # haul_max_km: single-order haul distance limit
         if rules.haul_max_km is not None and haul_km > rules.haul_max_km:
