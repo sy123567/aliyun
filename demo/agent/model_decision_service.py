@@ -240,6 +240,8 @@ class ModelDecisionService:
             if rw_e > rw_s and rw_s > 0:
                 if rw_s <= tod < rw_e:
                     return self._wait(rw_e - tod)
+                if 0 <= rw_s - tod <= 120:
+                    return self._wait(rw_e - tod)
 
         # (C) dated single-stop events (e.g. 盘库).
         for ev in rules.dated_single:
@@ -310,7 +312,10 @@ class ModelDecisionService:
 
         # (D5) home_rule: reposition to home before cutoff, idle until morning.
         # Only enforce when home coordinates were explicitly found in preference text.
-        if rules.home_by_minute is not None and rules.home_lat is not None and day not in plan["home_done"]:
+        if rules.home_by_minute is not None and rules.home_lat is not None and day in plan["home_done"]:
+            return self._wait(day_end - now)
+
+        if rules.home_by_minute is not None and rules.home_lat is not None:
             if tod >= rules.home_by_minute:
                 plan["home_done"].add(day)
                 dist = _haversine_km(lat, lng, rules.home_lat, rules.home_lng or 0)
@@ -379,6 +384,10 @@ class ModelDecisionService:
         order = self._pick_order(driver_id, status, rules, plan, now, lat, lng, day, hard_end)
         if order is not None:
             return order
+        if rules.rest_window is not None:
+            rw_s, rw_e = rules.rest_window
+            if rw_e > rw_s and rw_s > 0 and tod < rw_e and rw_s - tod <= 240:
+                return self._wait(rw_e - tod)
         # (E') anti-stranding: no compliant order is reachable from here, so the driver
         # would otherwise idle the entire day. If a single reposition toward a profitable
         # cargo cluster turns the day productive (the post-reposition pickup is short, so
