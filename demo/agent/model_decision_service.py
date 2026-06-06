@@ -24,6 +24,7 @@ QUERY_SCAN_BATCH_SIZE = 10
 # Minimum remaining minutes in the day worth attempting an anti-stranding reposition:
 # below this there is no time to relocate and still complete an order before day end.
 _STRAND_MIN_BUDGET = 240
+_HOME_RETURN_BUFFER_MIN = 180
 
 SHENZHEN_BBOX = (22.42, 22.89, 113.74, 114.66)  # lat_min, lat_max, lng_min, lng_max
 
@@ -327,7 +328,7 @@ class ModelDecisionService:
             # If close to home_by_minute and far from home, start heading home
             travel_to_home = _travel_minutes(_haversine_km(lat, lng, rules.home_lat, rules.home_lng or 0))
             dist_home = _haversine_km(lat, lng, rules.home_lat, rules.home_lng or 0)
-            if tod + travel_to_home + 180 >= rules.home_by_minute and dist_home > rules.home_radius_km:
+            if tod + travel_to_home + _HOME_RETURN_BUFFER_MIN >= rules.home_by_minute and dist_home > rules.home_radius_km:
                 plan["home_done"].add(day)
                 return self._reposition(rules.home_lat, rules.home_lng or 0)
 
@@ -363,7 +364,7 @@ class ModelDecisionService:
                 if rules.home_by_minute is not None and rules.home_lat is not None and day not in plan.get("home_done", set()):
                     dist_home = _haversine_km(lat, lng, rules.home_lat, rules.home_lng or 0)
                     if dist_home > rules.home_radius_km:
-                        latest_depart = day_start + rules.home_by_minute - _travel_minutes(dist_home) - 180
+                        latest_depart = day_start + rules.home_by_minute - _travel_minutes(dist_home) - _HOME_RETURN_BUFFER_MIN
                         if latest_depart <= now:
                             plan["home_done"].add(day)
                             return self._reposition(rules.home_lat, rules.home_lng or 0)
@@ -416,7 +417,7 @@ class ModelDecisionService:
             if rules.home_by_minute is not None and rules.home_lat is not None and day not in plan.get("home_done", set()):
                 dist_home = _haversine_km(lat, lng, rules.home_lat, rules.home_lng or 0)
                 if dist_home > rules.home_radius_km:
-                    latest_depart = day_start + rules.home_by_minute - _travel_minutes(dist_home) - 180
+                    latest_depart = day_start + rules.home_by_minute - _travel_minutes(dist_home) - _HOME_RETURN_BUFFER_MIN
                     if latest_depart <= now:
                         plan["home_done"].add(day)
                         return self._reposition(rules.home_lat, rules.home_lng or 0)
@@ -779,7 +780,7 @@ class ModelDecisionService:
             deadline = day * DAY_MINUTES + rules.home_by_minute
             if day not in plan.get("home_done", set()) and now < deadline:
                 travel_home = _travel_minutes(_haversine_km(elat, elng, rules.home_lat, rules.home_lng or 0))
-                if finish + travel_home + 180 > deadline:
+                if finish + travel_home + _HOME_RETURN_BUFFER_MIN > deadline:
                     return None
         haul_km = _haversine_km(slat, slng, elat, elng)
         # haul_max_km: single-order haul distance limit
@@ -1295,7 +1296,13 @@ class ModelDecisionService:
         if isinstance(rr, dict):
             reg, md = rr.get("region"), rr.get("min_days")
             if isinstance(reg, str) and reg.strip() and isinstance(md, (int, float)) and md > 0:
-                rules.required_region = (self._clean_region_name(reg), int(md))
+                r = self._clean_region_name(reg)
+                grounded_region = not all_text or r in all_text or _norm_region(r) in all_text
+                grounded_quota = not all_text or any(kw in all_text for kw in ("不同的日子", "不同日子", "接够", "至少", "够"))
+                if grounded_region and grounded_quota:
+                    rules.required_region = (r, int(md))
+                else:
+                    self._logger.info("llm grounding: rejected required_region '%s' (not grounded)", r)
         pk = data.get("pickup_max_km")
         if isinstance(pk, (int, float)) and pk > 0:
             rules.pickup_max_km = float(pk)
@@ -1316,14 +1323,28 @@ class ModelDecisionService:
                     rules.blackout.append((r, days))
                 else:
                     self._logger.info("llm validation: rejected blackout region '%s' (not in texts)", r)
-        for ev in data.get("dated_single") or []:
-            single = self._coerce_single(ev)
-            if single is not None and not any(e["day"] == single["day"] for e in rules.dated_single):
-                rules.dated_single.append(single)
-        for ev in data.get("dated_route") or []:
-            route = self._coerce_route(ev)
-            if route is not None and not any(e["day"] == route["day"] for e in rules.dated_route):
-                rules.dated_route.append(route)
+        dated_has_date = not all_text or bool(re.search(r"(?:\d{1,2}|[零一二两三四五六七八九十百]+)\s*[号日]", all_text))
+        dated_has_coord = not all_text or bool(re.search(r"\d{2,3}\.\d{1,}", all_text))
+        single_grounded = dated_has_date and dated_has_coord and (
+            not all_text or any(kw in all_text for kw in ("盘库", "盘点", "提货", "签收", "检查", "保养", "检修", "办事", "开会", "取东西", "拿货", "交货", "走一趟", "跑一趟", "去一趟", "装货", "卸货"))
+        )
+        route_grounded = dated_has_date and dated_has_coord and (
+            not all_text or any(kw in all_text for kw in ("赴宴", "寿", "赶到", "先到", "先去", "再到", "再去", "然后到", "然后去", "接着到", "接着去"))
+        )
+        if single_grounded:
+            for ev in data.get("dated_single") or []:
+                single = self._coerce_single(ev)
+                if single is not None and not any(e["day"] == single["day"] for e in rules.dated_single):
+                    rules.dated_single.append(single)
+        elif data.get("dated_single"):
+            self._logger.info("llm grounding: rejected dated_single (not grounded)")
+        if route_grounded:
+            for ev in data.get("dated_route") or []:
+                route = self._coerce_route(ev)
+                if route is not None and not any(e["day"] == route["day"] for e in rules.dated_route):
+                    rules.dated_route.append(route)
+        elif data.get("dated_route"):
+            self._logger.info("llm grounding: rejected dated_route (not grounded)")
 
         # --- new rule types from old 10-driver version ---
         # Text-grounding: only accept a new rule if the preference text contains
@@ -1464,10 +1485,13 @@ class ModelDecisionService:
             else:
                 self._logger.info("llm grounding: rejected haul_max_km=%s (no keywords in text)", hm)
 
-        # monthly_deadhead_max_km (keep as before — low risk, rarely hallucinated)
+        # monthly_deadhead_max_km — grounded
         mdh = data.get("monthly_deadhead_max_km")
         if isinstance(mdh, (int, float)) and mdh > 0:
-            rules.monthly_deadhead_max_km = float(mdh)
+            if ("月" in all_text or "累计" in all_text) and "空驶" in all_text and "公里" in all_text:
+                rules.monthly_deadhead_max_km = float(mdh)
+            else:
+                self._logger.info("llm grounding: rejected monthly_deadhead_max_km=%s (not grounded)", mdh)
 
         # daily_order_limit — grounded
         dol = data.get("daily_order_limit")
