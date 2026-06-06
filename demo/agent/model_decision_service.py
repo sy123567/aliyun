@@ -297,6 +297,31 @@ class ModelDecisionService:
                 plan["home_done"].add(day)
                 return self._reposition(rules.home_lat, rules.home_lng or 0)
 
+        # (D6) bounded_area: if the driver is parked OUTSIDE its declared operating
+        # area, the cargo query (centred on the driver) only ever returns out-of-area
+        # cargo, all of which is rejected — so the driver idles the entire month and
+        # earns nothing. Reposition once into the area so subsequent _pick_order calls
+        # can find compliant in-area cargo. Only triggers for a grounded, reasonably
+        # sized area (same guard as the order-acceptance check) to avoid acting on a
+        # hallucinated box.
+        if rules.bounded_area is not None:
+            la_min, la_max, ln_min, ln_max = rules.bounded_area
+            lat_span, lng_span = la_max - la_min, ln_max - ln_min
+            reasonable = (lat_span >= 0.5 and lng_span >= 0.5 and
+                          18 <= la_min and la_max <= 55 and 70 <= ln_min and ln_max <= 140)
+            outside = not (la_min <= lat <= la_max and ln_min <= lng <= ln_max)
+            if reasonable and outside and day not in plan.setdefault("bounded_repo", set()):
+                # Clamp the current position onto the box, then nudge 5% toward the
+                # centre so the driver lands clearly inside.
+                clat, clng = (la_min + la_max) / 2, (ln_min + ln_max) / 2
+                tgt_lat = min(max(lat, la_min), la_max)
+                tgt_lng = min(max(lng, ln_min), ln_max)
+                tgt_lat += (clat - tgt_lat) * 0.05
+                tgt_lng += (clng - tgt_lng) * 0.05
+                if now + _travel_minutes(_haversine_km(lat, lng, tgt_lat, tgt_lng)) <= day_end:
+                    plan["bounded_repo"].add(day)
+                    return self._reposition(tgt_lat, tgt_lng)
+
         # (E) take the best compliant order, else idle to day end. A flexible-rest
         # driver may let the day's *last* order finish past midnight (up to a cap that
         # still leaves room for a full rest block inside the next day), but only when
@@ -1102,9 +1127,9 @@ class ModelDecisionService:
         _BA_KW = ("范围", "区域内", "不超出", "只在", "仅在", "限定", "活动区域", "纬度", "经度", "运营区域", "只做", "只跑")
         _MV_KW = ("必须去", "一定要到", "每月去", "至少去", "必须到", "必访", "定期去", "经过", "起码", "至少", "接够")
         _HOME_KW = ("回家", "到家", "家里", "返回住所", "回住处", "回去", "回到家", "归家", "在家", "家附近", "停在家")
-        _DOL_KW = ("不超过", "上限", "最多", "不得超过", "不得多于", "顶多")
+        _DOL_KW = ("不超过", "上限", "最多", "不得超过", "不得多于", "顶多", "封顶", "单以内", "趟以内")
         _HAUL_KW = ("装货", "卸货", "干线", "运距", "里程", "运输距离", "运输", "提货", "交货", "运货", "距离", "公里", "不超", "单趟")
-        _FOB_KW = ("首单", "第一单", "第一趟", "最早", "点前出发", "点前接", "点前开", "点之前", "出第一")
+        _FOB_KW = ("首单", "第一单", "第一趟", "最早", "点前出发", "点前接", "点前开", "点之前", "出第一", "还没接单", "还不接单", "前要出", "前必须接", "前得接")
 
         def _text_has_any(keywords: tuple[str, ...]) -> bool:
             return any(kw in all_text for kw in keywords)
