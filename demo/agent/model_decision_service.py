@@ -23,12 +23,6 @@ COST_PER_KM = 1.5
 # Minimum remaining minutes in the day worth attempting an anti-stranding reposition:
 # below this there is no time to relocate and still complete an order before day end.
 _STRAND_MIN_BUDGET = 240
-# Cargo centroid: approximate centre of the 500k cargo dataset (Pearl River Delta).
-_CARGO_CENTROID = (22.80, 113.50)
-# Maximum rest_window / no_drive_window duration in minutes.
-# Safety cap to prevent extreme values (e.g. 22-hour rest windows) from making
-# a driver completely idle.  Real eval data should never trigger this.
-_MAX_REST_WINDOW_MINUTES = 960  # 16 hours
 
 SHENZHEN_BBOX = (22.42, 22.89, 113.74, 114.66)  # lat_min, lat_max, lng_min, lng_max
 
@@ -159,7 +153,6 @@ class ModelDecisionService:
                 "must_visit_days": {},  # idx → set of days visited
                 "first_order_taken": set(),  # days where first order was already taken
                 "home_done": set(),  # days where home repositioning is done
-                "total_orders": 0,  # total orders accepted across entire month
             },
         )
         # Preferences may only become visible inside their date window, so the off-day
@@ -329,27 +322,6 @@ class ModelDecisionService:
                     plan["bounded_repo"].add(day)
                     return self._reposition(tgt_lat, tgt_lng)
 
-        # (D7) cargo-desert reposition: if the driver is far from any cargo
-        # (nearest item > 200km) and has never taken an order, reposition toward
-        # the cargo centroid on day 0/1 so that subsequent queries return nearby
-        # results.  Only fires once.
-        if day <= 1 and plan.get("total_orders", 0) == 0 and "desert_repo" not in plan:
-            probe = self._api.query_cargo(driver_id=driver_id, latitude=lat, longitude=lng, k=60)
-            items = probe.get("items", [])
-            nearest_km = 9999.0
-            for it in items[:5]:
-                c = it.get("cargo", {})
-                plat, plng = c.get("origin_lat"), c.get("origin_lng")
-                if plat is not None and plng is not None:
-                    nearest_km = min(nearest_km, _haversine_km(lat, lng, plat, plng))
-            if not items or nearest_km > 200:
-                clat, clng = _CARGO_CENTROID
-                dist = _haversine_km(lat, lng, clat, clng)
-                if dist > 50 and now + _travel_minutes(dist) <= day_end:
-                    plan["desert_repo"] = True
-                    return self._reposition(clat, clng)
-            plan["desert_repo"] = True
-
         # (E) take the best compliant order, else idle to day end. A flexible-rest
         # driver may let the day's *last* order finish past midnight (up to a cap that
         # still leaves room for a full rest block inside the next day), but only when
@@ -377,24 +349,10 @@ class ModelDecisionService:
         strand = self._anti_strand(driver_id, rules, plan, now, lat, lng, day, hard_end)
         if strand is not None:
             return strand
-        # (E'') Instead of idling until day end, wait and retry.
-        # If in a cargo-sparse area (high retry count), reposition toward
-        # the cargo centroid instead of just waiting.
+        # (E'') Instead of idling until day end, wait 2-4 hours and retry.
+        # This avoids wasting entire days when cargo becomes available later.
         remaining = day_end - now
-        retry_count = plan.get("retry_count", {}).get(day, 0)
-        plan.setdefault("retry_count", {})
-        plan["retry_count"][day] = retry_count + 1
         if remaining > 240:
-            # After 2 failed retries on the same day, reposition toward cargo center
-            if retry_count >= 2 and rules.bounded_area is None:
-                clat, clng = _CARGO_CENTROID
-                dist = _haversine_km(lat, lng, clat, clng)
-                if dist > 80:
-                    # Move 30% closer to cargo center
-                    tgt_lat = lat + (clat - lat) * 0.3
-                    tgt_lng = lng + (clng - lng) * 0.3
-                    if now + _travel_minutes(_haversine_km(lat, lng, tgt_lat, tgt_lng)) < day_end:
-                        return self._reposition(tgt_lat, tgt_lng)
             return self._wait(180)  # wait 3 hours then retry
         return self._wait(max(remaining, 1))
 
@@ -499,11 +457,10 @@ class ModelDecisionService:
             return None
         if best_is_required:
             plan["zeng_order_days"].add(day)
-        # Track order count, first-order flag, deadhead, and total orders
+        # Track order count, first-order flag, and deadhead
         plan["orders_today"][day] = plan["orders_today"].get(day, 0) + 1
         plan["first_order_taken"].add(day)
         plan["total_deadhead_km"] += best_pickup_km
-        plan["total_orders"] = plan.get("total_orders", 0) + 1
         return self._take_order(str(best.get("cargo_id")))
 
     def _anti_strand(self, driver_id, rules, plan, now, lat, lng, day, day_end):
@@ -1073,18 +1030,11 @@ class ModelDecisionService:
             if isinstance(sh, (int, float)) and isinstance(eh, (int, float)):
                 sm, em = int(round(sh * 60)), int(round(eh * 60))
                 if em > sm:
-                    # Sanity cap: if the daytime window is extremely long (>16h),
-                    # cap it so the driver still has working hours.
-                    if em - sm > _MAX_REST_WINDOW_MINUTES:
-                        em = sm + _MAX_REST_WINDOW_MINUTES
                     rules.rest_window = (sm, em)
                 elif sm > em > 0:
                     # Overnight window (e.g. 22:00-05:00): morning part as rest_window
-                    overnight_min = 24 * 60 - sm + em
-                    if overnight_min > _MAX_REST_WINDOW_MINUTES:
-                        em = max(1, em - (overnight_min - _MAX_REST_WINDOW_MINUTES))
-                        overnight_min = _MAX_REST_WINDOW_MINUTES
                     rules.rest_window = (0, em)
+                    overnight_min = 24 * 60 - sm + em
                     rules.daily_rest_minutes = max(rules.daily_rest_minutes, overnight_min)
                     self._logger.info("llm: overnight rest_window %d-%d -> rest_window=(0,%d) rest_min=%d",
                                       sm, em, em, overnight_min)
@@ -1204,9 +1154,6 @@ class ModelDecisionService:
                         em += 24 * 60  # cross-midnight
                     else:
                         continue
-                    # Cap extreme no-drive windows (>16h)
-                    if em - sm > _MAX_REST_WINDOW_MINUTES:
-                        em = sm + _MAX_REST_WINDOW_MINUTES
                     if not any(ws == sm and we == em for ws, we in rules.no_drive_windows):
                         rules.no_drive_windows.append((sm, em))
         elif data.get("no_drive_windows"):
@@ -1624,8 +1571,6 @@ class ModelDecisionService:
                 # handle cross-midnight: end < start → wrap to next day
                 if em <= sm:
                     em += DAY_MINUTES
-                if em - sm > _MAX_REST_WINDOW_MINUTES:
-                    em = sm + _MAX_REST_WINDOW_MINUTES
                 rules.no_drive_windows.append((sm, em))
         # home_rule: "X点前须在自家/回家/到家...Y公里" (complex, rely more on LLM)
         # monthly_deadhead_max_km: "月累计空驶不超过N公里"
@@ -1784,8 +1729,6 @@ class ModelDecisionService:
             ndw_window = self._parse_time_window(text)
             if ndw_window is not None:
                 sm, em = ndw_window
-                if em - sm > _MAX_REST_WINDOW_MINUTES:
-                    em = sm + _MAX_REST_WINDOW_MINUTES
                 if not any(ws == sm and we == em for ws, we in rules.no_drive_windows):
                     rules.no_drive_windows.append((sm, em))
         # daily_order_limit: "同一天不超过N单" / "顶多跑N趟"
