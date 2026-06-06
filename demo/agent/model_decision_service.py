@@ -360,6 +360,14 @@ class ModelDecisionService:
 
         if rules.daily_order_limit is not None:
             if plan["orders_today"].get(day, 0) >= rules.daily_order_limit:
+                if rules.home_by_minute is not None and rules.home_lat is not None and day not in plan.get("home_done", set()):
+                    dist_home = _haversine_km(lat, lng, rules.home_lat, rules.home_lng or 0)
+                    if dist_home > rules.home_radius_km:
+                        latest_depart = day_start + rules.home_by_minute - _travel_minutes(dist_home) - 180
+                        if latest_depart <= now:
+                            plan["home_done"].add(day)
+                            return self._reposition(rules.home_lat, rules.home_lng or 0)
+                        return self._wait(latest_depart - now)
                 return self._wait(day_end - now)
 
         if self._first_order_deadline_unreachable(rules, plan, day, tod, 60):
@@ -1534,6 +1542,15 @@ class ModelDecisionService:
         return DAY_MINUTES
 
     @staticmethod
+    def _repair_china_coord(lat: float, lng: float) -> tuple[float, float]:
+        if lat > 90 and lng < 90:
+            lat, lng = lng, lat
+        if lat < 10 and 10 <= lng < 40:
+            lat += 20
+            lng += 100
+        return lat, lng
+
+    @staticmethod
     def _coerce_date(val: Any) -> int | None:
         """Convert various date formats to int 1-31. Handles int, float, '15号', '15日', '15'."""
         if isinstance(val, (int, float)):
@@ -2000,7 +2017,7 @@ class ModelDecisionService:
                 if 18 <= mlat <= 55 and 70 <= mlng <= 140:
                     rules.must_visit.append({"lat": mlat, "lng": mlng, "radius_km": mr, "required_days": days})
         # home_rule: "每天X点前/必须回...自家位置(lat,lng)R公里内，到次日Y点前不接单不空跑"
-        if rules.home_by_minute is None and any(kw in text for kw in ("自家", "回家", "到家", "家里", "回到", "进家")):
+        if rules.home_by_minute is None and any(kw in text for kw in ("自家", "自位", "回家", "到家", "家里", "回到", "进家", "必回")):
             hr_m = re.search(
                 r"每天\s*([零一二两三四五六七八九十\d]+)\s*点(?:前|.*?(?:必须|须)).*?"
                 r"[（(]\s*([0-9]+\.?[0-9]*)\s*[，,]\s*([0-9]+\.?[0-9]*)\s*[)）]"
@@ -2020,12 +2037,26 @@ class ModelDecisionService:
             if hr_m:
                 rules.home_by_minute = _cn_to_int(hr_m.group(1)) * 60
                 hlat, hlng = float(hr_m.group(2)), float(hr_m.group(3))
-                if hlat > 90 and hlng < 90:
-                    hlat, hlng = hlng, hlat
+                hlat, hlng = self._repair_china_coord(hlat, hlng)
                 rules.home_lat = hlat
                 rules.home_lng = hlng
                 rules.home_radius_km = float(_cn_to_int(hr_m.group(4)))
                 rules.no_drive_until_minute = _cn_to_int(hr_m.group(5)) * 60
+            else:
+                by_m = re.search(r"每[天日]?\s*([零一二两三四五六七八九十\d]+)\s*点", text)
+                coord_m = re.search(r"[（(]\s*([0-9]+\.?[0-9]*)\s*[，,]\s*([0-9]+\.?[0-9]*)\s*[)）]", text)
+                if by_m and coord_m:
+                    hlat, hlng = self._repair_china_coord(float(coord_m.group(1)), float(coord_m.group(2)))
+                    if 18 <= hlat <= 55 and 70 <= hlng <= 140:
+                        home_hour = _cn_to_int(by_m.group(1))
+                        rules.home_by_minute = home_hour * 60
+                        rules.home_lat = hlat
+                        rules.home_lng = hlng
+                        radius_m = re.search(r"[)）]\s*([零一二两三四五六七八九十百\d]+)\s*(?:公里|公)内", text)
+                        rules.home_radius_km = float(_cn_to_int(radius_m.group(1))) if radius_m else 2.0
+                        until_m = re.search(r"(?:次日|到日|日)\s*([零一二两三四五六七八九十\d]+)\s*点", text)
+                        until_hour = _cn_to_int(until_m.group(1)) if until_m else (home_hour + 9) % 24
+                        rules.no_drive_until_minute = until_hour * 60
 
     # ----------------------------------------------------- small text parsers
     @staticmethod
