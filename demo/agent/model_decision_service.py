@@ -232,6 +232,15 @@ class ModelDecisionService:
         else:
             plan["rest_done"].add(day)
 
+        # (B2) daytime rest_window enforcement: if the driver has a daytime
+        # rest window (e.g. 12:00-14:00) and the current time-of-day falls
+        # inside it, idle until the window ends.
+        if rules.rest_window is not None:
+            rw_s, rw_e = rules.rest_window
+            if rw_e > rw_s and rw_s > 0:
+                if rw_s <= tod < rw_e:
+                    return self._wait(rw_e - tod)
+
         # (C) dated single-stop events (e.g. 盘库).
         for ev in rules.dated_single:
             if ev["day"] != day or ev["day"] in plan["dated_single_done"]:
@@ -1981,15 +1990,24 @@ class ModelDecisionService:
                     mlat, mlng = mlng, mlat
                 if 18 <= mlat <= 55 and 70 <= mlng <= 140:
                     rules.must_visit.append({"lat": mlat, "lng": mlng, "radius_km": mr, "required_days": days})
-        # home_rule: "每天X点前...自家位置(lat,lng)R公里内，到次日Y点前不接单不空跑"
-        if rules.home_by_minute is None and any(kw in text for kw in ("自家", "回家", "到家", "家里")):
+        # home_rule: "每天X点前/必须回...自家位置(lat,lng)R公里内，到次日Y点前不接单不空跑"
+        if rules.home_by_minute is None and any(kw in text for kw in ("自家", "回家", "到家", "家里", "回到", "进家")):
             hr_m = re.search(
-                r"每天\s*([零一二两三四五六七八九十\d]+)\s*点前.*?"
+                r"每天\s*([零一二两三四五六七八九十\d]+)\s*点(?:前|.*?(?:必须|须)).*?"
                 r"[（(]\s*([0-9]+\.?[0-9]*)\s*[，,]\s*([0-9]+\.?[0-9]*)\s*[)）]"
                 r"\s*([零一二两三四五六七八九十百\d]+)\s*公里内.*?"
                 r"次日\s*([零一二两三四五六七八九十\d]+)\s*点前",
                 text,
             )
+            if not hr_m:
+                hr_m = re.search(
+                    r"每[天日]\s*([零一二两三四五六七八九十\d]+)\s*点.*?"
+                    r"(?:回到?|须在|必须).*?"
+                    r"[（(]\s*([0-9]+\.?[0-9]*)\s*[，,]\s*([0-9]+\.?[0-9]*)\s*[)）]"
+                    r"\s*([零一二两三四五六七八九十百\d]+)\s*公里内.*?"
+                    r"(?:次日|到.*?日)\s*([零一二两三四五六七八九十\d]+)\s*点",
+                    text,
+                )
             if hr_m:
                 rules.home_by_minute = _cn_to_int(hr_m.group(1)) * 60
                 hlat, hlng = float(hr_m.group(2)), float(hr_m.group(3))
