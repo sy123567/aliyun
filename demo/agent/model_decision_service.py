@@ -20,6 +20,7 @@ MONTH_DAYS = 31
 SPEED_KM_PER_HOUR = 60.0
 EARTH_RADIUS_KM = 6371.0
 COST_PER_KM = 1.5
+QUERY_SCAN_BATCH_SIZE = 10
 # Minimum remaining minutes in the day worth attempting an anti-stranding reposition:
 # below this there is no time to relocate and still complete an order before day end.
 _STRAND_MIN_BUDGET = 240
@@ -40,6 +41,10 @@ def _travel_minutes(distance_km: float) -> int:
     if distance_km <= 0:
         return 1
     return max(1, math.ceil(distance_km / SPEED_KM_PER_HOUR * 60.0))
+
+
+def _query_scan_minutes(k: int) -> int:
+    return math.ceil(max(1, k) / QUERY_SCAN_BATCH_SIZE)
 
 
 def _in_shenzhen(lat: float, lng: float) -> bool:
@@ -322,6 +327,13 @@ class ModelDecisionService:
                     plan["bounded_repo"].add(day)
                     return self._reposition(tgt_lat, tgt_lng)
 
+        if rules.daily_order_limit is not None:
+            if plan["orders_today"].get(day, 0) >= rules.daily_order_limit:
+                return self._wait(day_end - now)
+
+        if self._first_order_deadline_unreachable(rules, plan, day, tod, 60):
+            return self._wait(day_end - now)
+
         # (E) take the best compliant order, else idle to day end. A flexible-rest
         # driver may let the day's *last* order finish past midnight (up to a cap that
         # still leaves room for a full rest block inside the next day), but only when
@@ -368,6 +380,12 @@ class ModelDecisionService:
             return False  # event day or its pre-stage evening
         return True
 
+    def _first_order_deadline_unreachable(self, rules, plan, day: int, tod: int, query_k: int) -> bool:
+        deadline = rules.first_order_before_minute
+        if deadline is None or day in plan["first_order_taken"]:
+            return False
+        return tod + _query_scan_minutes(query_k) > deadline
+
     def _drive_route(self, ev, plan, now, day_start, lat, lng):
         stops = ev["stops"]
         st = plan.setdefault("route_state", {}).setdefault(ev["day"], {"idx": 0, "waited": False})
@@ -400,11 +418,8 @@ class ModelDecisionService:
             if count >= rules.daily_order_limit:
                 return None
         # first_order timing check: if no order taken today and it's past the deadline
-        if rules.first_order_before_minute is not None and day not in plan["first_order_taken"]:
-            tod = now % DAY_MINUTES
-            if tod > rules.first_order_before_minute:
-                # Past first-order deadline; mark as missed but still allow orders
-                pass
+        if self._first_order_deadline_unreachable(rules, plan, day, now % DAY_MINUTES, 60):
+            return None
         cargo_resp = self._api.query_cargo(driver_id=driver_id, latitude=lat, longitude=lng, k=60)
         items = cargo_resp.get("items", [])
         now = int(self._api.get_driver_status(driver_id)["simulation_progress_minutes"])
@@ -435,6 +450,8 @@ class ModelDecisionService:
                 best, best_score, best_is_required, best_pickup_km = (cargo, score, is_req, pkm)
         # Widen search if k=60 found no compliant order — try k=200 for a larger radius
         if best is None:
+            if self._first_order_deadline_unreachable(rules, plan, day, now % DAY_MINUTES, 200):
+                return None
             cargo_resp2 = self._api.query_cargo(driver_id=driver_id, latitude=lat, longitude=lng, k=200)
             items2 = cargo_resp2.get("items", [])
             now = int(self._api.get_driver_status(driver_id)["simulation_progress_minutes"])
