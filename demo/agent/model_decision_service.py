@@ -215,6 +215,8 @@ class ModelDecisionService:
         if block > 0 and day not in plan["rest_done"]:
             plan["rest_done"].add(day)
             if rules.rest_window is None:
+                # Flexible rest: rest from midnight (low-cargo period, 0-6am typical)
+                # but cap to block duration
                 dur = block if tod + block <= DAY_MINUTES else max(0, DAY_MINUTES - tod)
             else:
                 dur = min(block - tod, day_end - now) if tod < block else 0
@@ -361,11 +363,15 @@ class ModelDecisionService:
         strand = self._anti_strand(driver_id, rules, plan, now, lat, lng, day, hard_end)
         if strand is not None:
             return strand
-        # (E'') Instead of idling until day end, wait 2-4 hours and retry.
-        # This avoids wasting entire days when cargo becomes available later.
+        # (E'') Adaptive retry: more frequent during high-cargo hours (8-18),
+        # less frequent during off-hours to avoid wasting API calls.
         remaining = day_end - now
         if remaining > 240:
-            return self._wait(180)  # wait 3 hours then retry
+            hour_of_day = (now % DAY_MINUTES) // 60
+            if 8 <= hour_of_day < 18:
+                return self._wait(90)   # peak hours: retry every 1.5h
+            else:
+                return self._wait(150)  # off-peak: retry every 2.5h
         return self._wait(max(remaining, 1))
 
     def _next_day_is_ordinary(self, rules, plan, day) -> bool:
@@ -420,7 +426,7 @@ class ModelDecisionService:
         # first_order timing check: if no order taken today and it's past the deadline
         if self._first_order_deadline_unreachable(rules, plan, day, now % DAY_MINUTES, 60):
             return None
-        cargo_resp = self._api.query_cargo(driver_id=driver_id, latitude=lat, longitude=lng, k=60)
+        cargo_resp = self._api.query_cargo(driver_id=driver_id, latitude=lat, longitude=lng, k=100)
         items = cargo_resp.get("items", [])
         now = int(self._api.get_driver_status(driver_id)["simulation_progress_minutes"])
         blackout_regions = {r for r, days in rules.blackout if day in days}
@@ -437,18 +443,20 @@ class ModelDecisionService:
             ev = self._evaluate_cargo(cargo, item, rules, blackout_regions, now, day_end, lat, lng)
             if ev is None:
                 continue
-            net, touches_required, occupied, pkm = ev
+            net, touches_required, occupied, pkm, hkm = ev
             # monthly deadhead cap: skip if this order would exceed limit
             if rules.monthly_deadhead_max_km is not None:
                 if plan["total_deadhead_km"] + pkm > rules.monthly_deadhead_max_km:
                     continue
-            score = net / occupied
+            score = self._enhanced_score(
+                net, occupied, hkm, touches_required, need_zeng,
+                cargo, rules, plan, day)
             is_req = bool(need_zeng and touches_required)
             if is_req and not best_is_required:
                 best, best_score, best_is_required, best_pickup_km = (cargo, score, True, pkm)
             elif is_req == best_is_required and score > best_score:
                 best, best_score, best_is_required, best_pickup_km = (cargo, score, is_req, pkm)
-        # Widen search if k=60 found no compliant order — try k=200 for a larger radius
+        # Widen search if k=100 found no compliant order — try k=200 for a larger radius
         if best is None:
             if self._first_order_deadline_unreachable(rules, plan, day, now % DAY_MINUTES, 200):
                 return None
@@ -460,11 +468,13 @@ class ModelDecisionService:
                 ev = self._evaluate_cargo(cargo, item, rules, blackout_regions, now, day_end, lat, lng)
                 if ev is None:
                     continue
-                net, touches_required, occupied, pkm = ev
+                net, touches_required, occupied, pkm, hkm = ev
                 if rules.monthly_deadhead_max_km is not None:
                     if plan["total_deadhead_km"] + pkm > rules.monthly_deadhead_max_km:
                         continue
-                score = net / occupied
+                score = self._enhanced_score(
+                    net, occupied, hkm, touches_required, need_zeng,
+                    cargo, rules, plan, day)
                 is_req = bool(need_zeng and touches_required)
                 if is_req and not best_is_required:
                     best, best_score, best_is_required, best_pickup_km = (cargo, score, True, pkm)
@@ -480,6 +490,41 @@ class ModelDecisionService:
         plan["total_deadhead_km"] += best_pickup_km
         return self._take_order(str(best.get("cargo_id")))
 
+
+    def _enhanced_score(self, net, occupied, haul_km, touches_required, need_zeng,
+                        cargo, rules, plan, day):
+        """General-purpose scoring that works across unknown driver/cargo distributions."""
+        score = net / occupied
+
+        # (1) Dynamic haul-distance penalty: long hauls strand drivers.
+        # Threshold adapts to bounded_area size; defaults to 200km without one.
+        haul_thresh = 200.0
+        if rules.bounded_area is not None:
+            la_min, la_max, ln_min, ln_max = rules.bounded_area
+            diag = _haversine_km(la_min, ln_min, la_max, ln_max)
+            haul_thresh = max(100.0, diag * 0.8)
+        if haul_km > haul_thresh:
+            score *= max(0.4, 1.0 - (haul_km - haul_thresh) / (haul_thresh * 2))
+
+        # (2) Dropoff stays in bounded_area: prefer orders that don't push driver out.
+        if rules.bounded_area is not None:
+            la_min, la_max, ln_min, ln_max = rules.bounded_area
+            end = cargo.get("end") or {}
+            elat = float(end.get("lat", 0.0))
+            elng = float(end.get("lng", 0.0))
+            if not (la_min <= elat <= la_max and ln_min <= elng <= ln_max):
+                score *= 0.6
+
+        # (3) Required-region boost when quota not met.
+        if need_zeng and touches_required:
+            score *= 1.5
+
+        # (4) First-order-of-day boost: avoid wasting morning on marginal comparisons.
+        if plan["orders_today"].get(day, 0) == 0:
+            score *= 1.15
+
+        return score
+
     def _anti_strand(self, driver_id, rules, plan, now, lat, lng, day, day_end):
         """When no compliant order is reachable from the current spot, the driver is
         stranded (e.g. a previous haul left it far from any cargo cluster) and would
@@ -489,23 +534,48 @@ class ModelDecisionService:
         so the deadhead cap is never tripped (penalty stays 0). Allow up to 2 repositions
         per day to avoid wasting entire days when first target has no cargo."""
         strand_count = plan.get("strand_count", {}).get(day, 0)
-        if strand_count >= 2:
+        if strand_count >= 3:
             return None
         if day_end - now < _STRAND_MIN_BUDGET:
             return None
         cargo_resp = self._api.query_cargo(driver_id=driver_id, latitude=lat, longitude=lng, k=600)
         items = cargo_resp.get("items", [])
         blackout_regions = {r for r, days in rules.blackout if day in days}
+        need_zeng = (
+            rules.required_region is not None
+            and len(plan.get("zeng_order_days", set())) < rules.required_region[1]
+        )
         best_target = None
         best_net = 0.0
+        best_is_req = False
         for item in items:
             cargo = item.get("cargo", {})
             ev = self._evaluate_relocation(cargo, rules, blackout_regions, now, day_end, lat, lng)
             if ev is None:
                 continue
             net, tlat, tlng = ev
-            if net > best_net:
-                best_target, best_net = (tlat, tlng), net
+            # Boost score for required-region cargo during anti-strand
+            is_req = False
+            if need_zeng:
+                start = cargo.get("start") or {}
+                end = cargo.get("end") or {}
+                region = rules.required_region[0]
+                is_req = (_region_in_city(region, str(start.get("city", "")))
+                          or _region_in_city(region, str(end.get("city", ""))))
+                if is_req:
+                    net *= 1.5
+            # Penalize dropoff outside bounded_area
+            if rules.bounded_area is not None:
+                la_min, la_max, ln_min, ln_max = rules.bounded_area
+                end = cargo.get("end") or {}
+                elat = float(end.get("lat", 0.0))
+                elng = float(end.get("lng", 0.0))
+                if not (la_min <= elat <= la_max and ln_min <= elng <= ln_max):
+                    net *= 0.5
+            if is_req and not best_is_req:
+                best_target, best_net, best_is_req = (tlat, tlng), net, True
+            elif is_req == best_is_req and net > best_net:
+                best_target, best_net, best_is_req = (tlat, tlng), net, is_req
         if best_target is None:
             return None
         plan["strand_repo"].add(day)
@@ -668,7 +738,7 @@ class ModelDecisionService:
             region = rules.required_region[0]
             touches_required = _region_in_city(region, scity) or _region_in_city(region, ecity)
         occupied = max(1, finish - now)
-        return net, touches_required, occupied, pickup_km
+        return net, touches_required, occupied, pickup_km, haul_km
 
     @staticmethod
     def _is_forbidden_cargo(cargo_name: str, forbidden: set[str]) -> bool:
