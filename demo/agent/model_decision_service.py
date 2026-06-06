@@ -377,10 +377,24 @@ class ModelDecisionService:
         strand = self._anti_strand(driver_id, rules, plan, now, lat, lng, day, hard_end)
         if strand is not None:
             return strand
-        # (E'') Instead of idling until day end, wait 2-4 hours and retry.
-        # This avoids wasting entire days when cargo becomes available later.
+        # (E'') Instead of idling until day end, wait and retry.
+        # If in a cargo-sparse area (high retry count), reposition toward
+        # the cargo centroid instead of just waiting.
         remaining = day_end - now
+        retry_count = plan.get("retry_count", {}).get(day, 0)
+        plan.setdefault("retry_count", {})
+        plan["retry_count"][day] = retry_count + 1
         if remaining > 240:
+            # After 2 failed retries on the same day, reposition toward cargo center
+            if retry_count >= 2 and rules.bounded_area is None:
+                clat, clng = _CARGO_CENTROID
+                dist = _haversine_km(lat, lng, clat, clng)
+                if dist > 80:
+                    # Move 30% closer to cargo center
+                    tgt_lat = lat + (clat - lat) * 0.3
+                    tgt_lng = lng + (clng - lng) * 0.3
+                    if now + _travel_minutes(_haversine_km(lat, lng, tgt_lat, tgt_lng)) < day_end:
+                        return self._reposition(tgt_lat, tgt_lng)
             return self._wait(180)  # wait 3 hours then retry
         return self._wait(max(remaining, 1))
 
