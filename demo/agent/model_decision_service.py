@@ -151,14 +151,172 @@ class DriverRules:
         return block
 
 
+class DecisionHistory:
+    """维护司机的决策历史，为LLM提供结构化上下文。
+
+    企业级设计：不依赖硬编码地区知识，通过历史模式自适应任何司机/地区。
+    """
+
+    def __init__(self, window_size: int = 30):
+        self._window_size = window_size
+        self._history: list[dict[str, Any]] = []  # rolling window of recent decisions
+        self._monthly_stats: dict[int, dict[str, Any]] = {}  # month_idx → stats
+        self._total_orders = 0
+        self._total_income = 0.0
+        self._total_penalty_violations = 0
+        self._category_counts: dict[int, dict[str, int]] = {}  # month → {cat: count}
+        self._longhual_counts: dict[int, int] = {}  # month → count of >8h orders
+
+    def record(self, step: int, day: int, tod: int, action: str, params: dict,
+               result: dict | None = None, cargo_info: dict | None = None) -> None:
+        """Record a decision step."""
+        month_idx = day // 31
+        entry = {
+            "step": step,
+            "day": day,
+            "tod": tod,
+            "action": action,
+            "params": params,
+        }
+        if cargo_info:
+            entry["cargo_name"] = cargo_info.get("cargo_name", "")
+            entry["cargo_price"] = cargo_info.get("price", 0)
+            entry["cost_time_minutes"] = cargo_info.get("cost_time_minutes", 0)
+        if result:
+            entry["accepted"] = result.get("accepted", False)
+            entry["haul_km"] = result.get("haul_distance_km", 0)
+            entry["deadhead_km"] = result.get("pickup_deadhead_km", 0)
+            if result.get("accepted"):
+                self._total_orders += 1
+                income = entry.get("cargo_price", 0)
+                self._total_income += income
+                # Track category
+                cname = entry.get("cargo_name", "")
+                self._category_counts.setdefault(month_idx, {})
+                self._category_counts[month_idx][cname] = \
+                    self._category_counts[month_idx].get(cname, 0) + 1
+                # Track long-haul
+                if entry.get("cost_time_minutes", 0) > 480:
+                    self._longhual_counts[month_idx] = \
+                        self._longhual_counts.get(month_idx, 0) + 1
+        # Update monthly stats
+        stats = self._monthly_stats.setdefault(month_idx, {
+            "orders": 0, "waits": 0, "repositions": 0,
+            "total_haul_km": 0.0, "total_deadhead_km": 0.0,
+        })
+        if action == "take_order" and result and result.get("accepted"):
+            stats["orders"] += 1
+            stats["total_haul_km"] += entry.get("haul_km", 0)
+            stats["total_deadhead_km"] += entry.get("deadhead_km", 0)
+        elif action == "wait":
+            stats["waits"] += 1
+        elif action == "reposition":
+            stats["repositions"] += 1
+
+        self._history.append(entry)
+        if len(self._history) > self._window_size:
+            self._history.pop(0)
+
+    def get_summary(self, current_day: int) -> str:
+        """Generate a concise history summary for LLM context."""
+        month_idx = current_day // 31
+        month_name = {0: "3月", 1: "4月", 2: "5月"}.get(month_idx, f"第{month_idx+1}月")
+        lines = []
+        lines.append(f"=== 决策历史摘要 ===")
+        lines.append(f"总接单: {self._total_orders}, 累计收入: ¥{self._total_income:.0f}")
+
+        # Monthly breakdown
+        for mi in sorted(self._monthly_stats):
+            mn = {0: "3月", 1: "4月", 2: "5月"}.get(mi, f"第{mi+1}月")
+            s = self._monthly_stats[mi]
+            lines.append(
+                f"{mn}: 接单{s['orders']}, 等待{s['waits']}次, "
+                f"重定位{s['repositions']}次, "
+                f"运输{s['total_haul_km']:.0f}km, 空驶{s['total_deadhead_km']:.0f}km"
+            )
+
+        # Category progress for current month
+        if month_idx in self._category_counts:
+            cats = self._category_counts[month_idx]
+            top_cats = sorted(cats.items(), key=lambda x: -x[1])[:5]
+            lines.append(f"\n{month_name}品类分布(前5): " +
+                         ", ".join(f"{c}:{n}单" for c, n in top_cats))
+
+        # Long-haul tracking
+        lh = self._longhual_counts.get(month_idx, 0)
+        lines.append(f"{month_name}长途(>8h): {lh}/5单上限")
+
+        # Recent decisions (last 10)
+        recent = self._history[-10:]
+        if recent:
+            lines.append(f"\n最近{len(recent)}步决策:")
+            for e in recent:
+                d, t = e["day"], e["tod"]
+                h, m = divmod(t, 60)
+                act = e["action"]
+                detail = ""
+                if act == "take_order":
+                    cn = e.get("cargo_name", "?")
+                    acc = "✓" if e.get("accepted") else "✗"
+                    detail = f" {cn} {acc}"
+                elif act == "wait":
+                    dur = e["params"].get("duration_minutes", 0)
+                    detail = f" {dur}分钟"
+                elif act == "reposition":
+                    detail = f" →({e['params'].get('latitude',0):.1f},{e['params'].get('longitude',0):.1f})"
+                lines.append(f"  Day{d} {h:02d}:{m:02d} {act}{detail}")
+
+        return "\n".join(lines)
+
+    def update_last_result(self, result: dict, cargo_info: dict | None = None) -> None:
+        """Update the most recent history entry with execution result."""
+        if not self._history:
+            return
+        entry = self._history[-1]
+        month_idx = entry["day"] // 31
+        if result:
+            entry["accepted"] = result.get("accepted", False)
+            entry["haul_km"] = result.get("haul_distance_km", 0)
+            entry["deadhead_km"] = result.get("pickup_deadhead_km", 0)
+            if result.get("accepted"):
+                self._total_orders += 1
+                stats = self._monthly_stats.get(month_idx)
+                if stats:
+                    stats["orders"] += 1
+                    stats["total_haul_km"] += entry.get("haul_km", 0)
+                    stats["total_deadhead_km"] += entry.get("deadhead_km", 0)
+        if cargo_info:
+            entry["cargo_name"] = cargo_info.get("cargo_name", "")
+            entry["cargo_price"] = cargo_info.get("price", 0)
+            entry["cost_time_minutes"] = cargo_info.get("cost_time_minutes", 0)
+            cname = entry.get("cargo_name", "")
+            if result and result.get("accepted") and cname:
+                self._category_counts.setdefault(month_idx, {})
+                self._category_counts[month_idx][cname] = \
+                    self._category_counts[month_idx].get(cname, 0) + 1
+                if entry.get("cost_time_minutes", 0) > 480:
+                    self._longhual_counts[month_idx] = \
+                        self._longhual_counts.get(month_idx, 0) + 1
+
+    def get_category_progress(self, month_idx: int) -> dict[str, int]:
+        """Get category order counts for a specific month."""
+        return dict(self._category_counts.get(month_idx, {}))
+
+    def get_longhual_count(self, month_idx: int) -> int:
+        """Get long-haul order count for a specific month."""
+        return self._longhual_counts.get(month_idx, 0)
+
+
 class ModelDecisionService:
-    """单步决策：合规优先 + 净收益择单的确定性调度器。"""
+    """单步决策：LLM驱动 + 决策历史感知 + 规则引擎兜底的调度器。"""
 
     def __init__(self, api: SimulationApiPort) -> None:
         self._api = api
         self._logger = logging.getLogger("agent.decision_service")
         self._rules: dict[str, DriverRules] = {}
         self._plan: dict[str, dict[str, Any]] = {}
+        self._history: dict[str, DecisionHistory] = {}  # driver_id → history
+        self._step_count: dict[str, int] = {}  # driver_id → step counter
         # preference texts already fed to the parser (LLM is only re-invoked when a
         # new, date-windowed preference becomes visible).
         self._seen_prefs: dict[str, set[str]] = {}
@@ -184,23 +342,275 @@ class ModelDecisionService:
                 "monthly_category_orders": {},  # month_idx → {category: count}
             },
         )
+        # Initialize decision history for this driver
+        history = self._history.setdefault(driver_id, DecisionHistory())
+        self._step_count.setdefault(driver_id, 0)
+        self._step_count[driver_id] += 1
+
         # Preferences may only become visible inside their date window, so the off-day
         # set is recomputed each step from the rules known so far.
         plan["off_days"] = self._plan_off_days(rules)
         now = int(status["simulation_progress_minutes"])
         lat = float(status["current_lat"])
         lng = float(status["current_lng"])
-        action = self._schedule(driver_id, status, rules, plan, now, lat, lng)
+        day, tod = divmod(now, DAY_MINUTES)
+
+        # Try LLM-driven decision with history context
+        action = None
+        step = self._step_count[driver_id]
+        consecutive_waits = plan.get("_consecutive_waits", 0)
+        # Call LLM every 3 steps (or when idle), but skip if stuck in wait loop (>2 consecutive)
+        use_llm = (step % 3 == 0 or plan.get("_last_action") == "wait") and consecutive_waits < 3
+        if use_llm:
+            action = self._llm_decide_with_history(
+                driver_id, status, rules, plan, history, now, lat, lng, day, tod
+            )
+
+        # Fallback to rule engine if LLM decision is None or failed
+        if action is None:
+            action = self._schedule(driver_id, status, rules, plan, now, lat, lng)
+
+        # Track consecutive waits to detect LLM getting stuck
+        if action.get("action") == "wait":
+            plan["_consecutive_waits"] = consecutive_waits + 1
+        else:
+            plan["_consecutive_waits"] = 0
+
+        # Record decision in history
+        plan["_last_action"] = action.get("action")
+        history.record(
+            step=step, day=day, tod=tod,
+            action=action.get("action", "unknown"),
+            params=action.get("params", {}),
+        )
+
         self._logger.info(
-            "decision driver_id=%s now=%s day=%s tod=%s action=%s params=%s",
-            driver_id,
-            now,
-            now // DAY_MINUTES,
-            now % DAY_MINUTES,
-            action.get("action"),
-            action.get("params"),
+            "decision driver_id=%s now=%s day=%s tod=%s action=%s params=%s step=%d",
+            driver_id, now, day, tod,
+            action.get("action"), action.get("params"), step,
         )
         return action
+
+    def update_decision_result(self, driver_id: str, result: dict,
+                                cargo_info: dict | None = None) -> None:
+        """Called after execution to update decision history with the result.
+
+        This allows the history to track which orders were accepted, rejected, etc.
+        """
+        history = self._history.get(driver_id)
+        if history:
+            history.update_last_result(result, cargo_info)
+
+    def _llm_decide_with_history(self, driver_id, status, rules, plan, history,
+                                  now, lat, lng, day, tod) -> dict[str, Any] | None:
+        """Use LLM with decision history context to make strategic decisions.
+
+        Returns a valid action dict or None (to fall back to rule engine).
+        """
+        import time
+        start_time = time.time()
+
+        # Skip LLM for mandatory actions (rest, off-day, dated events)
+        if day in plan.get("off_days", set()):
+            return None  # let rule engine handle
+        block = rules.day_rest_block
+        if block > 0 and day not in plan.get("rest_done", set()):
+            return None  # let rule engine handle rest
+
+        # Query available cargo for context
+        cargo_resp = self._api.query_cargo(driver_id=driver_id, latitude=lat, longitude=lng, k=30)
+        items = cargo_resp.get("items", [])
+        now = int(self._api.get_driver_status(driver_id)["simulation_progress_minutes"])
+
+        # Build cargo summary for LLM (top 10 most relevant)
+        cargo_summary = []
+        for item in items[:10]:
+            cargo = item.get("cargo", {})
+            cargo_summary.append({
+                "cargo_id": str(cargo.get("cargo_id", "")),
+                "cargo_name": cargo.get("cargo_name", ""),
+                "price": cargo.get("price", 0),
+                "cost_time_minutes": cargo.get("cost_time_minutes", 0),
+                "start_city": cargo.get("start", {}).get("city", ""),
+                "end_city": cargo.get("end", {}).get("city", ""),
+                "distance_km": item.get("distance_km", 0),
+            })
+
+        # Build preference rules summary
+        pref_summary = self._format_rules_for_llm(rules, plan, day)
+
+        # Build history summary
+        history_text = history.get_summary(day)
+
+        # Construct LLM prompt
+        day_in_month = day % 31 + 1
+        month_idx = day // 31
+        month_name = {0: "3月", 1: "4月", 2: "5月"}.get(month_idx, f"第{month_idx+1}月")
+        hour, minute = divmod(tod, 60)
+
+        system_prompt = (
+            "你是一个智能货运调度决策AI。根据司机当前状态、决策历史、可用货源和偏好规则，"
+            "做出最优决策。你的目标是：1) 最大化净收入 2) 最小化偏好违规处罚 3) 完成品类指标。\n\n"
+            "可用动作：\n"
+            '- take_order: 接单。参数: {"cargo_id": "ID"}。优先选择目标品类、高价、短途的货\n'
+            '- wait: 等待。参数: {"duration_minutes": 分钟数}。仅在21:00-06:00夜休时段或货源确实不好时使用\n'
+            '- reposition: 空驶到新位置。参数: {"latitude": 纬度, "longitude": 经度}。'
+            '当附近无目标品类货源时，主动移动到可能有货的区域（根据地理常识判断）\n\n'
+            "重要规则：\n"
+            "- 21:00后不得接单或空驶（夜停休），在21:00-06:00期间只能wait\n"
+            "- 每月长途(>8h)最多5单\n"
+            "- 不要连续wait超过2次！如果当前货源不合适，应该reposition到新区域寻找更好货源\n"
+            "- 品类指标很重要：未达标会有高额罚款。优先接指标品类的货\n"
+            "- 只输出一个JSON对象: {\"action\": \"...\", \"params\": {...}, \"reason\": \"简短理由\"}\n"
+        )
+
+        # Add category target warning
+        cat_target, cat_needed = self._get_category_target(plan, day)
+        cat_warning = ""
+        if cat_target and cat_needed > 0:
+            cat_warning = f"\n⚠️ 品类指标警告: 本月需要'{cat_target}'至少12单，还差{cat_needed}单！优先接此品类。\n"
+
+        user_prompt = (
+            f"## 当前状态\n"
+            f"司机: {driver_id}, 位置: ({lat:.2f}, {lng:.2f})\n"
+            f"时间: {month_name}{day_in_month}日 {hour:02d}:{minute:02d}\n"
+            f"仿真进度: 第{day}天/{MONTH_DAYS}天\n"
+            f"{cat_warning}\n"
+            f"## 偏好规则与合规进度\n{pref_summary}\n\n"
+            f"## 决策历史\n{history_text}\n\n"
+            f"## 当前可用货源(前{len(cargo_summary)}条)\n"
+            f"{json.dumps(cargo_summary, ensure_ascii=False, indent=1)}\n\n"
+            f"请做出决策（只输出JSON）:"
+        )
+
+        try:
+            req = {
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                "temperature": 0.1,
+                "response_format": {"type": "json_object"},
+            }
+            resp = self._api.model_chat_completion(req)
+            elapsed = time.time() - start_time
+
+            # Timeout check: if >60s, log warning (for next iteration consider disabling thinking)
+            if elapsed > 60:
+                self._logger.warning(
+                    "[LLM] decision took %.1fs (>60s threshold) driver_id=%s",
+                    elapsed, driver_id
+                )
+
+            # Parse LLM response
+            content = resp.get("choices", [{}])[0].get("message", {}).get("content", "")
+            data = json.loads(content) if content else None
+            if data and "action" in data:
+                action_type = data["action"]
+                params = data.get("params", {})
+                reason = data.get("reason", "")
+                self._logger.info(
+                    "[LLM] decision driver_id=%s action=%s reason=%s elapsed=%.1fs",
+                    driver_id, action_type, reason, elapsed
+                )
+                # Validate against hard constraints before accepting
+                if action_type == "take_order" and "cargo_id" in params:
+                    # Constraint: no actions after 21:00 (no_drive_windows)
+                    night_start = None
+                    if rules.no_drive_windows:
+                        for ws, _we in rules.no_drive_windows:
+                            if ws < DAY_MINUTES:
+                                night_start = ws
+                            if tod >= ws:
+                                self._logger.info(
+                                    "[LLM] rejected take_order: in no_drive_window tod=%d ws=%d",
+                                    tod, ws)
+                                return None  # fall to rule engine
+                    # Constraint: order must complete before night start
+                    cargo_id = str(params["cargo_id"])
+                    cargo_cost_time = 0
+                    month_idx = day // 31
+                    for item in items:
+                        c = item.get("cargo", {})
+                        if str(c.get("cargo_id", "")) == cargo_id:
+                            cargo_cost_time = c.get("cost_time_minutes", 0)
+                            break
+                    if night_start and cargo_cost_time > 0:
+                        order_end_tod = tod + cargo_cost_time
+                        if order_end_tod > night_start:
+                            self._logger.info(
+                                "[LLM] rejected take_order: would end at tod=%d past night=%d",
+                                order_end_tod, night_start)
+                            return None
+                    # Constraint: long-haul limit check
+                    longhual_count = plan.get("monthly_longhual", {}).get(month_idx, 0)
+                    if longhual_count >= 5 and cargo_cost_time > 480:
+                        self._logger.info(
+                            "[LLM] rejected take_order: long-haul limit reached month=%d",
+                            month_idx)
+                        return None
+                    return self._take_order(str(params["cargo_id"]))
+                elif action_type == "wait" and "duration_minutes" in params:
+                    dur = int(params["duration_minutes"])
+                    return self._wait(min(dur, DAY_MINUTES - tod))  # cap to end of day
+                elif action_type == "reposition" and "latitude" in params and "longitude" in params:
+                    # Constraint: no reposition during no_drive_windows
+                    if rules.no_drive_windows:
+                        for ws, _we in rules.no_drive_windows:
+                            if tod >= ws:
+                                self._logger.info(
+                                    "[LLM] rejected reposition: in no_drive_window tod=%d", tod)
+                                return None
+                    return self._reposition(float(params["latitude"]), float(params["longitude"]))
+        except json.JSONDecodeError as exc:
+            self._logger.warning("[LLM] JSON parse failed driver_id=%s: %s", driver_id, exc)
+        except Exception as exc:
+            self._logger.warning("[LLM] decision failed driver_id=%s: %s", driver_id, exc)
+
+        return None  # fallback to rule engine
+
+    def _format_rules_for_llm(self, rules: DriverRules, plan: dict, day: int) -> str:
+        """Format driver rules and compliance progress as concise text for LLM."""
+        month_idx = day // 31
+        lines = []
+        if rules.rest_window:
+            rs, re_ = rules.rest_window
+            lines.append(f"- 休息窗口: {rs//60:02d}:{rs%60:02d}-{re_//60:02d}:{re_%60:02d}")
+        if rules.no_drive_windows:
+            for ws, we in rules.no_drive_windows:
+                lines.append(f"- 禁止接单/空驶: {ws//60:02d}:{ws%60:02d}-{we//60:02d}:{we%60:02d}")
+        if rules.forbidden_categories:
+            lines.append(f"- 禁运品类: {', '.join(rules.forbidden_categories)}")
+        if rules.forbidden_regions:
+            lines.append(f"- 禁入区域: {', '.join(rules.forbidden_regions)}")
+        if rules.pickup_max_km:
+            lines.append(f"- 空驶上限: {rules.pickup_max_km}km")
+        if rules.daily_order_limit:
+            today_count = plan.get("orders_today", {}).get(day, 0)
+            lines.append(f"- 每日接单上限: {rules.daily_order_limit} (今日已接{today_count})")
+
+        # Category targets with progress
+        cat_orders = plan.get("monthly_category_orders", {}).get(month_idx, {})
+        longhual = plan.get("monthly_longhual", {}).get(month_idx, 0)
+        lines.append(f"- 本月长途(>8h): {longhual}/5单上限")
+        lines.append(f"- 本月品类接单: {json.dumps(cat_orders, ensure_ascii=False)}")
+
+        # Add raw preference texts for context
+        prefs = self._get_active_preferences(rules, day)
+        if prefs:
+            lines.append("\n原始偏好文本:")
+            for p in prefs:
+                lines.append(f"  「{p}」")
+
+        return "\n".join(lines)
+
+    def _get_active_preferences(self, rules: DriverRules, day: int) -> list[str]:
+        """Get the active preference texts for the current day (from seen_prefs)."""
+        # This retrieves all preference texts that have been parsed
+        texts = []
+        for driver_id, seen in self._seen_prefs.items():
+            texts.extend(seen)
+        return list(texts)[:4]  # limit to 4 most recent
 
     # --------------------------------------------------------------- scheduler
     def _schedule(self, driver_id, status, rules, plan, now, lat, lng) -> dict[str, Any]:
@@ -569,81 +979,78 @@ class ModelDecisionService:
         return self._take_order(str(best.get("cargo_id")))
 
     def _llm_category_reposition(self, driver_id, plan, now, lat, lng, day, cat_target, cat_needed):
-        """Use LLM to decide where to reposition for target category cargo.
-        
-        Provides the LLM with current position, target category, and asks it to
-        suggest a city/area known for that cargo type to reposition to.
-        """
-        # Known cargo hubs for category types in Guangdong
-        # 水果: concentrated in Guangzhou (Baiyun, Nansha), Dongguan, Foshan
-        # 建材: concentrated throughout PRD with higher density
-        _CATEGORY_HUBS = {
-            "水果": [
-                (23.18, 113.26, "广州白云区"),  # Baiyun - highest concentration
-                (22.80, 113.53, "广州南沙区"),  # Nansha
-                (23.02, 113.75, "东莞"),        # Dongguan
-                (23.02, 113.12, "佛山"),        # Foshan
-            ],
-            "建材": [
-                (23.13, 113.26, "广州"),
-                (22.55, 114.06, "深圳"),
-                (23.02, 113.75, "东莞"),
-                (22.92, 113.18, "珠三角中心"),
-            ],
-        }
-        hubs = _CATEGORY_HUBS.get(cat_target, [])
-        if not hubs:
-            return None
+        """Use LLM with history context to decide reposition for target category cargo.
 
-        # Use LLM to evaluate which hub to go to based on current state
+        No hardcoded region knowledge — relies entirely on LLM's general knowledge
+        and the decision history to determine optimal reposition target.
+        """
+        history = self._history.get(driver_id)
+        history_text = history.get_summary(day) if history else "无历史记录"
+
         day_of_month = day % 31 + 1
-        month_name = {0: "三月", 1: "四月", 2: "五月"}.get(day // 31, "")
+        month_idx = day // 31
+        month_name = {0: "三月", 1: "四月", 2: "五月"}.get(month_idx, "")
+
+        # Query broader cargo to find where target category exists
+        cargo_resp = self._api.query_cargo(driver_id=driver_id, latitude=lat, longitude=lng, k=200)
+        items = cargo_resp.get("items", [])
+        # Find target category cargo in results
+        target_locations = []
+        for item in items:
+            cargo = item.get("cargo", {})
+            if cargo.get("cargo_name") == cat_target:
+                start = cargo.get("start", {})
+                target_locations.append({
+                    "lat": start.get("lat", 0),
+                    "lng": start.get("lng", 0),
+                    "city": start.get("city", "未知"),
+                    "distance_km": item.get("distance_km", 0),
+                })
+
         prompt = (
-            f"你是一个货运调度AI。司机当前位置: ({lat:.2f}, {lng:.2f})。\n"
-            f"当前是{month_name}第{day_of_month}天，需要完成'{cat_target}'品类指标，还差{cat_needed}单。\n"
-            f"以下是{cat_target}货源集中区域（编号-纬度-经度-名称）：\n"
+            f"你是货运调度AI。司机当前位置: ({lat:.2f}, {lng:.2f})，{month_name}第{day_of_month}天。\n"
+            f"品类指标: '{cat_target}'还差{cat_needed}单。\n\n"
+            f"决策历史:\n{history_text}\n\n"
         )
-        for i, (hlat, hlng, name) in enumerate(hubs):
-            dist = _haversine_km(lat, lng, hlat, hlng)
-            prompt += f"  {i+1}. ({hlat:.2f}, {hlng:.2f}) {name} - 距离{dist:.0f}km\n"
-        prompt += (
-            f"\n请选择最佳重定位目的地（考虑距离和货源密度），只回复编号(1-{len(hubs)})。"
-        )
+        if target_locations:
+            prompt += f"附近发现{len(target_locations)}条'{cat_target}'货源:\n"
+            for i, loc in enumerate(target_locations[:5]):
+                prompt += f"  {i+1}. ({loc['lat']:.2f},{loc['lng']:.2f}) {loc['city']} 距离{loc['distance_km']:.0f}km\n"
+            prompt += "\n请选择最佳重定位目的地，输出JSON: {\"latitude\": 纬度, \"longitude\": 经度, \"reason\": \"理由\"}"
+        else:
+            prompt += (
+                f"附近200条货源中无'{cat_target}'类。请根据你对中国物流地理的了解，"
+                f"推测'{cat_target}'货源可能集中的区域，输出JSON: "
+                f"{{\"latitude\": 纬度, \"longitude\": 经度, \"reason\": \"理由\"}}"
+            )
 
         try:
             req = {
                 "messages": [
-                    {"role": "system", "content": "你是货运路线规划助手，只回复一个数字编号。"},
+                    {"role": "system", "content": "你是货运路线规划助手。输出纯JSON，不要markdown。"},
                     {"role": "user", "content": prompt},
                 ],
                 "temperature": 0,
-                "max_tokens": 10,
+                "response_format": {"type": "json_object"},
+                "max_tokens": 100,
             }
             resp = self._api.model_chat_completion(req)
             content = resp.get("choices", [{}])[0].get("message", {}).get("content", "")
-            # Extract number from response
-            import re
-            nums = re.findall(r'\d+', content)
-            if nums:
-                idx = int(nums[0]) - 1
-                if 0 <= idx < len(hubs):
-                    target_lat, target_lng, target_name = hubs[idx]
+            data = json.loads(content) if content else None
+            if data and "latitude" in data and "longitude" in data:
+                target_lat = float(data["latitude"])
+                target_lng = float(data["longitude"])
+                reason = data.get("reason", "")
+                dist = _haversine_km(lat, lng, target_lat, target_lng)
+                if dist > 5:  # only reposition if meaningful distance
                     self._logger.info(
-                        "[LLM] category reposition driver_id=%s target=%s cat=%s needed=%d",
-                        driver_id, target_name, cat_target, cat_needed
+                        "[LLM] category reposition driver_id=%s target=(%.2f,%.2f) cat=%s needed=%d reason=%s",
+                        driver_id, target_lat, target_lng, cat_target, cat_needed, reason
                     )
                     return self._reposition(target_lat, target_lng)
         except Exception as exc:
             self._logger.warning("[LLM] category reposition failed: %s", exc)
 
-        # Fallback: reposition to nearest hub
-        nearest = min(hubs, key=lambda h: _haversine_km(lat, lng, h[0], h[1]))
-        if _haversine_km(lat, lng, nearest[0], nearest[1]) > 10:
-            self._logger.info(
-                "[LLM] fallback reposition driver_id=%s target=%s cat=%s",
-                driver_id, nearest[2], cat_target
-            )
-            return self._reposition(nearest[0], nearest[1])
         return None
 
     def _anti_strand(self, driver_id, rules, plan, now, lat, lng, day, day_end):
