@@ -17,8 +17,6 @@ if str(_SERVER_ROOT) not in sys.path:
 from bench.evaluation_runner import EvaluationRunner
 from bench.settings import _resolve_model_api_key, build_app_settings, load_settings
 
-_DEFAULT_MODEL_API_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
-
 
 def _resolve_agent_dir(agent_dir: Path) -> Path:
     resolved = agent_dir.resolve()
@@ -79,7 +77,7 @@ def main() -> int:
         sys.path.insert(0, str(submission_demo_root.resolve()))
 
     config_path = Path(args.config) if args.config else None
-    defaults = load_settings(config_path) if config_path or (_SERVER_ROOT / "config" / "config.json").is_file() else None
+    defaults = load_settings(config_path)
 
     try:
         settings = build_app_settings(
@@ -88,38 +86,29 @@ def main() -> int:
             results_dir=results_dir,
             log_dir=results_dir / "logs",
             reposition_speed_km_per_hour=float(
-                args.reposition_speed
-                if args.reposition_speed is not None
-                else (defaults.reposition_speed_km_per_hour if defaults else 60.0)
+                args.reposition_speed if args.reposition_speed is not None else defaults.reposition_speed_km_per_hour
             ),
             simulation_max_steps=int(
-                args.simulation_max_steps
-                if args.simulation_max_steps is not None
-                else (defaults.simulation_max_steps if defaults else 20000)
+                args.simulation_max_steps if args.simulation_max_steps is not None else defaults.simulation_max_steps
             ),
             simulation_duration_days=int(
-                args.simulation_days
-                if args.simulation_days is not None
-                else (defaults.simulation_duration_days if defaults else 31)
+                args.simulation_days if args.simulation_days is not None else defaults.simulation_duration_days
             ),
             model_api_url=str(
-                args.model_api_url
-                if args.model_api_url is not None
-                else (defaults.model_api_url if defaults else _DEFAULT_MODEL_API_URL)
+                args.model_api_url if args.model_api_url is not None else defaults.model_api_url
             ).strip(),
-            model_api_key=_resolve_model_api_key(
-                defaults.model_api_key if defaults else ""
-            ),
-            model_name=str(
-                args.model_name if args.model_name is not None else (defaults.model_name if defaults else "qwen3.5-flash")
-            ).strip(),
+            model_api_key=_resolve_model_api_key(defaults.model_api_key),
+            model_name=str(args.model_name if args.model_name is not None else defaults.model_name).strip(),
             model_timeout_seconds=float(
-                args.model_timeout
-                if args.model_timeout is not None
-                else (defaults.model_timeout_seconds if defaults else 120.0)
+                args.model_timeout if args.model_timeout is not None else defaults.model_timeout_seconds
             ),
+            decision_step_timeout_seconds=defaults.decision_step_timeout_seconds,
         )
-        runner = EvaluationRunner(settings=settings, max_steps=args.max_steps)
+        runner = EvaluationRunner(
+            settings=settings,
+            max_steps=args.max_steps,
+            decision_step_timeout_seconds=settings.decision_step_timeout_seconds,
+        )
         runner.run()
         return 0
     except Exception:

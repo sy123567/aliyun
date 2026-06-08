@@ -46,6 +46,7 @@ class AppSettings:
     model_api_key: str
     model_name: str
     model_timeout_seconds: float
+    decision_step_timeout_seconds: float
 
 
 def build_app_settings(
@@ -62,6 +63,7 @@ def build_app_settings(
     model_api_key: str,
     model_name: str,
     model_timeout_seconds: float = 60.0,
+    decision_step_timeout_seconds: float = 120.0,
 ) -> AppSettings:
     if reposition_speed_km_per_hour <= 0:
         raise ValueError("reposition_speed_km_per_hour 必须为正数")
@@ -73,6 +75,8 @@ def build_app_settings(
         raise ValueError("driver_max_total_tokens 必须为正整数")
     if model_timeout_seconds <= 0:
         raise ValueError("model_timeout_seconds 必须为正数")
+    if decision_step_timeout_seconds <= 0:
+        raise ValueError("decision_step_timeout_seconds 必须为正数")
     return AppSettings(
         cargo_dataset_path=cargo_dataset_path.resolve(),
         drivers_path=drivers_path.resolve(),
@@ -86,6 +90,7 @@ def build_app_settings(
         model_api_key=model_api_key.strip(),
         model_name=model_name.strip(),
         model_timeout_seconds=float(model_timeout_seconds),
+        decision_step_timeout_seconds=float(decision_step_timeout_seconds),
     )
 
 
@@ -123,9 +128,12 @@ def load_settings(config_path: Path | None = None) -> AppSettings:
     model_name = raw.get("model_name")
     if not isinstance(model_name, str) or not model_name.strip():
         raise ValueError("config.json 缺少有效字段 model_name（字符串）")
-    model_timeout_seconds = raw.get("model_timeout_seconds", 60)
+    model_timeout_seconds = raw.get("model_timeout_seconds")
     if not isinstance(model_timeout_seconds, (int, float)) or float(model_timeout_seconds) <= 0:
         raise ValueError("config.json 缺少有效字段 model_timeout_seconds（正数）")
+    decision_step_timeout_seconds = raw.get("decision_step_timeout_seconds")
+    if not isinstance(decision_step_timeout_seconds, (int, float)) or float(decision_step_timeout_seconds) <= 0:
+        raise ValueError("config.json 缺少有效字段 decision_step_timeout_seconds（正数）")
     cargo_path = Path(cargo_rel)
     drivers_path = Path(drivers_rel)
     results_path = Path(results_rel)
@@ -151,4 +159,5 @@ def load_settings(config_path: Path | None = None) -> AppSettings:
         model_api_key=model_api_key,
         model_name=model_name,
         model_timeout_seconds=float(model_timeout_seconds),
+        decision_step_timeout_seconds=float(decision_step_timeout_seconds),
     )

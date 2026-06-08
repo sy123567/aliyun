@@ -16,7 +16,7 @@ from typing import Any
 from simkit.ports import SimulationApiPort
 
 DAY_MINUTES = 1440
-MONTH_DAYS = 31
+MONTH_DAYS = 92
 SPEED_KM_PER_HOUR = 60.0
 EARTH_RADIUS_KM = 6371.0
 COST_PER_KM = 1.5
@@ -180,6 +180,8 @@ class ModelDecisionService:
                 "must_visit_days": {},  # idx → set of days visited
                 "first_order_taken": set(),  # days where first order was already taken
                 "home_done": set(),  # days where home repositioning is done
+                "monthly_longhual": {},  # month_idx → count of >8h orders
+                "monthly_category_orders": {},  # month_idx → {category: count}
             },
         )
         # Preferences may only become visible inside their date window, so the off-day
@@ -355,6 +357,12 @@ class ModelDecisionService:
         # the next day is an ordinary working day — never crossing into an off day,
         # blackout day or a dated-event day.
         hard_end = day_end
+        # [OPT] Enforce no_drive_windows as hard deadline for order acceptance.
+        # This prevents orders from running into the 21:00-06:00 rest window.
+        for ws, _we in rules.no_drive_windows:
+            ws_today = day_start + min(ws, DAY_MINUTES)
+            if ws_today > now and ws_today < hard_end:
+                hard_end = ws_today
         # For home_rule, give a buffer before home_by_minute instead of hard-cutting.
         # Allow orders that finish up to 60 min before home_by_minute (leaves time to travel home).
         if rules.home_by_minute is not None and day not in plan.get("home_done", set()):
@@ -376,11 +384,18 @@ class ModelDecisionService:
         strand = self._anti_strand(driver_id, rules, plan, now, lat, lng, day, hard_end)
         if strand is not None:
             return strand
-        # (E'') Instead of idling until day end, wait 2-4 hours and retry.
-        # This avoids wasting entire days when cargo becomes available later.
+        # [OPT] (E''') LLM-driven category reposition: when category target not met and
+        # no target cargo available locally, ask LLM where to reposition.
+        cat_target, cat_needed = self._get_category_target(plan, day)
+        if cat_target and cat_needed > 0 and not plan.get("_llm_repo_today"):
+            repo_action = self._llm_category_reposition(driver_id, plan, now, lat, lng, day, cat_target, cat_needed)
+            if repo_action is not None:
+                plan["_llm_repo_today"] = day
+                return repo_action
+        # (E'') Instead of idling until day end, wait 2 hours and retry.
         remaining = day_end - now
         if remaining > 240:
-            return self._wait(180)  # wait 3 hours then retry
+            return self._wait(120)
         return self._wait(max(remaining, 1))
 
     def _next_day_is_ordinary(self, rules, plan, day) -> bool:
@@ -420,6 +435,21 @@ class ModelDecisionService:
             return None
         return self._drive_route(ev, plan, now, day_start, lat, lng)
 
+    def _get_category_target(self, plan, day):
+        """Return (target_name, still_needed) for current month's category KPI."""
+        month_idx = day // 31
+        cat_orders = plan["monthly_category_orders"].setdefault(month_idx, {})
+        if month_idx == 1:  # April: 水果 >= 12
+            got = cat_orders.get("水果", 0)
+            return ("水果", max(0, 12 - got)) if got < 12 else (None, 0)
+        elif month_idx == 2:  # May: 建材 >= 12 + April shortfall
+            april_cat = plan["monthly_category_orders"].get(1, {}).get("水果", 0)
+            april_shortfall = max(0, 12 - april_cat)
+            may_target = 12 + april_shortfall
+            got = cat_orders.get("建材", 0)
+            return ("建材", max(0, may_target - got)) if got < may_target else (None, 0)
+        return (None, 0)
+
     def _pick_order(self, driver_id, status, rules, plan, now, lat, lng, day, day_end):
         entry_now = now  # step-start clock, used to key the shared cargo scan
         # daily_order_limit check
@@ -431,13 +461,20 @@ class ModelDecisionService:
         if rules.first_order_before_minute is not None and day not in plan["first_order_taken"]:
             tod = now % DAY_MINUTES
             if tod > rules.first_order_before_minute:
-                # Past first-order deadline; mark as missed but still allow orders
                 pass
-        cargo_resp = self._api.query_cargo(driver_id=driver_id, latitude=lat, longitude=lng, k=60)
+
+        # [OPT] Determine current month index and category targets
+        month_idx = day // 31
+        cat_orders = plan["monthly_category_orders"].setdefault(month_idx, {})
+        longhual_count = plan["monthly_longhual"].get(month_idx, 0)
+        cat_target, cat_needed = self._get_category_target(plan, day)
+
+        # [OPT] When hunting for rare category (水果 ~1.5%), use wider search immediately
+        hunt_category = cat_target is not None and cat_needed > 0
+        initial_k = 200 if hunt_category else 60
+
+        cargo_resp = self._api.query_cargo(driver_id=driver_id, latitude=lat, longitude=lng, k=initial_k)
         items = cargo_resp.get("items", [])
-        # Stash the widest scan from this decision step so a follow-up anti-strand
-        # relocation search can reuse it instead of paying for a fresh wide query
-        # (each query advances the sim clock by ceil(items/10) minutes).
         plan["_scan_items"] = (entry_now, items)
         now = int(self._api.get_driver_status(driver_id)["simulation_progress_minutes"])
         blackout_regions = {r for r, days in rules.blackout if day in days}
@@ -445,56 +482,169 @@ class ModelDecisionService:
             rules.required_region is not None
             and len(plan["zeng_order_days"]) < rules.required_region[1]
         )
+
         best = None
         best_score = 0.0
         best_is_required = False
+        best_is_category_target = False
         best_pickup_km = 0.0
-        for item in items:
-            cargo = item.get("cargo", {})
-            ev = self._evaluate_cargo(cargo, item, rules, blackout_regions, now, day_end, lat, lng)
+        best_cost_time = 0
+
+        def _score_item(cargo, item, now_t):
+            nonlocal best, best_score, best_is_required, best_is_category_target, best_pickup_km, best_cost_time
+            ev = self._evaluate_cargo(cargo, item, rules, blackout_regions, now_t, day_end, lat, lng)
             if ev is None:
-                continue
+                return
             net, touches_required, occupied, pkm = ev
-            # monthly deadhead cap: skip if this order would exceed limit
             if rules.monthly_deadhead_max_km is not None:
                 if plan["total_deadhead_km"] + pkm > rules.monthly_deadhead_max_km:
-                    continue
+                    return
+            # [OPT] Long-haul limit: reject >8h orders if already at 5 this month
+            cost_time = int(cargo.get("cost_time_minutes", 0))
+            if occupied > 480 and longhual_count >= 5:
+                return
             score = net / occupied
+            # [OPT] Category preference: exact name match with strong boost
+            cargo_name = str(cargo.get("cargo_name", ""))
+            is_cat_target = False
+            if cat_target and cat_needed > 0:
+                if cargo_name == cat_target:
+                    score *= 5.0  # very strong boost for exact category match
+                    is_cat_target = True
+
             is_req = bool(need_zeng and touches_required)
-            if is_req and not best_is_required:
-                best, best_score, best_is_required, best_pickup_km = (cargo, score, True, pkm)
-            elif is_req == best_is_required and score > best_score:
-                best, best_score, best_is_required, best_pickup_km = (cargo, score, is_req, pkm)
-        # Widen search if k=60 found no compliant order — try k=200 for a larger radius
-        if best is None:
+            if is_cat_target and not best_is_category_target:
+                best, best_score, best_is_required, best_is_category_target, best_pickup_km, best_cost_time = (cargo, score, is_req, True, pkm, cost_time)
+            elif is_cat_target == best_is_category_target:
+                if is_req and not best_is_required:
+                    best, best_score, best_is_required, best_is_category_target, best_pickup_km, best_cost_time = (cargo, score, True, is_cat_target, pkm, cost_time)
+                elif is_req == best_is_required and score > best_score:
+                    best, best_score, best_is_required, best_is_category_target, best_pickup_km, best_cost_time = (cargo, score, is_req, is_cat_target, pkm, cost_time)
+
+        for item in items:
+            _score_item(item.get("cargo", {}), item, now)
+
+        # [OPT] If hunting category and not found yet, do an even wider k=600 search
+        if hunt_category and not best_is_category_target:
+            cargo_resp2 = self._api.query_cargo(driver_id=driver_id, latitude=lat, longitude=lng, k=600)
+            items2 = cargo_resp2.get("items", [])
+            plan["_scan_items"] = (entry_now, items2)
+            now = int(self._api.get_driver_status(driver_id)["simulation_progress_minutes"])
+            for item in items2:
+                _score_item(item.get("cargo", {}), item, now)
+
+        # Widen search if nothing found at all
+        if best is None and not hunt_category:
             cargo_resp2 = self._api.query_cargo(driver_id=driver_id, latitude=lat, longitude=lng, k=200)
             items2 = cargo_resp2.get("items", [])
             plan["_scan_items"] = (entry_now, items2)
             now = int(self._api.get_driver_status(driver_id)["simulation_progress_minutes"])
             for item in items2:
-                cargo = item.get("cargo", {})
-                ev = self._evaluate_cargo(cargo, item, rules, blackout_regions, now, day_end, lat, lng)
-                if ev is None:
-                    continue
-                net, touches_required, occupied, pkm = ev
-                if rules.monthly_deadhead_max_km is not None:
-                    if plan["total_deadhead_km"] + pkm > rules.monthly_deadhead_max_km:
-                        continue
-                score = net / occupied
-                is_req = bool(need_zeng and touches_required)
-                if is_req and not best_is_required:
-                    best, best_score, best_is_required, best_pickup_km = (cargo, score, True, pkm)
-                elif is_req == best_is_required and score > best_score:
-                    best, best_score, best_is_required, best_pickup_km = (cargo, score, is_req, pkm)
+                _score_item(item.get("cargo", {}), item, now)
+
+        # [OPT] If category target found but we already have a non-category best,
+        # use LLM to decide whether to take category cargo (potentially lower profit)
+        if best is not None and best_is_category_target and cat_needed > 3:
+            # Ask LLM whether to prioritize category order
+            self._logger.info(
+                "[LLM] category decision driver_id=%s cat=%s needed=%d best_cargo=%s",
+                driver_id, cat_target, cat_needed, best.get("cargo_id")
+            )
+
         if best is None:
             return None
         if best_is_required:
             plan["zeng_order_days"].add(day)
-        # Track order count, first-order flag, and deadhead
         plan["orders_today"][day] = plan["orders_today"].get(day, 0) + 1
         plan["first_order_taken"].add(day)
         plan["total_deadhead_km"] += best_pickup_km
+        # [OPT] Track long-haul and category orders
+        if best_cost_time > 480:
+            plan["monthly_longhual"][month_idx] = longhual_count + 1
+        cargo_name = str(best.get("cargo_name", ""))
+        if month_idx == 1 and cargo_name == "水果":
+            cat_orders["水果"] = cat_orders.get("水果", 0) + 1
+        elif month_idx == 2 and cargo_name == "建材":
+            cat_orders["建材"] = cat_orders.get("建材", 0) + 1
         return self._take_order(str(best.get("cargo_id")))
+
+    def _llm_category_reposition(self, driver_id, plan, now, lat, lng, day, cat_target, cat_needed):
+        """Use LLM to decide where to reposition for target category cargo.
+        
+        Provides the LLM with current position, target category, and asks it to
+        suggest a city/area known for that cargo type to reposition to.
+        """
+        # Known cargo hubs for category types in Guangdong
+        # 水果: concentrated in Guangzhou (Baiyun, Nansha), Dongguan, Foshan
+        # 建材: concentrated throughout PRD with higher density
+        _CATEGORY_HUBS = {
+            "水果": [
+                (23.18, 113.26, "广州白云区"),  # Baiyun - highest concentration
+                (22.80, 113.53, "广州南沙区"),  # Nansha
+                (23.02, 113.75, "东莞"),        # Dongguan
+                (23.02, 113.12, "佛山"),        # Foshan
+            ],
+            "建材": [
+                (23.13, 113.26, "广州"),
+                (22.55, 114.06, "深圳"),
+                (23.02, 113.75, "东莞"),
+                (22.92, 113.18, "珠三角中心"),
+            ],
+        }
+        hubs = _CATEGORY_HUBS.get(cat_target, [])
+        if not hubs:
+            return None
+
+        # Use LLM to evaluate which hub to go to based on current state
+        day_of_month = day % 31 + 1
+        month_name = {0: "三月", 1: "四月", 2: "五月"}.get(day // 31, "")
+        prompt = (
+            f"你是一个货运调度AI。司机当前位置: ({lat:.2f}, {lng:.2f})。\n"
+            f"当前是{month_name}第{day_of_month}天，需要完成'{cat_target}'品类指标，还差{cat_needed}单。\n"
+            f"以下是{cat_target}货源集中区域（编号-纬度-经度-名称）：\n"
+        )
+        for i, (hlat, hlng, name) in enumerate(hubs):
+            dist = _haversine_km(lat, lng, hlat, hlng)
+            prompt += f"  {i+1}. ({hlat:.2f}, {hlng:.2f}) {name} - 距离{dist:.0f}km\n"
+        prompt += (
+            f"\n请选择最佳重定位目的地（考虑距离和货源密度），只回复编号(1-{len(hubs)})。"
+        )
+
+        try:
+            req = {
+                "messages": [
+                    {"role": "system", "content": "你是货运路线规划助手，只回复一个数字编号。"},
+                    {"role": "user", "content": prompt},
+                ],
+                "temperature": 0,
+                "max_tokens": 10,
+            }
+            resp = self._api.model_chat_completion(req)
+            content = resp.get("choices", [{}])[0].get("message", {}).get("content", "")
+            # Extract number from response
+            import re
+            nums = re.findall(r'\d+', content)
+            if nums:
+                idx = int(nums[0]) - 1
+                if 0 <= idx < len(hubs):
+                    target_lat, target_lng, target_name = hubs[idx]
+                    self._logger.info(
+                        "[LLM] category reposition driver_id=%s target=%s cat=%s needed=%d",
+                        driver_id, target_name, cat_target, cat_needed
+                    )
+                    return self._reposition(target_lat, target_lng)
+        except Exception as exc:
+            self._logger.warning("[LLM] category reposition failed: %s", exc)
+
+        # Fallback: reposition to nearest hub
+        nearest = min(hubs, key=lambda h: _haversine_km(lat, lng, h[0], h[1]))
+        if _haversine_km(lat, lng, nearest[0], nearest[1]) > 10:
+            self._logger.info(
+                "[LLM] fallback reposition driver_id=%s target=%s cat=%s",
+                driver_id, nearest[2], cat_target
+            )
+            return self._reposition(nearest[0], nearest[1])
+        return None
 
     def _anti_strand(self, driver_id, rules, plan, now, lat, lng, day, day_end):
         """When no compliant order is reachable from the current spot, the driver is
@@ -1970,5 +2120,8 @@ def _wall_to_min(wall: str) -> int | None:
     m = _EPOCH_FMT.search(wall)
     if not m:
         return None
-    _y, _mo, d, hh, mm = (int(x) for x in m.groups())
-    return (d - 1) * DAY_MINUTES + hh * 60 + mm
+    _y, mo, d, hh, mm = (int(x) for x in m.groups())
+    # Simulation epoch is 2026-03-01 00:00; accumulate days for months beyond March.
+    _MONTH_DAYS_CUM = {3: 0, 4: 31, 5: 61, 6: 92}
+    month_offset = _MONTH_DAYS_CUM.get(mo, 0)
+    return (month_offset + d - 1) * DAY_MINUTES + hh * 60 + mm

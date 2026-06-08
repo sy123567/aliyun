@@ -24,10 +24,15 @@ class EvaluationRunner:
         config_path: Path | None = None,
         settings: AppSettings | None = None,
         max_steps: int | None = None,
+        *,
+        resume: bool = False,
+        decision_step_timeout_seconds: float = 120.0,
     ) -> None:
         self._config_path = config_path
         self._settings = settings
         self._max_steps = max_steps
+        self._resume = resume
+        self._decision_step_timeout_seconds = decision_step_timeout_seconds
         self._logger = logging.getLogger("bench.evaluation_runner")
 
     def run(self) -> dict[str, Any]:
@@ -70,6 +75,8 @@ class EvaluationRunner:
                 simulation_duration_days=settings.simulation_duration_days,
                 driver_max_total_tokens=settings.driver_max_total_tokens,
                 session_actions_by_driver=session_actions_by_driver,
+                resume=self._resume,
+                decision_step_timeout_seconds=self._decision_step_timeout_seconds,
             )
 
             manager.start_simulation_minutes(driver_id=None, progress_minutes=0)
