@@ -6,6 +6,7 @@
   "model_api_key": "",
   "model_name": "qwen3.5-flash",
   "model_timeout_seconds": 60,
+  "decision_step_timeout_seconds": 120,
   "results_dir": "results",
   "log_dir": "results/logs",
   "simulation_max_steps": 20000,

@@ -37,6 +37,8 @@ class ModelGatewayClient:
     def _build_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
         body = dict(payload)
         body.setdefault("model", self._default_model_name)
+        # 默认关闭；agent 在 payload 中显式传 enable_thinking=True 可开启
+        body.setdefault("enable_thinking", False)
         return body
 
     def _build_headers(self) -> dict[str, str]:
