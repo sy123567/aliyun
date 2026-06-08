@@ -526,22 +526,37 @@ class ModelDecisionService:
                                     "[LLM] rejected take_order: in no_drive_window tod=%d ws=%d",
                                     tod, ws)
                                 return None  # fall to rule engine
-                    # Constraint: order must complete before night start
+                    # Constraint: order must complete before night start (incl. pickup deadhead)
                     cargo_id = str(params["cargo_id"])
                     cargo_cost_time = 0
+                    pickup_distance_km = 0.0
                     month_idx = day // 31
                     for item in items:
                         c = item.get("cargo", {})
                         if str(c.get("cargo_id", "")) == cargo_id:
                             cargo_cost_time = c.get("cost_time_minutes", 0)
+                            pickup_distance_km = item.get("distance_km", 0.0)
                             break
-                    if night_start and cargo_cost_time > 0:
-                        order_end_tod = tod + cargo_cost_time
-                        if order_end_tod > night_start:
-                            self._logger.info(
-                                "[LLM] rejected take_order: would end at tod=%d past night=%d",
-                                order_end_tod, night_start)
-                            return None
+                    # Estimate pickup deadhead time: ~60km/h average speed + 15min safety margin
+                    pickup_time_min = int(pickup_distance_km / 60.0 * 60) if pickup_distance_km > 0 else 0
+                    safety_margin = 15  # buffer for loading/unloading delays
+                    if night_start:
+                        if cargo_cost_time > 0:
+                            total_order_time = pickup_time_min + cargo_cost_time + safety_margin
+                            order_end_tod = tod + total_order_time
+                            if order_end_tod > night_start:
+                                self._logger.info(
+                                    "[LLM] rejected take_order: would end at tod=%d past night=%d "
+                                    "(pickup=%dmin + haul=%dmin)",
+                                    order_end_tod, night_start, pickup_time_min, cargo_cost_time)
+                                return None
+                        else:
+                            # Unknown cargo duration: reject if less than 3h before night
+                            if tod > night_start - 180:
+                                self._logger.info(
+                                    "[LLM] rejected take_order: unknown duration, too close to night tod=%d",
+                                    tod)
+                                return None
                     # Constraint: long-haul limit check
                     longhual_count = plan.get("monthly_longhual", {}).get(month_idx, 0)
                     if longhual_count >= 5 and cargo_cost_time > 480:
