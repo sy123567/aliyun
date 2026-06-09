@@ -93,6 +93,45 @@ cd demo && python calc_monthly_income.py
 
 ---
 
+## 3.5 复赛 −44.7 万事故的根因与本轮修复（语义接地 + fail-safe + 历史自检）
+
+### 事故现象
+复赛两位未知司机：偏好扣分 **52.6 万** → 净收益 **−44.7 万**，token 烧到 289 万。
+
+### 根因（已定位）
+- 526,100 ÷ (2 司机 × ~92 天) ≈ **2,859/司机日**，恰是"一条**每日生效**约束被几乎每天违规一次"的量级；
+  夜休罚金 2,700/次 × 92 × 2 ≈ 49.7 万，与之吻合 → **最大头是夜间停车休息几乎每天被违规**。
+- 机制：偏好处理是 **LLM 抽取 → 关键词/子串"接地"校验 → 确定性调度执行**。
+  老的接地是**写死关键词白名单**：`no_drive_windows` 必须原文**同时**命中时间词+动作词
+  （`_ndw_grounded()`），否则**整条静默丢弃**；`forbidden_categories/regions`、`blackout`、
+  `avoid`、`monthly_category_targets` 用 `_text_supports()` 原词子串匹配接地。
+- 复赛偏好是自然语言、措辞会变："入夜收车""后半夜不揽货""天黑归家落锁"等没进白名单的说法
+  → LLM 即使抽对了夜休窗口也被**静默丢掉** → 调度器以为没有夜休 → **每天整夜出车，按天复利扣到 50 万**。
+- 关键不对称：**漏一条"每日生效"约束 ≈ 25 万/司机；多一条最多损失几小时收入**。老逻辑"宁可漏不可错"方向反了。
+
+### 本轮修复
+- **P0 时间窗 fail-safe**：`_merge_llm_rules` 里**删除 `_ndw_grounded()` 关键词门**，
+  直接采纳 temperature=0 抽出的 `no_drive_windows`（含跨夜 start>end），只做时刻合法性校验。
+  decision system prompt 里写死的 "21:00–06:00 夜停休" 文案改为**通用措辞**（不同司机时段不同），
+  实际时段来自解析结果。解析 prompt 强化：任何"入夜/天黑/后半夜…不出车/收车/归家不动/熄火"
+  一律填 `no_drive_windows`（+ 含休息含义则同时填 `rest_window`）。
+- **P1 语义接地**：新增 `_confirm_rule_holds(rule_desc, all_text, default=True)`——
+  用一次 temperature=0 的 LLM 调用判断"原文是否确实施加该约束"，**只有模型明确说"否"才丢弃，
+  调用失败/不确定一律保留（fail-safe）**；带缓存。替换 `no_drive_windows / forbidden_categories /
+  forbidden_regions / blackout / avoid_categories / monthly_category_targets` 的子串/关键词接地。
+  → 任意措辞都能泛化，根治"换个说法就丢规则"。（`allowed_regions / bounded_area / forbidden_zones`
+  这类"误加危害更大"的字段**仍保留原有保守门**，未放宽。）
+- **P3 历史自检**：`_compliance_self_audit()` 每天把司机的硬时间窗（休息/禁驶）作为
+  "【硬约束·每日生效】"块置于决策 prompt 顶部，并扫描滚动历史，若**昨日**有在禁驶时段出车的记录
+  就追加"【历史自检】昨日违规"提醒。纯历史查询、无额外 LLM 调用；因为罚分按天复利，
+  抓到一次即可阻止后续每天重犯。
+
+> 验证建议（本地无复赛司机数据）：自造"措辞刁钻"的夜休/禁区偏好喂进解析器，
+> 看日志 `parsed rules ... no_drive=...` 是否被采纳即可，几秒出结果，不必跑满月。
+> 满月跑分受 §2 网关不确定性影响，需多跑取均值。
+
+---
+
 ## 4. 仍然通用、未写死的既有设计（接手者可直接用）
 
 - **偏好解析**：自然语言 → 结构化 `DriverRules`，按时间窗增量触发；
