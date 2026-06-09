@@ -191,6 +191,17 @@ class EmbeddedAgentDecisionEngine:
         )
         return action
 
+    def update_decision_result(
+        self,
+        driver_id: str,
+        result: dict[str, Any],
+        cargo_info: dict[str, Any] | None = None,
+        action_start_minutes: int | None = None,
+    ) -> None:
+        updater = getattr(self._decision_service, "update_decision_result", None)
+        if callable(updater):
+            updater(driver_id, result, cargo_info, action_start_minutes)
+
 
 def build_embedded_agent_decision_engine(
     repo: CargoRepository,

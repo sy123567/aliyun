@@ -324,7 +324,9 @@ class SimulationOrchestrator:
         ctx.decision_latency.record(driver_id, decide_elapsed_ms)
         progress_after_decision = self._manager.get_simulation_progress_minutes()
         query_scan_cost_minutes = progress_after_decision - step_start_minutes
+        cargo_info = self._cargo_info_for_action(action)
         result = self._apply_action(driver_id, action)
+        self._notify_agent_result(driver_id, result, cargo_info, progress_after_decision)
         after_status = self._manager.get_driver_status(driver_id)
         current_progress = self._manager.get_simulation_progress_minutes()
         driver_progress_minutes = min(current_progress, ctx.month_duration_minutes)
@@ -371,6 +373,31 @@ class SimulationOrchestrator:
         self._driver_token_budget.record_step(driver_id, token_usage)
         self._flush_driver_actions(driver_id, ctx)
         return driver_progress_minutes
+
+    def _cargo_info_for_action(self, action: dict[str, Any]) -> dict[str, Any] | None:
+        if str(action.get("action", "")).strip().lower() != "take_order":
+            return None
+        params = action.get("params", {})
+        if not isinstance(params, dict):
+            return None
+        cargo_id = str(params.get("cargo_id", "")).strip()
+        if not cargo_id:
+            return None
+        cargo = self._repo.get_by_id(cargo_id)
+        if not isinstance(cargo, dict):
+            return None
+        return simulation_actions.normalize_cargo_price_to_yuan(cargo)
+
+    def _notify_agent_result(
+        self,
+        driver_id: str,
+        result: dict[str, Any],
+        cargo_info: dict[str, Any] | None,
+        action_start_minutes: int | None = None,
+    ) -> None:
+        updater = getattr(self._agent_decision, "update_decision_result", None)
+        if callable(updater):
+            updater(driver_id, result, cargo_info, action_start_minutes)
 
     def _replay_driver_actions(
         self,
@@ -565,7 +592,17 @@ class SimulationOrchestrator:
             for item in actions:
                 file.write(json.dumps(item, ensure_ascii=False))
                 file.write("\n")
-        tmp_path.replace(path)
+        last_error: PermissionError | None = None
+        for attempt in range(5):
+            try:
+                tmp_path.replace(path)
+                break
+            except PermissionError as exc:
+                last_error = exc
+                time.sleep(0.1 * (attempt + 1))
+        else:
+            if last_error is not None:
+                raise last_error
         return str(path)
 
     def _flush_driver_actions(self, driver_id: str, ctx: SimulationRunContext) -> None:
