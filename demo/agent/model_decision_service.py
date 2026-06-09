@@ -1353,10 +1353,18 @@ class ModelDecisionService:
         if month_idx in getattr(rules, "category_carryover_months", set()):
             prev_targets = getattr(rules, "monthly_category_targets", {}).get(month_idx - 1, {})
             prev_orders = plan["monthly_category_orders"].get(month_idx - 1, {})
-            carry = sum(max(0, int(req) - int(prev_orders.get(cat, 0))) for cat, req in prev_targets.items())
-            if carry and targets:
-                first_cat = next(iter(targets))
-                targets[first_cat] = int(targets[first_cat]) + carry
+            # A carryover clause means an unmet KPI from the previous month must
+            # be made up by taking MORE OF THE SAME category this month (that is
+            # how the scorer credits make-up orders). So add each previous-month
+            # deficit to the *same* category's target this month. Do NOT inflate
+            # this month's own first category -- extra orders of a different
+            # category do not offset the carried-over deficit, which is exactly
+            # what made the agent over-take 建材 while ignoring the cheaper fruit
+            # make-up and eat the (higher) carryover penalty.
+            for cat, req in prev_targets.items():
+                deficit = max(0, int(req) - int(prev_orders.get(cat, 0)))
+                if deficit:
+                    targets[cat] = int(targets.get(cat, 0)) + deficit
         if targets:
             best_cat, best_need = None, 0
             for cat, req in targets.items():
