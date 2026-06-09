@@ -31,6 +31,10 @@ LONGHAUL_PENALTY = 1000.0
 # Minimum remaining minutes in the day worth attempting an anti-stranding reposition:
 # below this there is no time to relocate and still complete an order before day end.
 _STRAND_MIN_BUDGET = 240
+# Max anti-stranding repositions per day. Each reposition only fires toward a
+# net-positive post-move order (deadhead already netted out), so more tries on a
+# cargo-dry day = more orders = more gross, with no penalty risk. Raised from 2.
+_MAX_STRAND_REPOS_PER_DAY = 3
 _ORDER_DEADLINE_BUFFER_MIN = 10
 _LLM_CARGO_SUMMARY_LIMIT = 8
 _MIN_BOUNDED_AREA_SPAN = 0.1
@@ -123,9 +127,40 @@ def _norm_region(name: str) -> str:
     return name
 
 
+# 河流/地理名词不是"区域"。司机偏好里出现"别走珠江沿线""避开长江航道"时，
+# LLM 可能把"珠江/长江/三角洲…"当成区域规则抽出来；而 _region_in_city 用双向子串
+# 匹配，"珠江"会误命中"珠江新城"等城市。所以这些裸地理名词不得作为区域约束。
+# 注意："珠江三角洲""长江三角洲"是合法区域（见 _ALLOWED_REGION_ALIASES），不在此列。
+_REGION_GEO_NOISE_EXACT = {
+    "珠江", "长江", "黄河", "黑龙江", "松花江", "淮河", "海河", "钱塘江", "闽江", "赣江",
+    "湘江", "沿江", "沿河", "沿海", "江边", "河边", "河流", "江河", "水路", "航道",
+    "运河", "大运河", "京杭大运河", "三角洲", "流域",
+}
+_REGION_GEO_NOISE_BASES = (
+    "珠江", "长江", "黄河", "钱塘江", "闽江", "淮河", "海河", "运河", "大运河",
+)
+_REGION_GEO_NOISE_SUFFIXES = ("沿岸", "沿线", "沿江", "流域", "航道", "边")
+
+
+def _is_geo_noise_region(name: str) -> bool:
+    """True 表示该"区域名"实为河流/地理名词，应忽略，不作为区域约束。"""
+    n = _norm_region(name)
+    if not n:
+        return False
+    if n in _REGION_GEO_NOISE_EXACT:
+        return True
+    for base in _REGION_GEO_NOISE_BASES:
+        if any(n == base + suf for suf in _REGION_GEO_NOISE_SUFFIXES):
+            return True
+    return False
+
+
 def _region_in_city(region: str, city: str) -> bool:
     """区域归属判断：对行政区后缀差异稳健（双向子串匹配）。"""
     if not region or not city:
+        return False
+    # 河流/地理名词不作为区域，避免"珠江"误命中"珠江新城"这类城市。
+    if _is_geo_noise_region(region):
         return False
     if region in city or city in region:
         return True
@@ -153,6 +188,9 @@ def _allowed_region_key(region: str) -> str | None:
 
 
 def _city_matches_allowed_regions(regions: set[str], city: str) -> bool:
+    # 忽略河流/地理名词：若过滤后没有任何真实区域，则视为无限制（安全默认，
+    # 否则一条被误解析成"珠江"的 allowed_regions 会拒掉所有货 → 整月空跑）。
+    regions = {r for r in regions if not _is_geo_noise_region(r)}
     if not regions:
         return True
     city = city.strip()
@@ -171,6 +209,7 @@ def _city_matches_allowed_regions(regions: set[str], city: str) -> bool:
 
 
 def _point_matches_allowed_regions(regions: set[str], lat: float, lng: float) -> bool:
+    regions = {r for r in regions if not _is_geo_noise_region(r)}
     if not regions:
         return True
     for region in regions:
@@ -607,6 +646,19 @@ class ModelDecisionService:
                 driver_id, status, rules, plan, history, now, lat, lng, day, tod
             )
 
+        # Floor guard (净收益下限): never let the LLM idle when a compliant,
+        # profitable order is available right now. _pick_order already enforces
+        # every hard constraint (night/no-drive/forbidden/long-haul/load-window)
+        # and prioritises category KPIs, so taking its order strictly dominates a
+        # bare wait for net income. During a mandatory rest/no-drive period
+        # _pick_order returns None (all night-overlapping cargo is rejected), so
+        # compliance is preserved. This is the single biggest floor-raiser:
+        # one LLM "wait" on a day with money on the table costs real gross.
+        if action is not None and action.get("action") == "wait":
+            forced = self._floor_order_if_available(driver_id, status, rules, plan, now, lat, lng, day)
+            if forced is not None:
+                action = forced
+
         # Fallback to rule engine if LLM decision is None or failed
         if action is None:
             action = self._schedule(driver_id, status, rules, plan, now, lat, lng)
@@ -677,6 +729,37 @@ class ModelDecisionService:
             if _region_in_city(region, str(start.get("city", ""))) or _region_in_city(region, str(end.get("city", ""))):
                 plan["zeng_order_days"].add(day)
         self._track_category_order(plan, self._rules.get(driver_id), month_idx, str(cargo_info.get("cargo_name", "")))
+
+    def _floor_order_if_available(self, driver_id, status, rules, plan, now, lat, lng, day):
+        """Return a ``take_order`` action iff a compliant, profitable order is
+        available right now; otherwise None. Used to override an LLM ``wait`` so
+        the driver never idles a day that has money on the table.
+
+        Mirrors the scheduler's mandatory-rest guards so it never overrides a
+        legitimate rest/off-day idle, then defers entirely to ``_pick_order``
+        (which enforces every hard constraint and prioritises category KPIs).
+        ``_pick_order`` returns None inside a no-drive/night window because all
+        window-overlapping cargo is rejected, so compliance is preserved."""
+        if day in plan.get("off_days", set()):
+            return None
+        # Start-of-day rest block still pending -> let the driver rest.
+        block = rules.day_rest_block
+        tod = now % DAY_MINUTES
+        if block > 0 and tod < block and day not in plan.get("rest_done", set()):
+            return None
+        try:
+            hard_end = self._hard_order_deadline(rules, plan, now, day)
+            order = self._pick_order(driver_id, status, rules, plan, now, lat, lng, day, hard_end)
+        except Exception as exc:
+            self._logger.warning("floor order probe failed driver_id=%s err=%s", driver_id, exc)
+            return None
+        if order is not None and order.get("action") == "take_order":
+            self._logger.info(
+                "floor guard overrode LLM wait with take_order driver_id=%s params=%s",
+                driver_id, order.get("params"),
+            )
+            return order
+        return None
 
     def _llm_decide_with_history(self, driver_id, status, rules, plan, history,
                                   now, lat, lng, day, tod) -> dict[str, Any] | None:
@@ -1718,12 +1801,13 @@ class ModelDecisionService:
         idle the whole day. Scan a wide radius for the best order that becomes workable
         *after a single reposition to its pickup*, and move toward it. The reposition
         deadhead is already folded into `net`, and the post-reposition pickup is ~0 km,
-        so the deadhead cap is never tripped (penalty stays 0). Allow up to 2 repositions
-        per day to avoid wasting entire days when first target has no cargo."""
+        so the deadhead cap is never tripped (penalty stays 0). Allow up to
+        _MAX_STRAND_REPOS_PER_DAY repositions per day to avoid wasting entire days
+        when the first target has no cargo."""
         now = int(self._api.get_driver_status(driver_id)["simulation_progress_minutes"])
         day_end = min(day_end, self._hard_order_deadline(rules, plan, now, day))
         strand_count = plan.get("strand_count", {}).get(day, 0)
-        if strand_count >= 2:
+        if strand_count >= _MAX_STRAND_REPOS_PER_DAY:
             return None
         if day_end - now < _STRAND_MIN_BUDGET:
             return None
