@@ -347,6 +347,10 @@ class DecisionHistory:
         if len(self._history) > self._window_size:
             self._history.pop(0)
 
+    def recent_actions(self) -> list[dict[str, Any]]:
+        """Rolling window of recent decision entries (for the daily self-audit)."""
+        return self._history
+
     def get_summary(self, current_day: int, plan: dict[str, Any] | None = None) -> str:
         """Concise history summary for LLM context.
 
@@ -743,11 +747,11 @@ class ModelDecisionService:
             "可用动作：\n"
             '- take_order: 接单。参数: {"cargo_id": "ID"}。优先净收益最高的货：候选里 net_per_h(每小时净收益)越高越好；'
             '若有未达标的品类指标则优先该品类。不要只图短途，长途只要 net_per_h 高就值得接\n'
-            '- wait: 等待。参数: {"duration_minutes": 分钟数}。仅在21:00-06:00夜休时段或货源确实不好时使用\n'
+            '- wait: 等待。参数: {"duration_minutes": 分钟数}。在司机自己的休息/禁驶时段(见下方硬约束与偏好规则)或货源确实不好时使用\n'
             '- reposition: 空驶到新位置。参数: {"latitude": 纬度, "longitude": 经度}。'
             '当附近无目标品类货源时，主动移动到可能有货的区域（根据地理常识判断）\n\n'
             "重要规则：\n"
-            "- 21:00后不得接单或空驶（夜停休）；空驶必须在20:50前结束，21:00-06:00期间只能wait\n"
+            "- 在司机自己的休息/禁驶时段内不得接单或空驶，只能wait(具体时段见下方【硬约束】与偏好规则，不同司机时段不同，不要假设固定21:00-06:00)；空驶须在该时段开始前结束\n"
             "- 每月长途(>8h)软上限5单：超出每单扣1000，但只要该单净收益明显大于1000就仍应接\n"
             "- 不要连续wait超过2次！如果当前货源不合适，应该reposition到新区域寻找更好货源\n"
             "- 品类指标很重要：未达标会有高额罚款。优先接指标品类的货\n"
@@ -762,12 +766,19 @@ class ModelDecisionService:
         if cat_target and cat_needed > 0:
             cat_warning = f"\n⚠️ 品类指标警告: 本月需要'{cat_target}'至少12单，还差{cat_needed}单！优先接此品类。\n"
 
+        # P3: history-driven daily compliance self-audit (hard time-windows +
+        # any previous-day in-window driving). Placed up top so it anchors the
+        # decision.
+        audit_text = self._compliance_self_audit(rules, history, day)
+        audit_block = f"## 合规自检\n{audit_text}\n\n" if audit_text else ""
+
         user_prompt = (
             f"## 当前状态\n"
             f"司机: {driver_id}, 位置: ({lat:.2f}, {lng:.2f})\n"
             f"时间: {month_name}{day_in_month}日 {hour:02d}:{minute:02d}\n"
             f"仿真进度: 第{day}天/{MONTH_DAYS}天\n"
             f"{cat_warning}\n"
+            f"{audit_block}"
             f"## 偏好规则与合规进度\n{pref_summary}\n\n"
             f"## 决策历史\n{history_text}\n\n"
             f"## 已通过本地可行性检查的候选货源({len(cargo_summary)}条)\n"
@@ -1042,6 +1053,62 @@ class ModelDecisionService:
             )
             return False
         return True
+
+    def _compliance_self_audit(self, rules: "DriverRules", history: "DecisionHistory", day: int) -> str:
+        """P3 — history-driven daily self-audit.
+
+        Each day, restate the driver's hard time-windows (rest + no-drive) to
+        the LLM and, by scanning the recent decision history, flag whether the
+        previous day actually drove inside any of those windows. Because these
+        penalties recur daily, surfacing one slip immediately stops it from
+        repeating for the rest of the season. Pure history lookup — no extra
+        LLM call. Returns "" when the driver has no time-window constraints.
+        """
+        # Build the within-day "must not drive" spans (minutes of day).
+        spans: list[tuple[int, int]] = []
+        block = rules.day_rest_block
+        if block > 0:
+            spans.append((0, block))
+        for ws, we in rules.no_drive_windows:
+            if we <= DAY_MINUTES:
+                spans.append((ws, we))
+            else:  # cross-midnight -> split into tail-of-day + head-of-next
+                spans.append((ws, DAY_MINUTES))
+                spans.append((0, we - DAY_MINUTES))
+        if not spans and not rules.rest_window:
+            return ""
+
+        reminders: list[str] = []
+        if rules.rest_window:
+            rs, re_ = rules.rest_window
+            reminders.append(f"休息 {rs // 60:02d}:{rs % 60:02d}-{re_ // 60:02d}:{re_ % 60:02d}")
+        for ws, we in rules.no_drive_windows:
+            we_d = we % DAY_MINUTES
+            reminders.append(f"禁驶 {ws // 60:02d}:{ws % 60:02d}-{we_d // 60:02d}:{we_d % 60:02d}")
+
+        violations = 0
+        prev = day - 1
+        if spans and prev >= 0:
+            for e in history.recent_actions():
+                if e.get("day") != prev:
+                    continue
+                act = e.get("action")
+                if act not in ("take_order", "reposition"):
+                    continue
+                if act == "take_order" and e.get("accepted") is False:
+                    continue
+                t = int(e.get("tod", -1))
+                if any(s <= t < en for s, en in spans):
+                    violations += 1
+
+        parts: list[str] = []
+        if reminders:
+            parts.append("【硬约束·每日生效】" + "；".join(reminders)
+                         + "：这些时段只能 wait，绝不可 take_order/reposition（违反按天扣高额罚分）。")
+        if violations:
+            parts.append(f"【历史自检】昨日检测到 {violations} 次在休息/禁驶时段出车的记录，"
+                         "今日务必严格遵守上述时段，避免每日重复扣分。")
+        return "\n".join(parts)
 
     def _format_rules_for_llm(self, driver_id: str, rules: DriverRules, plan: dict, day: int) -> str:
         """Format driver rules and compliance progress as concise text for LLM."""
@@ -2076,8 +2143,9 @@ class ModelDecisionService:
         '- daily_rest_hours: 每天连续休息最少小时数（数字或 null）\n'
         '- rest_window: 每天固定停车时段 {"start_hour":数字,"end_hour":数字}（或 null）。半小时用0.5，如11点半→11.5\n'
         '- no_drive_windows: 每天禁止接单/空驶的时段数组 [{"start_hour":数字,"end_hour":数字}]。半小时用0.5。\n'
-        '  适用于非休息类禁行（如"中午12点到1点不接单"）。跨午夜时 end_hour<start_hour，如23→5。\n'
-        '  注意：如果同一条偏好既有"休息"又有"不接单不空跑"，rest_window和no_drive_windows都填。\n'
+        '  适用于任何"某时段不出车/不接单/不空驶/收车/熄火/落锁/归家不动/歇业/宵禁"。跨午夜时 end_hour<start_hour，如23→5。\n'
+        '  **极重要（夜休按天扣分，漏抽代价极高，务必抽出）**：凡表达"夜里/入夜/天黑后/后半夜/晚上X点后/到次日X点 不出车·不揽货·收车·归家·熄火·睡觉·歇着"等含义的，'
+        '无论用词多口语/方言，都必须填 no_drive_windows（跨夜用 start>end）；若同时有"休息/睡觉/停车熄火"含义，则 rest_window 也一并填。宁可多抽一个夜休窗口，也不要漏掉。\n'
         '- off_days_min: 整月完全不出车天数（整数，默认 0）\n'
         '- forbidden_categories: 禁运货物**品类名**数组（仅货物名称如"蔬菜""机械设备""生鲜"，'
         '绝不放城市/区域名！"在惠州的货"是区域禁令不是品类禁令）\n'
@@ -2120,8 +2188,8 @@ class ModelDecisionService:
         "对应字段**必须**为null或空数组。宁可漏掉也绝不臆造。**错误的约束比缺少约束惩罚高10倍。**"
         "特别是：forbidden_zones/bounded_area/must_visit/home_rule这些高风险字段，除非文本中有非常明确的描述和坐标，否则一律为null/空数组。\n"
         "8) 同一偏好可能同时包含多种约束（如禁区域+禁品类+日期事件+回家规则），全部抽取。\n"
-        '9) "不接单不空跑/不空驶"类约束，如果含时间段→填no_drive_windows；'
-        '如果同时含"休息/睡觉"→也填rest_window或daily_rest_hours。\n'
+        '9) "不接单不空跑/不空驶/收车/归家不动/熄火歇业"类约束，只要含时间段一律填no_drive_windows（夜间跨夜用start>end）；'
+        '若同时含"休息/睡觉/停车熄火"→也填rest_window或daily_rest_hours。这类"每日生效"的时段约束漏抽代价极高，务必抽全。\n'
         '10) "接上配偶/家人→返回老家/进家门"是 dated_route 事件（多点路线），不是 home_rule。\n'
         '11) "只跑/只接/仅在/不出X"是 allowed_regions，不是 forbidden_regions。\n\n'
         "示例1：\n"
@@ -2323,6 +2391,56 @@ class ModelDecisionService:
             self._logger.info("overnight rest_window %d-%d -> rest_window=(0,%d) no_drive=%s",
                               sm, em, em, overnight)
 
+    def _confirm_rule_holds(self, rule_desc: str, all_text: str, default: bool = True) -> bool:
+        """Semantic grounding: ask the model whether ``all_text`` actually
+        imposes the constraint ``rule_desc``.
+
+        This replaces brittle substring/keyword grounding, which silently
+        dropped correctly-extracted rules whenever a finals driver phrased the
+        same constraint with words not on a hard-coded whitelist. The model
+        decides by meaning, so paraphrases / dialect / idioms all generalise.
+
+        Fail-safe: returns ``default`` (keep the rule) on any error, empty
+        text, or unparseable response. We only drop a rule when the model
+        clearly says it does not hold, so a flaky verifier never silently
+        discards a real constraint.
+        """
+        if not all_text.strip():
+            return default
+        cache = getattr(self, "_rule_confirm_cache", None)
+        if cache is None:
+            cache = {}
+            self._rule_confirm_cache = cache
+        key = (rule_desc, all_text)
+        if key in cache:
+            return cache[key]
+        verdict = default
+        try:
+            msgs = [
+                {"role": "system", "content": (
+                    "你判断一段司机偏好原文是否确实包含某条约束。"
+                    "只输出JSON {\"holds\": true/false}。"
+                    "只有当原文明显不支持该约束时才返回false；含义相符或不确定一律返回true。"
+                )},
+                {"role": "user", "content": json.dumps(
+                    {"原文": all_text, "约束": rule_desc}, ensure_ascii=False)},
+            ]
+            req: dict[str, Any] = {"messages": msgs, "temperature": 0, "max_tokens": 30}
+            try:
+                req["response_format"] = {"type": "json_object"}
+                resp = self._api.model_chat_completion(req)
+            except Exception:
+                req.pop("response_format", None)
+                resp = self._api.model_chat_completion(req)
+            data = self._extract_json(resp)
+            if isinstance(data, dict) and data.get("holds") is False:
+                verdict = False
+        except Exception as exc:
+            self._logger.info("rule-confirm unavailable (keep rule) desc=%s err=%s", rule_desc, exc)
+            verdict = default
+        cache[key] = verdict
+        return verdict
+
     def _merge_llm_rules(self, rules: DriverRules, data: dict[str, Any], texts: list[str] | None = None) -> None:
         all_text = "\n".join(texts) if texts else ""
         rest_h = data.get("daily_rest_hours")
@@ -2362,19 +2480,19 @@ class ModelDecisionService:
             clean_cats.append(stripped if stripped else c)
 
         for c in clean_cats:
-            if _text_supports(c, all_text):
+            if self._confirm_rule_holds(f"司机禁运（一律不接）货物品类「{c}」", all_text):
                 rules.forbidden_categories.add(c)
             else:
-                self._logger.info("llm validation: rejected forbidden_category '%s' (not in texts)", c)
+                self._logger.info("llm semantic-confirm: dropped forbidden_category '%s'", c)
 
         for reg in raw_regs:
             r = self._clean_region_name(reg)
             if not r:
                 continue
-            if _text_supports(r, all_text):
+            if self._confirm_rule_holds(f"司机禁接装货地或卸货地在「{r}」的货", all_text):
                 rules.forbidden_regions.add(r)
             else:
-                self._logger.info("llm validation: rejected forbidden_region '%s' (not in texts)", r)
+                self._logger.info("llm semantic-confirm: dropped forbidden_region '%s'", r)
         rr = data.get("required_region")
         if isinstance(rr, dict):
             reg, md = rr.get("region"), rr.get("min_days")
@@ -2396,10 +2514,10 @@ class ModelDecisionService:
                 r = self._clean_region_name(reg)
                 if not r:
                     continue
-                if _text_supports(r, all_text):
+                if self._confirm_rule_holds(f"司机在指定日期不去「{r}」", all_text):
                     rules.blackout.append((r, days))
                 else:
-                    self._logger.info("llm validation: rejected blackout region '%s' (not in texts)", r)
+                    self._logger.info("llm semantic-confirm: dropped blackout region '%s'", r)
         for ev in data.get("dated_single") or []:
             single = self._coerce_single(ev)
             if single is not None and not any(e["day"] == single["day"] for e in rules.dated_single):
@@ -2437,36 +2555,47 @@ class ModelDecisionService:
             has_action = any(kw in all_text for kw in _NDW_ACTION_KW)
             return has_time and has_action
 
-        # no_drive_windows — grounded with compound check
-        if _ndw_grounded():
-            for ndw in data.get("no_drive_windows") or []:
-                if not isinstance(ndw, dict):
-                    continue
-                sh, eh = ndw.get("start_hour"), ndw.get("end_hour")
-                if isinstance(sh, (int, float)) and isinstance(eh, (int, float)):
-                    sm, em = int(round(sh * 60)), int(round(eh * 60))
-                    if em > sm:
-                        pass  # normal range
-                    elif sm > em:
-                        em += 24 * 60  # cross-midnight
-                    else:
-                        continue
-                    if not any(ws == sm and we == em for ws, we in rules.no_drive_windows):
-                        rules.no_drive_windows.append((sm, em))
-        elif data.get("no_drive_windows"):
-            self._logger.info("llm grounding: rejected no_drive_windows (no keywords in text)")
+        # no_drive_windows — FAIL-SAFE (no keyword gate).
+        # A daily "don't drive in this window" rule (esp. night rest) that we
+        # miss is catastrophic: it is violated EVERY day and compounds into a
+        # six-figure penalty over the season, whereas a spurious window only
+        # costs a few idle hours. The old `_ndw_grounded()` keyword whitelist
+        # silently dropped these whenever a driver phrased it off-vocabulary,
+        # which is exactly the finals scenario. We now trust the temperature-0
+        # extraction and only drop a window if the semantic verifier clearly
+        # says it does not hold (verifier failure keeps the window).
+        for ndw in data.get("no_drive_windows") or []:
+            if not isinstance(ndw, dict):
+                continue
+            sh, eh = ndw.get("start_hour"), ndw.get("end_hour")
+            if not (isinstance(sh, (int, float)) and isinstance(eh, (int, float))):
+                continue
+            if not (0 <= sh <= 24 and 0 <= eh <= 24):
+                continue
+            sm, em = int(round(sh * 60)), int(round(eh * 60))
+            if em > sm:
+                pass  # normal within-day range
+            elif sm > em:
+                em += 24 * 60  # cross-midnight (e.g. 23:00->05:00)
+            else:
+                continue
+            desc = f"司机每天 {sm // 60:02d}:{sm % 60:02d}-{(em % DAY_MINUTES) // 60:02d}:{(em % DAY_MINUTES) % 60:02d} 不接单、不出车/不空驶（禁驶时段）"
+            if not self._confirm_rule_holds(desc, all_text):
+                self._logger.info("llm semantic-confirm: dropped no_drive_window %d-%d", sm, em)
+                continue
+            if not any(ws == sm and we == em for ws, we in rules.no_drive_windows):
+                rules.no_drive_windows.append((sm, em))
 
-        # avoid_categories — grounded
-        if _text_has_any(_AVOID_KW):
-            for ac in data.get("avoid_categories") or []:
-                if isinstance(ac, str) and ac.strip():
-                    s = re.sub(r"^(?:凡是|所有|一切|任何)", "", ac.strip()).strip()
-                    if s and _text_supports(s, all_text):
-                        rules.avoid_categories.add(s)
-                    elif s:
-                        self._logger.info("llm grounding: rejected avoid_category '%s' (not in text)", s)
-        elif data.get("avoid_categories"):
-            self._logger.info("llm grounding: rejected avoid_categories (no keywords in text)")
+        # avoid_categories — semantic confirm (replaces keyword/substring gate)
+        for ac in data.get("avoid_categories") or []:
+            if isinstance(ac, str) and ac.strip():
+                s = re.sub(r"^(?:凡是|所有|一切|任何)", "", ac.strip()).strip()
+                if not s:
+                    continue
+                if self._confirm_rule_holds(f"司机尽量避免/少接货物品类「{s}」", all_text):
+                    rules.avoid_categories.add(s)
+                else:
+                    self._logger.info("llm semantic-confirm: dropped avoid_category '%s'", s)
 
         # NOTE: avoid/forbidden dedup moved to _dedup_avoid_forbidden (runs after supplement)
 
@@ -2666,8 +2795,9 @@ class ModelDecisionService:
             month_idx = self._month_to_idx(item.get("month"))
             if not cat or month_idx is None or not isinstance(req, (int, float)) or req <= 0:
                 continue
-            if not _text_supports(cat, all_text):
-                self._logger.info("llm validation: rejected category_target '%s' (not in texts)", cat)
+            desc = f"司机要求{_month_name(month_idx)}品类「{cat}」当月至少接{int(req)}单（月度品类指标）"
+            if not self._confirm_rule_holds(desc, all_text):
+                self._logger.info("llm semantic-confirm: dropped category_target '%s'", cat)
                 continue
             rules.monthly_category_targets.setdefault(month_idx, {})[cat] = max(
                 int(req),
