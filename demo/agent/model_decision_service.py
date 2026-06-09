@@ -20,6 +20,14 @@ MONTH_DAYS = 92
 SPEED_KM_PER_HOUR = 60.0
 EARTH_RADIUS_KM = 6371.0
 COST_PER_KM = 1.5
+# Monthly long-haul (>8h haul) cap and the per-order penalty for exceeding it.
+# The cap is *soft*: exceeding it only costs LONGHAUL_PENALTY of net income per
+# extra order, so taking one is still worth it when the order's own net income
+# beats the penalty. Threshold/cap/penalty match the scorer
+# (calc_monthly_income._eval_monthly_long_haul_cap).
+LONGHAUL_MINUTES = 480
+LONGHAUL_CAP = 5
+LONGHAUL_PENALTY = 1000.0
 # Minimum remaining minutes in the day worth attempting an anti-stranding reposition:
 # below this there is no time to relocate and still complete an order before day end.
 _STRAND_MIN_BUDGET = 240
@@ -447,6 +455,98 @@ class ModelDecisionService:
         # new, date-windowed preference becomes visible).
         self._seen_prefs: dict[str, set[str]] = {}
         self._initial_position: dict[str, tuple[float, float]] = {}
+        # cargo_id -> metadata seen during scans; used to reconstruct monthly
+        # accumulators from the authoritative decision history (see
+        # _sync_monthly_counts_from_history).
+        self._cargo_meta: dict[str, dict[str, Any]] = {}
+
+    def _query_cargo(self, driver_id: str, latitude: float, longitude: float, k: int) -> dict[str, Any]:
+        """query_cargo wrapper that caches cargo metadata for every scanned item.
+
+        The cap-enforcing accumulators are rebuilt from accepted orders in the
+        decision history, but that history only records cargo_id + result (no
+        cost_time / category). We therefore remember the metadata of every cargo
+        we ever see here so it can be looked up later by id.
+        """
+        resp = self._api.query_cargo(driver_id=driver_id, latitude=latitude, longitude=longitude, k=k)
+        for item in resp.get("items", []) or []:
+            cargo = item.get("cargo", {}) if isinstance(item, dict) else {}
+            cid = str(cargo.get("cargo_id", "") or "")
+            if not cid:
+                continue
+            self._cargo_meta[cid] = {
+                "cost_time_minutes": int(cargo.get("cost_time_minutes", 0) or 0),
+                "cargo_name": str(cargo.get("cargo_name", "") or ""),
+                "start_city": str((cargo.get("start") or {}).get("city", "") or ""),
+                "end_city": str((cargo.get("end") or {}).get("city", "") or ""),
+            }
+        return resp
+
+    def _sync_monthly_counts_from_history(self, driver_id: str, plan: dict[str, Any]) -> None:
+        """Rebuild accepted-order accumulators from the authoritative history.
+
+        The harness only calls ``decide()`` -- it never calls
+        ``update_decision_result``. That left ``monthly_longhual`` (and the
+        deadhead/category/orders accumulators) permanently empty, so the
+        monthly long-haul cap (and other quota checks) read 0 every step and
+        never fired -- the driver took unlimited >8h orders and ate the penalty.
+
+        Since the evaluation submits the agent only, we reconstruct these
+        accumulators inside the agent from ``query_decision_history`` (the same
+        per-step records the server appends). This is idempotent and runs each
+        step, so the cap checks downstream see the real counts. ``action_start``
+        is computed exactly as the scorer does (prev_end + query_scan) so the
+        calendar-month bucketing matches.
+        """
+        try:
+            resp = self._api.query_decision_history(driver_id, -1)
+        except Exception:  # pragma: no cover - defensive: never break decide()
+            return
+        records = (resp or {}).get("records") or []
+        if not records:
+            return
+        rules = self._rules.get(driver_id)
+        plan["monthly_longhual"] = {}
+        plan["monthly_category_orders"] = {}
+        plan["monthly_deadhead_km"] = {}
+        plan["orders_today"] = {}
+        plan["first_order_taken"] = set()
+        plan["failed_cargo_ids"] = set()
+        plan["failed_cargo_reasons"] = {}
+        plan["zeng_order_days"] = set()
+        plan["total_deadhead_km"] = 0.0
+        for rec in records:
+            action = rec.get("action") or {}
+            if action.get("action") != "take_order":
+                continue
+            result = rec.get("result") or {}
+            cargo_id = str(result.get("cargo_id") or (action.get("params") or {}).get("cargo_id") or "")
+            if not result.get("accepted"):
+                if cargo_id:
+                    plan["failed_cargo_ids"].add(cargo_id)
+                    plan["failed_cargo_reasons"][cargo_id] = str(result.get("detail", "failed"))
+                continue
+            if not cargo_id:
+                continue
+            end_min = int(result.get("simulation_progress_minutes", 0) or 0)
+            step_elapsed = int(rec.get("step_elapsed_minutes", 0) or 0)
+            query_scan = int(rec.get("query_scan_cost_minutes", 0) or 0)
+            action_start = max(0, end_min - step_elapsed + query_scan)
+            day = max(0, min(MONTH_DAYS - 1, action_start // DAY_MINUTES))
+            month_idx = _month_index_for_day(day)
+            plan["orders_today"][day] = plan["orders_today"].get(day, 0) + 1
+            plan["first_order_taken"].add(day)
+            pickup_deadhead = float(result.get("pickup_deadhead_km", 0.0) or 0.0)
+            plan["total_deadhead_km"] += pickup_deadhead
+            plan["monthly_deadhead_km"][month_idx] = plan["monthly_deadhead_km"].get(month_idx, 0.0) + pickup_deadhead
+            meta = self._cargo_meta.get(cargo_id, {})
+            if int(meta.get("cost_time_minutes", 0) or 0) > 480:
+                plan["monthly_longhual"][month_idx] = plan["monthly_longhual"].get(month_idx, 0) + 1
+            self._track_category_order(plan, rules, month_idx, str(meta.get("cargo_name", "")))
+            if rules is not None and rules.required_region is not None:
+                region = rules.required_region[0]
+                if _region_in_city(region, meta.get("start_city", "")) or _region_in_city(region, meta.get("end_city", "")):
+                    plan["zeng_order_days"].add(day)
 
     # ------------------------------------------------------------------ decide
     def decide(self, driver_id: str) -> dict[str, Any]:
@@ -472,6 +572,10 @@ class ModelDecisionService:
                 "failed_cargo_reasons": {},  # cargo_id → detail
             },
         )
+        # Rebuild accepted-order accumulators (long-haul/deadhead/category/...)
+        # from the authoritative decision history, since the result hook is
+        # never invoked by the harness.
+        self._sync_monthly_counts_from_history(driver_id, plan)
         # Initialize decision history for this driver
         history = self._history.setdefault(driver_id, DecisionHistory())
         self._step_count.setdefault(driver_id, 0)
@@ -584,7 +688,7 @@ class ModelDecisionService:
             return None  # let rule engine handle rest
 
         # Query available cargo for context
-        cargo_resp = self._api.query_cargo(driver_id=driver_id, latitude=lat, longitude=lng, k=30)
+        cargo_resp = self._query_cargo(driver_id=driver_id, latitude=lat, longitude=lng, k=30)
         items = cargo_resp.get("items", [])
         now = int(self._api.get_driver_status(driver_id)["simulation_progress_minutes"])
         hard_end = self._hard_order_deadline(rules, plan, now, day)
@@ -913,17 +1017,19 @@ class ModelDecisionService:
         cargo = match.get("cargo", {})
         month_idx = _month_index_for_day(day)
         longhual_count = plan.get("monthly_longhual", {}).get(month_idx, 0)
-        if longhual_count >= 5 and int(cargo.get("cost_time_minutes", 0) or 0) > 480:
-            self._logger.info("[LLM] rejected take_order: long-haul limit reached month=%d", month_idx)
-            return False
         blackout_regions = {r for r, days in rules.blackout if day in days}
         ev = self._evaluate_cargo(cargo, match, rules, blackout_regions, now, hard_end, lat, lng)
         if ev is None:
             self._logger.info("[LLM] rejected take_order: cargo_id=%s failed deterministic feasibility", cargo_id)
             return False
-        _net, _touches_required, occupied, _pickup_km = ev
-        if occupied > 480 and longhual_count >= 5:
-            self._logger.info("[LLM] rejected take_order: occupied=%d over long-haul limit", occupied)
+        net, _touches_required, _occupied, _pickup_km = ev
+        # Long-haul cap is soft (net maximization): only reject an over-cap >8h
+        # order when its net income does not cover the penalty it would incur.
+        cost_time = int(cargo.get("cost_time_minutes", 0) or 0)
+        if cost_time > LONGHAUL_MINUTES and longhual_count >= LONGHAUL_CAP and net <= LONGHAUL_PENALTY:
+            self._logger.info(
+                "[LLM] rejected take_order: over long-haul cap and net=%.0f<=penalty month=%d", net, month_idx
+            )
             return False
         return True
 
@@ -952,7 +1058,13 @@ class ModelDecisionService:
         # Category targets with progress
         cat_orders = plan.get("monthly_category_orders", {}).get(month_idx, {})
         longhual = plan.get("monthly_longhual", {}).get(month_idx, 0)
-        lines.append(f"- 本月长途(>8h): {longhual}/5单上限")
+        if longhual >= LONGHAUL_CAP:
+            lines.append(
+                f"- 本月长途(>8h): {longhual}单 (已达{LONGHAUL_CAP}单上限; 再接每单扣{int(LONGHAUL_PENALTY)}罚分，"
+                f"仅当该单净利润>{int(LONGHAUL_PENALTY)}才值得接)"
+            )
+        else:
+            lines.append(f"- 本月长途(>8h): {longhual}/{LONGHAUL_CAP}单上限 (超限后每单扣{int(LONGHAUL_PENALTY)})")
         lines.append(f"- 本月品类接单: {json.dumps(cat_orders, ensure_ascii=False)}")
         targets = getattr(rules, "monthly_category_targets", {}).get(month_idx, {})
         if targets:
@@ -1300,7 +1412,7 @@ class ModelDecisionService:
         urgent_category = bool(hunt_category and remaining_month_days <= cat_needed + 10)
         initial_k = 600 if urgent_category else (200 if hunt_category else 60)
 
-        cargo_resp = self._api.query_cargo(driver_id=driver_id, latitude=lat, longitude=lng, k=initial_k)
+        cargo_resp = self._query_cargo(driver_id=driver_id, latitude=lat, longitude=lng, k=initial_k)
         items = cargo_resp.get("items", [])
         plan["_scan_items"] = (entry_now, items)
         now = int(self._api.get_driver_status(driver_id)["simulation_progress_minutes"])
@@ -1329,11 +1441,19 @@ class ModelDecisionService:
             if rules.monthly_deadhead_max_km is not None:
                 if month_deadhead + pkm > rules.monthly_deadhead_max_km:
                     return
-            # [OPT] Long-haul limit: reject >8h orders if already at 5 this month
+            # [OPT] Long-haul cap is a *soft* limit. Exceeding 5 >8h orders in a
+            # month costs LONGHAUL_PENALTY of net each, so instead of hard-rejecting
+            # we subtract the penalty from the order's value: it is still picked
+            # when its net beats the penalty (net maximization), and is correctly
+            # deprioritised otherwise. Threshold uses cost_time (the haul time the
+            # scorer counts), not the full occupied time.
             cost_time = int(cargo.get("cost_time_minutes", 0))
-            if occupied > 480 and longhual_count >= 5:
-                return
-            score = net / occupied
+            eff_net = net
+            if cost_time > LONGHAUL_MINUTES and longhual_count >= LONGHAUL_CAP:
+                eff_net = net - LONGHAUL_PENALTY
+                if eff_net <= 0:
+                    return
+            score = eff_net / occupied
             # [OPT] Category preference: exact name match with strong boost
             cargo_name = str(cargo.get("cargo_name", ""))
             is_cat_target = False
@@ -1362,7 +1482,7 @@ class ModelDecisionService:
 
         # [OPT] If hunting category and not found yet, do an even wider k=600 search
         if hunt_category and not best_is_category_target:
-            cargo_resp2 = self._api.query_cargo(driver_id=driver_id, latitude=lat, longitude=lng, k=600)
+            cargo_resp2 = self._query_cargo(driver_id=driver_id, latitude=lat, longitude=lng, k=600)
             items2 = cargo_resp2.get("items", [])
             plan["_scan_items"] = (entry_now, items2)
             now = int(self._api.get_driver_status(driver_id)["simulation_progress_minutes"])
@@ -1371,7 +1491,7 @@ class ModelDecisionService:
 
         # Widen search if nothing found at all
         if best is None and not hunt_category:
-            cargo_resp2 = self._api.query_cargo(driver_id=driver_id, latitude=lat, longitude=lng, k=200)
+            cargo_resp2 = self._query_cargo(driver_id=driver_id, latitude=lat, longitude=lng, k=200)
             items2 = cargo_resp2.get("items", [])
             plan["_scan_items"] = (entry_now, items2)
             now = int(self._api.get_driver_status(driver_id)["simulation_progress_minutes"])
@@ -1407,8 +1527,15 @@ class ModelDecisionService:
                 latest_deadline,
             )
             return None
-        _latest_net, _latest_required, latest_occupied, latest_pickup_km = latest_ev
-        if latest_occupied > 480 and longhual_count >= 5:
+        latest_net, _latest_required, latest_occupied, latest_pickup_km = latest_ev
+        # Soft long-haul cap: keep an over-cap >8h order only if its net beats the
+        # penalty (consistent with _score_item / _validate_llm_take_order).
+        latest_cost_time = int(best.get("cost_time_minutes", 0) or 0)
+        if (
+            latest_cost_time > LONGHAUL_MINUTES
+            and longhual_count >= LONGHAUL_CAP
+            and latest_net - LONGHAUL_PENALTY <= 0
+        ):
             return None
         if rules.monthly_deadhead_max_km is not None:
             if month_deadhead + latest_pickup_km > rules.monthly_deadhead_max_km:
@@ -1431,7 +1558,7 @@ class ModelDecisionService:
         month_name = {0: "三月", 1: "四月", 2: "五月"}.get(month_idx, "")
 
         # Query broader cargo to find where target category exists
-        cargo_resp = self._api.query_cargo(driver_id=driver_id, latitude=lat, longitude=lng, k=200)
+        cargo_resp = self._query_cargo(driver_id=driver_id, latitude=lat, longitude=lng, k=200)
         items = cargo_resp.get("items", [])
         now = int(self._api.get_driver_status(driver_id)["simulation_progress_minutes"])
         # Find target category cargo in results
@@ -1545,7 +1672,7 @@ class ModelDecisionService:
         if scan is not None and scan[0] == now:
             best_target, best_net = _best_target(scan[1])
         if best_target is None:
-            cargo_resp = self._api.query_cargo(driver_id=driver_id, latitude=lat, longitude=lng, k=600)
+            cargo_resp = self._query_cargo(driver_id=driver_id, latitude=lat, longitude=lng, k=600)
             now = int(self._api.get_driver_status(driver_id)["simulation_progress_minutes"])
             day_end = min(day_end, self._hard_order_deadline(rules, plan, now, day))
             best_target, best_net = _best_target(cargo_resp.get("items", []))
@@ -2163,6 +2290,29 @@ class ModelDecisionService:
         else:
             self._logger.info("validation: rejected allowed_region '%s' (not in texts)", region)
 
+    def _apply_rest_window(self, rules: DriverRules, sm: int, em: int) -> None:
+        """Record a daily rest window given start/end minutes-of-day.
+
+        For an overnight window (e.g. 21:00-06:00, sm > em) the morning part
+        (00:00-em) is enforced via rest_window/day_rest_block, but the EVENING
+        part (sm-24:00) would otherwise be unconstrained — the driver keeps
+        working until midnight and violates the night-rest rule every single day.
+        We therefore also register the whole overnight span as a no_drive_window
+        so the deterministic scheduler blocks evening orders/repositions and waits
+        through the window. Deriving it from the rest_window bypasses the keyword
+        grounding used for free-form no_drive_windows, which often fails on the
+        noisy preference text.
+        """
+        if em > sm:
+            rules.rest_window = (sm, em)
+        elif sm > em > 0:
+            rules.rest_window = (0, em)
+            overnight = (sm, em + DAY_MINUTES)
+            if not any(ws == overnight[0] and we == overnight[1] for ws, we in rules.no_drive_windows):
+                rules.no_drive_windows.append(overnight)
+            self._logger.info("overnight rest_window %d-%d -> rest_window=(0,%d) no_drive=%s",
+                              sm, em, em, overnight)
+
     def _merge_llm_rules(self, rules: DriverRules, data: dict[str, Any], texts: list[str] | None = None) -> None:
         all_text = "\n".join(texts) if texts else ""
         rest_h = data.get("daily_rest_hours")
@@ -2172,15 +2322,7 @@ class ModelDecisionService:
         if isinstance(rw, dict):
             sh, eh = rw.get("start_hour"), rw.get("end_hour")
             if isinstance(sh, (int, float)) and isinstance(eh, (int, float)):
-                sm, em = int(round(sh * 60)), int(round(eh * 60))
-                if em > sm:
-                    rules.rest_window = (sm, em)
-                elif sm > em > 0:
-                    # Overnight window (e.g. 22:00-05:00): morning part as rest_window
-                    rules.rest_window = (0, em)
-                    overnight_min = 24 * 60 - sm + em
-                    self._logger.info("llm: overnight rest_window %d-%d -> rest_window=(0,%d) window_min=%d",
-                                      sm, em, em, overnight_min)
+                self._apply_rest_window(rules, int(round(sh * 60)), int(round(eh * 60)))
         off = data.get("off_days_min")
         if isinstance(off, (int, float)) and off > 0:
             rules.off_days_min = max(rules.off_days_min, int(off))
@@ -2759,7 +2901,7 @@ class ModelDecisionService:
         if ("睡觉" in text or "停着熄火" in text or "雷打不动" in text) and "点" in text:
             window = self._parse_time_window(text)
             if window is not None:
-                rules.rest_window = window
+                self._apply_rest_window(rules, window[0], window[1])
         if (
             "整天" in text and (
                 "歇" in text or "休息" in text or "停驶" in text or "检修" in text
@@ -3069,7 +3211,7 @@ class ModelDecisionService:
         if ("睡觉" in text or "停着熄火" in text or "雷打不动" in text) and "点" in text:
             window = self._parse_time_window(text)
             if window is not None:
-                rules.rest_window = window
+                self._apply_rest_window(rules, window[0], window[1])
         # off days: "抽三个整天" / "留两个整天"
         if (
             "整天" in text and (
