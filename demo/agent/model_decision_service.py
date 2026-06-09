@@ -2163,6 +2163,29 @@ class ModelDecisionService:
         else:
             self._logger.info("validation: rejected allowed_region '%s' (not in texts)", region)
 
+    def _apply_rest_window(self, rules: DriverRules, sm: int, em: int) -> None:
+        """Record a daily rest window given start/end minutes-of-day.
+
+        For an overnight window (e.g. 21:00-06:00, sm > em) the morning part
+        (00:00-em) is enforced via rest_window/day_rest_block, but the EVENING
+        part (sm-24:00) would otherwise be unconstrained — the driver keeps
+        working until midnight and violates the night-rest rule every single day.
+        We therefore also register the whole overnight span as a no_drive_window
+        so the deterministic scheduler blocks evening orders/repositions and waits
+        through the window. Deriving it from the rest_window bypasses the keyword
+        grounding used for free-form no_drive_windows, which often fails on the
+        noisy preference text.
+        """
+        if em > sm:
+            rules.rest_window = (sm, em)
+        elif sm > em > 0:
+            rules.rest_window = (0, em)
+            overnight = (sm, em + DAY_MINUTES)
+            if not any(ws == overnight[0] and we == overnight[1] for ws, we in rules.no_drive_windows):
+                rules.no_drive_windows.append(overnight)
+            self._logger.info("overnight rest_window %d-%d -> rest_window=(0,%d) no_drive=%s",
+                              sm, em, em, overnight)
+
     def _merge_llm_rules(self, rules: DriverRules, data: dict[str, Any], texts: list[str] | None = None) -> None:
         all_text = "\n".join(texts) if texts else ""
         rest_h = data.get("daily_rest_hours")
@@ -2172,15 +2195,7 @@ class ModelDecisionService:
         if isinstance(rw, dict):
             sh, eh = rw.get("start_hour"), rw.get("end_hour")
             if isinstance(sh, (int, float)) and isinstance(eh, (int, float)):
-                sm, em = int(round(sh * 60)), int(round(eh * 60))
-                if em > sm:
-                    rules.rest_window = (sm, em)
-                elif sm > em > 0:
-                    # Overnight window (e.g. 22:00-05:00): morning part as rest_window
-                    rules.rest_window = (0, em)
-                    overnight_min = 24 * 60 - sm + em
-                    self._logger.info("llm: overnight rest_window %d-%d -> rest_window=(0,%d) window_min=%d",
-                                      sm, em, em, overnight_min)
+                self._apply_rest_window(rules, int(round(sh * 60)), int(round(eh * 60)))
         off = data.get("off_days_min")
         if isinstance(off, (int, float)) and off > 0:
             rules.off_days_min = max(rules.off_days_min, int(off))
@@ -2759,7 +2774,7 @@ class ModelDecisionService:
         if ("睡觉" in text or "停着熄火" in text or "雷打不动" in text) and "点" in text:
             window = self._parse_time_window(text)
             if window is not None:
-                rules.rest_window = window
+                self._apply_rest_window(rules, window[0], window[1])
         if (
             "整天" in text and (
                 "歇" in text or "休息" in text or "停驶" in text or "检修" in text
@@ -3069,7 +3084,7 @@ class ModelDecisionService:
         if ("睡觉" in text or "停着熄火" in text or "雷打不动" in text) and "点" in text:
             window = self._parse_time_window(text)
             if window is not None:
-                rules.rest_window = window
+                self._apply_rest_window(rules, window[0], window[1])
         # off days: "抽三个整天" / "留两个整天"
         if (
             "整天" in text and (
