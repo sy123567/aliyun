@@ -340,9 +340,11 @@ def evaluate_d001_preferences(
         shortfall=april_shortfall,
     )
 
+    may_fruit_makeup_orders = _count_category_orders(ctxs, cargo_map, "水果", 5, may_rule)
+    remaining_april_shortfall = max(0, april_shortfall - may_fruit_makeup_orders)
     may_jiancai_orders = _count_category_orders(ctxs, cargo_map, "建材", 5, may_rule)
     may_shortfall = max(0, _MAY_JIANCAI_MIN_ORDERS - may_jiancai_orders)
-    may_violations = april_shortfall + may_shortfall
+    may_violations = remaining_april_shortfall + may_shortfall
     may_penalty = may_violations * may_rule.penalty_amount
     total += may_penalty
     _append_rule(
@@ -351,6 +353,8 @@ def evaluate_d001_preferences(
         may_penalty,
         may_rule,
         april_shortfall=april_shortfall,
+        may_fruit_makeup_orders=may_fruit_makeup_orders,
+        remaining_april_shortfall=remaining_april_shortfall,
         may_jiancai_orders=may_jiancai_orders,
         may_shortfall=may_shortfall,
         violations=may_violations,
