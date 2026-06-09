@@ -781,7 +781,11 @@ class ModelDecisionService:
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt},
                 ],
-                "temperature": 0.1,
+                # Greedy decoding (0, like the other LLM calls here) for
+                # run-to-run stability: at 0.1 the per-step picks drift enough to
+                # swing monthly net income by 10k+, which makes the one-shot
+                # finals score a coin flip. We want a high, reproducible floor.
+                "temperature": 0,
                 "response_format": {"type": "json_object"},
                 "max_tokens": 180,
             }
