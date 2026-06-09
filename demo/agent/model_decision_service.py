@@ -347,36 +347,45 @@ class DecisionHistory:
         if len(self._history) > self._window_size:
             self._history.pop(0)
 
-    def get_summary(self, current_day: int) -> str:
-        """Generate a concise history summary for LLM context."""
+    def get_summary(self, current_day: int, plan: dict[str, Any] | None = None) -> str:
+        """Concise history summary for LLM context.
+
+        Accepted-order aggregates (total/this-month orders, long-haul count,
+        category progress) are read from ``plan`` when provided, because the
+        evaluation harness only calls ``decide()`` and never feeds per-step
+        results back into this object -- so the internal counters here stay 0
+        and would otherwise mislead the model. ``plan`` is rebuilt every step
+        from the authoritative decision history, so it is the source of truth.
+        Wait/reposition counts and the recent action trace come from the local
+        rolling window (those are recorded reliably at decide time).
+        """
         month_idx = _month_index_for_day(current_day)
         month_name = _month_name(month_idx)
-        lines = []
-        lines.append(f"=== 决策历史摘要 ===")
-        lines.append(f"总接单: {self._total_orders}, 累计收入: ¥{self._total_income:.0f}")
+        lines = ["=== 决策历史摘要 ==="]
 
-        # Monthly breakdown
-        for mi in sorted(self._monthly_stats):
-            mn = _month_name(mi)
-            s = self._monthly_stats[mi]
-            lines.append(
-                f"{mn}: 接单{s['orders']}, 等待{s['waits']}次, "
-                f"重定位{s['repositions']}次, "
-                f"运输{s['total_haul_km']:.0f}km, 空驶{s['total_deadhead_km']:.0f}km"
-            )
+        if plan is not None:
+            orders_today = plan.get("orders_today", {}) or {}
+            total_orders = sum(int(v) for v in orders_today.values())
+            m_lo, m_hi = _MONTH_START_DAYS[month_idx], _MONTH_START_DAYS[month_idx + 1]
+            month_orders = sum(int(c) for d, c in orders_today.items() if m_lo <= int(d) < m_hi)
+            longhual = plan.get("monthly_longhual", {}).get(month_idx, 0)
+            cat_orders = plan.get("monthly_category_orders", {}).get(month_idx, {}) or {}
+            lines.append(f"累计接单: {total_orders}单 (本{month_name}已接{month_orders}单)")
+            lines.append(f"{month_name}长途(>8h): {longhual}/{LONGHAUL_CAP}单上限")
+            if cat_orders:
+                top = sorted(cat_orders.items(), key=lambda x: -x[1])[:5]
+                lines.append(f"{month_name}品类接单: " + ", ".join(f"{c}:{n}单" for c, n in top))
+        else:
+            lines.append(f"累计接单: {self._total_orders}单, 累计收入: ¥{self._total_income:.0f}")
 
-        # Category progress for current month
-        if month_idx in self._category_counts:
-            cats = self._category_counts[month_idx]
-            top_cats = sorted(cats.items(), key=lambda x: -x[1])[:5]
-            lines.append(f"\n{month_name}品类分布(前5): " +
-                         ", ".join(f"{c}:{n}单" for c, n in top_cats))
+        # Wait/reposition activity this month (recorded reliably at decide time).
+        s = self._monthly_stats.get(month_idx)
+        if s:
+            lines.append(f"{month_name}活动: 等待{s['waits']}次, 重定位{s['repositions']}次")
 
-        # Long-haul tracking
-        lh = self._longhual_counts.get(month_idx, 0)
-        lines.append(f"{month_name}长途(>8h): {lh}/5单上限")
-
-        # Recent decisions (last 10)
+        # Recent action trace (reliable for the action chosen each step). We do
+        # not assert accept/reject here -- failed cargo is surfaced separately
+        # from the authoritative plan in the rules/compliance section.
         recent = self._history[-10:]
         if recent:
             lines.append(f"\n最近{len(recent)}步决策:")
@@ -386,15 +395,9 @@ class DecisionHistory:
                 act = e["action"]
                 detail = ""
                 if act == "take_order":
-                    cn = e.get("cargo_name", "?")
-                    acc = "✓" if e.get("accepted") else "✗"
-                    fail = ""
-                    if not e.get("accepted") and e.get("detail"):
-                        fail = f"({str(e.get('detail'))[:12]})"
-                    detail = f" {cn} {acc}{fail}"
+                    detail = f" {e.get('cargo_name', '') or e.get('params', {}).get('cargo_id', '?')}"
                 elif act == "wait":
-                    dur = e["params"].get("duration_minutes", 0)
-                    detail = f" {dur}分钟"
+                    detail = f" {e['params'].get('duration_minutes', 0)}分钟"
                 elif act == "reposition":
                     detail = f" →({e['params'].get('latitude',0):.1f},{e['params'].get('longitude',0):.1f})"
                 lines.append(f"  Day{d} {h:02d}:{m:02d} {act}{detail}")
@@ -723,8 +726,9 @@ class ModelDecisionService:
         # Build preference rules summary
         pref_summary = self._format_rules_for_llm(driver_id, rules, plan, day)
 
-        # Build history summary
-        history_text = history.get_summary(day)
+        # Build history summary (accepted-order aggregates come from the
+        # authoritative ``plan`` rebuilt each step from decision history).
+        history_text = history.get_summary(day, plan)
 
         # Construct LLM prompt
         day_in_month = _day_in_month(day)
@@ -734,15 +738,17 @@ class ModelDecisionService:
 
         system_prompt = (
             "你是一个智能货运调度决策AI。根据司机当前状态、决策历史、可用货源和偏好规则，"
-            "做出最优决策。你的目标是：1) 最大化净收入 2) 最小化偏好违规处罚 3) 完成品类指标。\n\n"
+            "做出最优决策。首要目标是最大化净收益(net=毛收入−成本−偏好罚款)；"
+            "罚款只是净收益里的一项成本，毛收入足够高时带点罚款也值得。完成品类指标同样重要(欠单罚款高)。\n\n"
             "可用动作：\n"
-            '- take_order: 接单。参数: {"cargo_id": "ID"}。优先选择目标品类、高价、短途的货\n'
+            '- take_order: 接单。参数: {"cargo_id": "ID"}。优先净收益最高的货：候选里 net_per_h(每小时净收益)越高越好；'
+            '若有未达标的品类指标则优先该品类。不要只图短途，长途只要 net_per_h 高就值得接\n'
             '- wait: 等待。参数: {"duration_minutes": 分钟数}。仅在21:00-06:00夜休时段或货源确实不好时使用\n'
             '- reposition: 空驶到新位置。参数: {"latitude": 纬度, "longitude": 经度}。'
             '当附近无目标品类货源时，主动移动到可能有货的区域（根据地理常识判断）\n\n'
             "重要规则：\n"
             "- 21:00后不得接单或空驶（夜停休）；空驶必须在20:50前结束，21:00-06:00期间只能wait\n"
-            "- 每月长途(>8h)最多5单\n"
+            "- 每月长途(>8h)软上限5单：超出每单扣1000，但只要该单净收益明显大于1000就仍应接\n"
             "- 不要连续wait超过2次！如果当前货源不合适，应该reposition到新区域寻找更好货源\n"
             "- 品类指标很重要：未达标会有高额罚款。优先接指标品类的货\n"
             "- 只能从候选货源列表里选 cargo_id；候选为空或都不合适就 wait/reposition\n"
@@ -775,7 +781,11 @@ class ModelDecisionService:
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt},
                 ],
-                "temperature": 0.1,
+                # Greedy decoding (0, like the other LLM calls here) for
+                # run-to-run stability: at 0.1 the per-step picks drift enough to
+                # swing monthly net income by 10k+, which makes the one-shot
+                # finals score a coin flip. We want a high, reproducible floor.
+                "temperature": 0,
                 "response_format": {"type": "json_object"},
                 "max_tokens": 180,
             }
@@ -1347,10 +1357,18 @@ class ModelDecisionService:
         if month_idx in getattr(rules, "category_carryover_months", set()):
             prev_targets = getattr(rules, "monthly_category_targets", {}).get(month_idx - 1, {})
             prev_orders = plan["monthly_category_orders"].get(month_idx - 1, {})
-            carry = sum(max(0, int(req) - int(prev_orders.get(cat, 0))) for cat, req in prev_targets.items())
-            if carry and targets:
-                first_cat = next(iter(targets))
-                targets[first_cat] = int(targets[first_cat]) + carry
+            # A carryover clause means an unmet KPI from the previous month must
+            # be made up by taking MORE OF THE SAME category this month (that is
+            # how the scorer credits make-up orders). So add each previous-month
+            # deficit to the *same* category's target this month. Do NOT inflate
+            # this month's own first category -- extra orders of a different
+            # category do not offset the carried-over deficit, which is exactly
+            # what made the agent over-take 建材 while ignoring the cheaper fruit
+            # make-up and eat the (higher) carryover penalty.
+            for cat, req in prev_targets.items():
+                deficit = max(0, int(req) - int(prev_orders.get(cat, 0)))
+                if deficit:
+                    targets[cat] = int(targets.get(cat, 0)) + deficit
         if targets:
             best_cat, best_need = None, 0
             for cat, req in targets.items():
@@ -1359,15 +1377,10 @@ class ModelDecisionService:
                 if need > best_need:
                     best_cat, best_need = cat, need
             return (best_cat, best_need) if best_cat and best_need > 0 else (None, 0)
-        if month_idx == 1:
-            got = cat_orders.get("水果", 0)
-            return ("水果", max(0, 12 - got)) if got < 12 else (None, 0)
-        if month_idx == 2:
-            april_cat = plan["monthly_category_orders"].get(1, {}).get("水果", 0)
-            april_shortfall = max(0, 12 - april_cat)
-            may_target = 12 + april_shortfall
-            got = cat_orders.get("建材", 0)
-            return ("建材", max(0, may_target - got)) if got < may_target else (None, 0)
+        # No category KPI parsed from this driver's preferences -> no target.
+        # (Earlier builds hard-coded D001's 水果/建材 quotas here, which would
+        # mislead any other driver; the parsed monthly_category_targets above is
+        # the only source of truth now.)
         return (None, 0)
 
     @staticmethod
@@ -1380,11 +1393,8 @@ class ModelDecisionService:
             for cat in targets:
                 if cat and (cat in cargo_name or cargo_name in cat):
                     cat_orders[cat] = cat_orders.get(cat, 0) + 1
-            return
-        if month_idx == 1 and cargo_name == "水果":
-            cat_orders["水果"] = cat_orders.get("水果", 0) + 1
-        elif month_idx == 2 and cargo_name == "建材":
-            cat_orders["建材"] = cat_orders.get("建材", 0) + 1
+        # No parsed targets -> nothing to track (was a D001-specific 水果/建材
+        # fallback that does not generalize to other drivers).
 
     def _pick_order(self, driver_id, status, rules, plan, now, lat, lng, day, day_end):
         entry_now = now  # step-start clock, used to key the shared cargo scan
@@ -1551,7 +1561,7 @@ class ModelDecisionService:
         and the decision history to determine optimal reposition target.
         """
         history = self._history.get(driver_id)
-        history_text = history.get_summary(day) if history else "无历史记录"
+        history_text = history.get_summary(day, plan) if history else "无历史记录"
 
         day_of_month = _day_in_month(day)
         month_idx = _month_index_for_day(day)
