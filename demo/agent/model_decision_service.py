@@ -1466,15 +1466,14 @@ class ModelDecisionService:
         shared = (set(cat) & set(cargo_name)) - ModelDecisionService._GENERIC_CATEGORY_CHARS
         return bool(shared)
 
-    @staticmethod
-    def _track_category_order(plan, rules, month_idx: int, cargo_name: str) -> None:
+    def _track_category_order(self, plan, rules, month_idx: int, cargo_name: str) -> None:
         if not cargo_name:
             return
         cat_orders = plan["monthly_category_orders"].setdefault(month_idx, {})
         targets = getattr(rules, "monthly_category_targets", {}).get(month_idx, {}) if rules else {}
         if targets:
             for cat in targets:
-                if ModelDecisionService._category_matches(cat, cargo_name):
+                if self._category_matches_sem(cat, cargo_name):
                     cat_orders[cat] = cat_orders.get(cat, 0) + 1
         # No parsed targets -> nothing to track (was a D001-specific 水果/建材
         # fallback that does not generalize to other drivers).
@@ -1551,7 +1550,7 @@ class ModelDecisionService:
             cargo_name = str(cargo.get("cargo_name", ""))
             is_cat_target = False
             if cat_target and cat_needed > 0:
-                if self._category_matches(cat_target, cargo_name):
+                if self._category_matches_sem(cat_target, cargo_name):
                     score *= 8.0 if urgent_category else 5.0
                     is_cat_target = True
 
@@ -1658,7 +1657,7 @@ class ModelDecisionService:
         target_locations = []
         for item in items:
             cargo = item.get("cargo", {})
-            if self._category_matches(cat_target, str(cargo.get("cargo_name", ""))):
+            if self._category_matches_sem(cat_target, str(cargo.get("cargo_name", ""))):
                 start = cargo.get("start", {})
                 target_locations.append({
                     "lat": start.get("lat", 0),
@@ -2394,11 +2393,15 @@ class ModelDecisionService:
         region = self._canonical_allowed_region(raw)
         if not region:
             return
-        if _allowed_region_key(region) is None and (
-            len(region) > 6 or any(ch in self._REGION_JUNK_CHARS for ch in region)
-        ):
-            self._logger.info("validation: rejected junk allowed_region '%s'", region)
-            return
+        if _allowed_region_key(region) is None:
+            junk_heuristic = len(region) > 6 or any(ch in self._REGION_JUNK_CHARS for ch in region)
+            is_place = self._llm_semantic_yes_no(
+                f"『{region}』是否是一个真实的中国地名/行政区/区域名（而非动作短语或乱序碎片）？",
+                default=not junk_heuristic,
+            )
+            if not is_place:
+                self._logger.info("validation: rejected junk allowed_region '%s'", region)
+                return
         if self._allowed_region_text_supported(region, all_text):
             rules.allowed_regions.add(region)
         else:
@@ -2476,6 +2479,57 @@ class ModelDecisionService:
             verdict = default
         cache[key] = verdict
         return verdict
+
+    def _llm_semantic_yes_no(self, question: str, default: bool) -> bool:
+        """通用 LLM 是/否语义判定（缓存 + fail-safe 降级到 default）。
+
+        用于品类归属、地名真实性等开放词表无法枚举的判断，避免硬编码字表。
+        同一问题只问一次；模型不可用/输出不可解析时返回启发式 default。"""
+        cache = getattr(self, "_semantic_yes_no_cache", None)
+        if cache is None:
+            cache = {}
+            self._semantic_yes_no_cache = cache
+        if question in cache:
+            return cache[question]
+        verdict = default
+        try:
+            msgs = [
+                {"role": "system", "content": (
+                    "你是货运领域的语义判定助手。输入文本可能是乱序/缺字的中文。"
+                    "只输出JSON {\"answer\": true/false}。"
+                )},
+                {"role": "user", "content": question},
+            ]
+            req: dict[str, Any] = {"messages": msgs, "temperature": 0, "max_tokens": 30}
+            try:
+                req["response_format"] = {"type": "json_object"}
+                resp = self._api.model_chat_completion(req)
+            except Exception:
+                req.pop("response_format", None)
+                resp = self._api.model_chat_completion(req)
+            data = self._extract_json(resp)
+            if isinstance(data, dict) and isinstance(data.get("answer"), bool):
+                verdict = data["answer"]
+        except Exception as exc:
+            self._logger.info("semantic yes/no unavailable (default=%s) q=%s err=%s", default, question[:60], exc)
+            verdict = default
+        cache[question] = verdict
+        return verdict
+
+    def _category_matches_sem(self, cat: str, cargo_name: str) -> bool:
+        """品类归属判定：子串直接命中；其余交给 LLM 语义判定（缓存），
+        模型不可用时降级到 _category_matches 启发式。"""
+        cat, cargo_name = cat.strip(), cargo_name.strip()
+        if not cat or not cargo_name:
+            return False
+        if cat in cargo_name or cargo_name in cat:
+            return True
+        question = (
+            f"货物名称『{cargo_name}』是否属于品类『{cat}』？"
+            "（两者都可能是乱序/缺字的中文，如『鲜果』即『水果』；"
+            "但『水泥』不属于『水果』）"
+        )
+        return self._llm_semantic_yes_no(question, default=self._category_matches(cat, cargo_name))
 
     def _merge_llm_rules(self, rules: DriverRules, data: dict[str, Any], texts: list[str] | None = None) -> None:
         all_text = "\n".join(texts) if texts else ""
