@@ -261,6 +261,10 @@ class DriverRules:
         self.first_order_before_minute: int | None = None
         self.monthly_category_targets: dict[int, dict[str, int]] = {}
         self.category_carryover_months: set[int] = set()
+        # rule kind -> per-violation penalty amount (from preference penalty_amounts,
+        # attributed by the parse LLM). Lets execution treat constraints economically:
+        # an order violating a rule is still worth taking when net > penalty.
+        self.rule_penalties: dict[str, float] = {}
 
     @property
     def day_rest_block(self) -> int:
@@ -379,6 +383,17 @@ class DecisionHistory:
             if cat_orders:
                 top = sorted(cat_orders.items(), key=lambda x: -x[1])[:5]
                 lines.append(f"{month_name}品类接单: " + ", ".join(f"{c}:{n}单" for c, n in top))
+            # Per-pickup-city realised yield (net/h) from the authoritative
+            # history — gives reposition decisions data instead of pure
+            # geographic intuition.
+            city_yield = plan.get("city_yield") or {}
+            if city_yield:
+                ranked = sorted(
+                    city_yield.items(),
+                    key=lambda kv: -(kv[1][1] / max(1, kv[1][2])),
+                )[:6]
+                lines.append("各装货城市历史净收益: " + ", ".join(
+                    f"{c}:{v[1] / max(1, v[2]) * 60:.0f}元/h({v[0]}单)" for c, v in ranked))
         else:
             lines.append(f"累计接单: {self._total_orders}单, 累计收入: ¥{self._total_income:.0f}")
 
@@ -387,9 +402,10 @@ class DecisionHistory:
         if s:
             lines.append(f"{month_name}活动: 等待{s['waits']}次, 重定位{s['repositions']}次")
 
-        # Recent action trace (reliable for the action chosen each step). We do
-        # not assert accept/reject here -- failed cargo is surfaced separately
-        # from the authoritative plan in the rules/compliance section.
+        # Recent action trace. Outcomes are annotated from the authoritative
+        # plan (failed_cargo_reasons rebuilt from the server-side history), so
+        # the model can learn from its own rejected attempts.
+        fail_reasons = (plan or {}).get("failed_cargo_reasons", {}) or {}
         recent = self._history[-10:]
         if recent:
             lines.append(f"\n最近{len(recent)}步决策:")
@@ -399,7 +415,14 @@ class DecisionHistory:
                 act = e["action"]
                 detail = ""
                 if act == "take_order":
-                    detail = f" {e.get('cargo_name', '') or e.get('params', {}).get('cargo_id', '?')}"
+                    cid = str(e.get("params", {}).get("cargo_id", ""))
+                    detail = f" {e.get('cargo_name', '') or cid or '?'}"
+                    if cid and cid in fail_reasons:
+                        detail += f" [失败:{fail_reasons[cid][:24]}]"
+                    elif e.get("accepted") is False:
+                        detail += f" [失败:{str(e.get('detail', ''))[:24]}]"
+                    else:
+                        detail += " [成交]"
                 elif act == "wait":
                     detail = f" {e['params'].get('duration_minutes', 0)}分钟"
                 elif act == "reposition":
@@ -484,6 +507,7 @@ class ModelDecisionService:
             self._cargo_meta[cid] = {
                 "cost_time_minutes": int(cargo.get("cost_time_minutes", 0) or 0),
                 "cargo_name": str(cargo.get("cargo_name", "") or ""),
+                "price": float(cargo.get("price", 0.0) or 0.0),
                 "start_city": str((cargo.get("start") or {}).get("city", "") or ""),
                 "end_city": str((cargo.get("end") or {}).get("city", "") or ""),
             }
@@ -522,6 +546,7 @@ class ModelDecisionService:
         plan["failed_cargo_reasons"] = {}
         plan["zeng_order_days"] = set()
         plan["total_deadhead_km"] = 0.0
+        plan["city_yield"] = {}  # start_city -> [orders, total_net, total_minutes]
         for rec in records:
             action = rec.get("action") or {}
             if action.get("action") != "take_order":
@@ -550,6 +575,16 @@ class ModelDecisionService:
             if int(meta.get("cost_time_minutes", 0) or 0) > 480:
                 plan["monthly_longhual"][month_idx] = plan["monthly_longhual"].get(month_idx, 0) + 1
             self._track_category_order(plan, rules, month_idx, str(meta.get("cargo_name", "")))
+            city = str(meta.get("start_city", "") or "")
+            price = float(meta.get("price", 0.0) or 0.0)
+            if city and price > 0:
+                haul_km = float(result.get("haul_distance_km", 0.0) or 0.0)
+                net_v = price - COST_PER_KM * (haul_km + pickup_deadhead)
+                minutes = max(1, int(meta.get("cost_time_minutes", 0) or 0))
+                cy = plan["city_yield"].setdefault(city, [0, 0.0, 0])
+                cy[0] += 1
+                cy[1] += net_v
+                cy[2] += minutes
             if rules is not None and rules.required_region is not None:
                 region = rules.required_region[0]
                 if _region_in_city(region, meta.get("start_city", "")) or _region_in_city(region, meta.get("end_city", "")):
@@ -1131,6 +1166,10 @@ class ModelDecisionService:
         if rules.daily_order_limit:
             today_count = plan.get("orders_today", {}).get(day, 0)
             lines.append(f"- 每日接单上限: {rules.daily_order_limit} (今日已接{today_count})")
+        rule_penalties = getattr(rules, "rule_penalties", {}) or {}
+        if rule_penalties:
+            lines.append("- 各规则单次违约扣款: " + ", ".join(f"{k}:{int(v)}元" for k, v in rule_penalties.items()))
+            lines.append("  罚款只是成本：候选货源的 net/net_per_h 已扣除对应罚款，净收益为正即值得接")
 
         # Category targets with progress
         cat_orders = plan.get("monthly_category_orders", {}).get(month_idx, {})
@@ -1450,15 +1489,30 @@ class ModelDecisionService:
         # the only source of truth now.)
         return (None, 0)
 
+    # Chars too generic to identify a category on their own ("水果" vs "水泥",
+    # "建材" vs "木材" must NOT match through them).
+    _GENERIC_CATEGORY_CHARS = set("水材品类货物用设大小鲜活其他")
+
     @staticmethod
-    def _track_category_order(plan, rules, month_idx: int, cargo_name: str) -> None:
+    def _category_matches(cat: str, cargo_name: str) -> bool:
+        """容噪品类匹配：精确子串之外，允许通过非泛用共有字匹配
+        （抓住「水果」↔「鲜果」这类措辞差异，同时拒绝「水果」↔「水泥」）。"""
+        cat, cargo_name = cat.strip(), cargo_name.strip()
+        if not cat or not cargo_name:
+            return False
+        if cat in cargo_name or cargo_name in cat:
+            return True
+        shared = (set(cat) & set(cargo_name)) - ModelDecisionService._GENERIC_CATEGORY_CHARS
+        return bool(shared)
+
+    def _track_category_order(self, plan, rules, month_idx: int, cargo_name: str) -> None:
         if not cargo_name:
             return
         cat_orders = plan["monthly_category_orders"].setdefault(month_idx, {})
         targets = getattr(rules, "monthly_category_targets", {}).get(month_idx, {}) if rules else {}
         if targets:
             for cat in targets:
-                if cat and (cat in cargo_name or cargo_name in cat):
+                if self._category_matches_sem(cat, cargo_name):
                     cat_orders[cat] = cat_orders.get(cat, 0) + 1
         # No parsed targets -> nothing to track (was a D001-specific 水果/建材
         # fallback that does not generalize to other drivers).
@@ -1535,7 +1589,7 @@ class ModelDecisionService:
             cargo_name = str(cargo.get("cargo_name", ""))
             is_cat_target = False
             if cat_target and cat_needed > 0:
-                if cargo_name == cat_target:
+                if self._category_matches_sem(cat_target, cargo_name):
                     score *= 8.0 if urgent_category else 5.0
                     is_cat_target = True
 
@@ -1642,7 +1696,7 @@ class ModelDecisionService:
         target_locations = []
         for item in items:
             cargo = item.get("cargo", {})
-            if cargo.get("cargo_name") == cat_target:
+            if self._category_matches_sem(cat_target, str(cargo.get("cargo_name", ""))):
                 start = cargo.get("start", {})
                 target_locations.append({
                     "lat": start.get("lat", 0),
@@ -1854,9 +1908,18 @@ class ModelDecisionService:
         return net, slat, slng, scity
 
     def _evaluate_cargo(self, cargo, item, rules, blackout_regions, now, day_end, lat, lng):
+        # Economic treatment of preference violations: when the parse step
+        # attributed a per-violation penalty amount to a rule kind, a violating
+        # order is not hard-rejected — the penalty is subtracted from its net
+        # and the order survives only if it is still profitable (same pattern
+        # as the long-haul soft cap). Unknown penalty → conservative hard reject.
+        violation_cost = 0.0
         name = str(cargo.get("cargo_name", ""))
         if self._is_forbidden_cargo(name, rules.forbidden_categories):
-            return None
+            fp = rules.rule_penalties.get("forbidden_categories")
+            if fp is None:
+                return None
+            violation_cost += fp
         # avoid_categories: soft penalty (50% score reduction) rather than hard rejection
         avoid_penalty = 0.5 if self._is_forbidden_cargo(name, rules.avoid_categories) else 1.0
         start = cargo.get("start") or {}
@@ -1866,13 +1929,19 @@ class ModelDecisionService:
         slat, slng = float(start.get("lat", 0.0)), float(start.get("lng", 0.0))
         elat, elng = float(end.get("lat", 0.0)), float(end.get("lng", 0.0))
         if rules.allowed_regions:
-            if not _target_matches_allowed_regions(rules.allowed_regions, slat, slng, scity):
-                return None
-            if not _target_matches_allowed_regions(rules.allowed_regions, elat, elng, ecity):
-                return None
+            if not (_target_matches_allowed_regions(rules.allowed_regions, slat, slng, scity)
+                    and _target_matches_allowed_regions(rules.allowed_regions, elat, elng, ecity)):
+                ap = rules.rule_penalties.get("allowed_regions")
+                if ap is None:
+                    return None
+                violation_cost += ap
         for region in rules.forbidden_regions:
             if _region_in_city(region, scity) or _region_in_city(region, ecity):
-                return None
+                rp = rules.rule_penalties.get("forbidden_regions")
+                if rp is None:
+                    return None
+                violation_cost += rp
+                break
         for region in blackout_regions:
             if _region_in_city(region, scity) or _region_in_city(region, ecity):
                 return None
@@ -1932,7 +2001,7 @@ class ModelDecisionService:
         if rules.haul_max_km is not None and haul_km > rules.haul_max_km:
             return None
         price = float(cargo.get("price", 0.0))
-        net = price - COST_PER_KM * (pickup_km + haul_km)
+        net = price - COST_PER_KM * (pickup_km + haul_km) - violation_cost
         if net <= 0:
             return None
         # Apply avoid_categories soft penalty
@@ -2028,7 +2097,11 @@ class ModelDecisionService:
 
         before = self._rules_fingerprint(rules)
         coord_map = self._collect_coords(prefs)
-        parsed_by_llm = self._llm_parse_preferences(driver_id, texts, rules, coord_map)
+        penalties = [
+            (pref.get("penalty_amount") if isinstance(pref, dict) else None) for pref in prefs
+            if (pref.get("content", "") if isinstance(pref, dict) else str(pref)).strip()
+        ]
+        parsed_by_llm = self._llm_parse_preferences(driver_id, texts, rules, coord_map, penalties)
         if not parsed_by_llm:
             # offline / model unavailable: fall back to the deterministic regex parser.
             for text in texts:
@@ -2085,6 +2158,7 @@ class ModelDecisionService:
         # Dedup avoid/forbidden AFTER supplement so regex-added items are also cleaned
         init_lat, init_lng = self._initial_position[driver_id]
         self._supplement_relative_allowed_regions(texts, rules, init_lat, init_lng)
+        self._supplement_night_failsafe(texts, rules)
         self._dedup_avoid_forbidden(rules)
         if self._rules_fingerprint(rules) != before:
             self._logger.info(
@@ -2174,7 +2248,11 @@ class ModelDecisionService:
         '- dated_single: 某天必须到某地办事 [{"date":日期,"lat":纬度,"lng":经度,"wait_minutes":停留分钟,"before_hour":最晚到达整点或null}]\n'
         '  触发词：盘库/清库存/对账/验收/盘点/提货/签收/检查/保养/检修/停一趟/办事/开会/取东西/交货/拿货/走一趟/回一趟/去一趟/看看/办手续/送东西/存东西\n'
         '- dated_route: 某天按顺序经过多个地点 [{"date":日期,"stops":[{"lat":纬度,"lng":经度,"wait_minutes":分钟,"before_hour":整点或null}...]}]\n'
-        '  触发词：赴宴/做寿/先到…再到/先去…再去/先过…赶到/接人/送人/喝喜酒/吃饭/接上配偶/接家人\n\n'
+        '  触发词：赴宴/做寿/先到…再到/先去…再去/先过…赶到/接人/送人/喝喜酒/吃饭/接上配偶/接家人\n'
+        '- rule_penalties: 各类规则的单次违约扣款金额对象（仅当输入含 penalty_amounts 时填写，否则 null）。'
+        '把每条偏好的金额归因到其抽出的规则类别，键限：'
+        '"allowed_regions"/"forbidden_regions"/"forbidden_categories"/"night_window"/"category_targets"/"dated_events"。'
+        '一条偏好含多种规则时金额填到每个对应键；无法确定归因的键省略。\n\n'
         "关键规则：\n"
         "1) 日期用该月日数 1-31。中文数字要转换（十二号→12，二十号→20，三十一号→31）。\n"
         "2) 坐标：偏好中'地名（纬度,经度）'→直接取。输入若有 known_coordinates 优先使用。"
@@ -2191,7 +2269,10 @@ class ModelDecisionService:
         '9) "不接单不空跑/不空驶/收车/归家不动/熄火歇业"类约束，只要含时间段一律填no_drive_windows（夜间跨夜用start>end）；'
         '若同时含"休息/睡觉/停车熄火"→也填rest_window或daily_rest_hours。这类"每日生效"的时段约束漏抽代价极高，务必抽全。\n'
         '10) "接上配偶/家人→返回老家/进家门"是 dated_route 事件（多点路线），不是 home_rule。\n'
-        '11) "只跑/只接/仅在/不出X"是 allowed_regions，不是 forbidden_regions。\n\n'
+        '11) "只跑/只接/仅在/不出X"是 allowed_regions，不是 forbidden_regions。\n'
+        '12) 输入可能含 penalty_amounts 数组（与 preferences 一一对应的违约扣款金额）。'
+        '金额越高的偏好越要逐字推敲、确保其全部约束被完整抽出，绝不能漏；尤其是每日生效的夜休/禁驶窗口和月度品类指标。'
+        '同时把各金额按规则类别归因填入 rule_penalties。\n\n'
         "示例1：\n"
         '入: {"preferences":["每天零点到六点停着熄火睡觉","凡是生鲜货源碰不得","三月四号五号不往深圳（22.55，114.05）跑"]}\n'
         '出: {"daily_rest_hours":null,"rest_window":{"start_hour":0,"end_hour":6},'
@@ -2243,6 +2324,7 @@ class ModelDecisionService:
     def _llm_parse_preferences(
         self, driver_id: str, texts: list[str], rules: DriverRules,
         coord_map: dict[str, tuple[float, float]] | None = None,
+        penalties: list[Any] | None = None,
     ) -> bool:
         """用大模型把全部可见偏好解析成结构化规则并合并进 rules。
 
@@ -2252,6 +2334,8 @@ class ModelDecisionService:
         if not texts:
             return False
         payload: dict[str, Any] = {"preferences": texts}
+        if penalties and len(penalties) == len(texts) and any(p for p in penalties):
+            payload["penalty_amounts"] = penalties
         if coord_map:
             payload["known_coordinates"] = {
                 name: {"lat": loc[0], "lng": loc[1]} for name, loc in coord_map.items()
@@ -2343,6 +2427,11 @@ class ModelDecisionService:
             return ""
         return r[:12]
 
+    # Characters that never appear in a real place name; regex captures over the
+    # noisy/scrambled preference text sometimes yield fragments like "浙范跑单"
+    # or "三角个" — those must not become allowed_regions entries.
+    _REGION_JUNK_CHARS = set("跑接单货车驶运范围圈线路内外出不只仅在限的得须必每天月日点号时晚夜元扣罚个这那")
+
     def _canonical_allowed_region(self, raw: str) -> str:
         cleaned = self._clean_region_name(raw)
         if not cleaned:
@@ -2363,6 +2452,15 @@ class ModelDecisionService:
         region = self._canonical_allowed_region(raw)
         if not region:
             return
+        if _allowed_region_key(region) is None:
+            junk_heuristic = len(region) > 6 or any(ch in self._REGION_JUNK_CHARS for ch in region)
+            is_place = self._llm_semantic_yes_no(
+                f"『{region}』是否是一个真实的中国地名/行政区/区域名（而非动作短语或乱序碎片）？",
+                default=not junk_heuristic,
+            )
+            if not is_place:
+                self._logger.info("validation: rejected junk allowed_region '%s'", region)
+                return
         if self._allowed_region_text_supported(region, all_text):
             rules.allowed_regions.add(region)
         else:
@@ -2441,8 +2539,64 @@ class ModelDecisionService:
         cache[key] = verdict
         return verdict
 
+    def _llm_semantic_yes_no(self, question: str, default: bool) -> bool:
+        """通用 LLM 是/否语义判定（缓存 + fail-safe 降级到 default）。
+
+        用于品类归属、地名真实性等开放词表无法枚举的判断，避免硬编码字表。
+        同一问题只问一次；模型不可用/输出不可解析时返回启发式 default。"""
+        cache = getattr(self, "_semantic_yes_no_cache", None)
+        if cache is None:
+            cache = {}
+            self._semantic_yes_no_cache = cache
+        if question in cache:
+            return cache[question]
+        verdict = default
+        try:
+            msgs = [
+                {"role": "system", "content": (
+                    "你是货运领域的语义判定助手。输入文本可能是乱序/缺字的中文。"
+                    "只输出JSON {\"answer\": true/false}。"
+                )},
+                {"role": "user", "content": question},
+            ]
+            req: dict[str, Any] = {"messages": msgs, "temperature": 0, "max_tokens": 30}
+            try:
+                req["response_format"] = {"type": "json_object"}
+                resp = self._api.model_chat_completion(req)
+            except Exception:
+                req.pop("response_format", None)
+                resp = self._api.model_chat_completion(req)
+            data = self._extract_json(resp)
+            if isinstance(data, dict) and isinstance(data.get("answer"), bool):
+                verdict = data["answer"]
+        except Exception as exc:
+            self._logger.info("semantic yes/no unavailable (default=%s) q=%s err=%s", default, question[:60], exc)
+            verdict = default
+        cache[question] = verdict
+        return verdict
+
+    def _category_matches_sem(self, cat: str, cargo_name: str) -> bool:
+        """品类归属判定：子串直接命中；其余交给 LLM 语义判定（缓存），
+        模型不可用时降级到 _category_matches 启发式。"""
+        cat, cargo_name = cat.strip(), cargo_name.strip()
+        if not cat or not cargo_name:
+            return False
+        if cat in cargo_name or cargo_name in cat:
+            return True
+        question = (
+            f"货物名称『{cargo_name}』是否属于品类『{cat}』？"
+            "（两者都可能是乱序/缺字的中文，如『鲜果』即『水果』；"
+            "但『水泥』不属于『水果』）"
+        )
+        return self._llm_semantic_yes_no(question, default=self._category_matches(cat, cargo_name))
+
     def _merge_llm_rules(self, rules: DriverRules, data: dict[str, Any], texts: list[str] | None = None) -> None:
         all_text = "\n".join(texts) if texts else ""
+        rp = data.get("rule_penalties")
+        if isinstance(rp, dict):
+            for k, v in rp.items():
+                if isinstance(k, str) and isinstance(v, (int, float)) and v > 0:
+                    rules.rule_penalties[k] = max(rules.rule_penalties.get(k, 0.0), float(v))
         rest_h = data.get("daily_rest_hours")
         if isinstance(rest_h, (int, float)) and rest_h > 0:
             rules.daily_rest_minutes = max(rules.daily_rest_minutes, int(round(rest_h * 60)))
@@ -2856,6 +3010,39 @@ class ModelDecisionService:
                 if "在" in raw:
                     raw = raw.rsplit("在", 1)[-1]
                 self._add_allowed_region(rules, raw, text)
+
+    _NIGHT_KW = ("夜", "晚", "宵", "黑")
+    _REST_KW = ("停", "休", "熄", "睡", "眠", "收", "歇", "锁", "不出", "不接", "不动", "归家")
+    _CLOCK_RE = re.compile(r"([01]?\d|2[0-4])(?:[：:]([0-5]\d)|点(半)?|时)")
+
+    def _supplement_night_failsafe(self, texts: list[str], rules: DriverRules) -> None:
+        """夜休 fail-safe：夜间禁驶是按天重复扣分的最大罚项之一，漏抽代价极高。
+
+        若 LLM/正则都未产出任何跨夜窗口，但某条原文同时含夜间词 + 停休词 +
+        可识别的晚间/凌晨时刻对，则直接按文本中的时刻构造跨夜窗口（宁可多休
+        损失少量收入，也不能每天吃夜休罚款）。"""
+        if any(we > DAY_MINUTES for _ws, we in rules.no_drive_windows):
+            return  # an overnight window already exists
+        if rules.rest_window is not None and rules.rest_window[0] == 0 and rules.rest_window[1] > 0:
+            return  # overnight rest already registered via _apply_rest_window
+        for text in texts:
+            if not any(k in text for k in self._NIGHT_KW):
+                continue
+            if not any(k in text for k in self._REST_KW):
+                continue
+            times: list[int] = []
+            for m in self._CLOCK_RE.finditer(text):
+                h = int(m.group(1))
+                mins = int(m.group(2)) if m.group(2) else (30 if m.group(3) else 0)
+                times.append(h * 60 + mins)
+            evening = [t for t in times if t >= 18 * 60]
+            morning = [t for t in times if 0 < t <= 9 * 60]
+            if not evening or not morning:
+                continue
+            sm, em = max(evening), min(morning)
+            self._logger.info("night fail-safe: derived overnight window %d-%d from text %r", sm, em, text[:60])
+            self._apply_rest_window(rules, sm, em)
+            return
 
     def _supplement_relative_allowed_regions(
         self,
@@ -3636,8 +3823,16 @@ class ModelDecisionService:
                 return (0, end)
         if len(minutes) >= 2:
             m1, m2 = minutes[0], minutes[1]
-            # fix PM context: "十一点半到下午一点半" → h2=1 should be 13
             h1, h2 = m1 // 60, m2 // 60
+            # PM context for the start: "每晚十点到次日五点" → h1=10 means 22:00
+            if 0 < h1 < 12:
+                first = re.search(r"[零一二两三四五六七八九十\d]+\s*点半?", text)
+                if first is not None:
+                    prefix = text[max(0, first.start() - 2):first.start()]
+                    if any(ch in prefix for ch in "晚夜宵"):
+                        m1 += 12 * 60
+                        h1 += 12
+            # fix PM context: "十一点半到下午一点半" → h2=1 should be 13
             if h2 < h1 and h2 < 12 and ("下午" in text or "中午" in text):
                 m2 += 12 * 60
             return (m1, m2)
