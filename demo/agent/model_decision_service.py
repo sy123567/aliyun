@@ -261,6 +261,10 @@ class DriverRules:
         self.first_order_before_minute: int | None = None
         self.monthly_category_targets: dict[int, dict[str, int]] = {}
         self.category_carryover_months: set[int] = set()
+        # rule kind -> per-violation penalty amount (from preference penalty_amounts,
+        # attributed by the parse LLM). Lets execution treat constraints economically:
+        # an order violating a rule is still worth taking when net > penalty.
+        self.rule_penalties: dict[str, float] = {}
 
     @property
     def day_rest_block(self) -> int:
@@ -379,6 +383,17 @@ class DecisionHistory:
             if cat_orders:
                 top = sorted(cat_orders.items(), key=lambda x: -x[1])[:5]
                 lines.append(f"{month_name}品类接单: " + ", ".join(f"{c}:{n}单" for c, n in top))
+            # Per-pickup-city realised yield (net/h) from the authoritative
+            # history — gives reposition decisions data instead of pure
+            # geographic intuition.
+            city_yield = plan.get("city_yield") or {}
+            if city_yield:
+                ranked = sorted(
+                    city_yield.items(),
+                    key=lambda kv: -(kv[1][1] / max(1, kv[1][2])),
+                )[:6]
+                lines.append("各装货城市历史净收益: " + ", ".join(
+                    f"{c}:{v[1] / max(1, v[2]) * 60:.0f}元/h({v[0]}单)" for c, v in ranked))
         else:
             lines.append(f"累计接单: {self._total_orders}单, 累计收入: ¥{self._total_income:.0f}")
 
@@ -387,9 +402,10 @@ class DecisionHistory:
         if s:
             lines.append(f"{month_name}活动: 等待{s['waits']}次, 重定位{s['repositions']}次")
 
-        # Recent action trace (reliable for the action chosen each step). We do
-        # not assert accept/reject here -- failed cargo is surfaced separately
-        # from the authoritative plan in the rules/compliance section.
+        # Recent action trace. Outcomes are annotated from the authoritative
+        # plan (failed_cargo_reasons rebuilt from the server-side history), so
+        # the model can learn from its own rejected attempts.
+        fail_reasons = (plan or {}).get("failed_cargo_reasons", {}) or {}
         recent = self._history[-10:]
         if recent:
             lines.append(f"\n最近{len(recent)}步决策:")
@@ -399,7 +415,14 @@ class DecisionHistory:
                 act = e["action"]
                 detail = ""
                 if act == "take_order":
-                    detail = f" {e.get('cargo_name', '') or e.get('params', {}).get('cargo_id', '?')}"
+                    cid = str(e.get("params", {}).get("cargo_id", ""))
+                    detail = f" {e.get('cargo_name', '') or cid or '?'}"
+                    if cid and cid in fail_reasons:
+                        detail += f" [失败:{fail_reasons[cid][:24]}]"
+                    elif e.get("accepted") is False:
+                        detail += f" [失败:{str(e.get('detail', ''))[:24]}]"
+                    else:
+                        detail += " [成交]"
                 elif act == "wait":
                     detail = f" {e['params'].get('duration_minutes', 0)}分钟"
                 elif act == "reposition":
@@ -484,6 +507,7 @@ class ModelDecisionService:
             self._cargo_meta[cid] = {
                 "cost_time_minutes": int(cargo.get("cost_time_minutes", 0) or 0),
                 "cargo_name": str(cargo.get("cargo_name", "") or ""),
+                "price": float(cargo.get("price", 0.0) or 0.0),
                 "start_city": str((cargo.get("start") or {}).get("city", "") or ""),
                 "end_city": str((cargo.get("end") or {}).get("city", "") or ""),
             }
@@ -522,6 +546,7 @@ class ModelDecisionService:
         plan["failed_cargo_reasons"] = {}
         plan["zeng_order_days"] = set()
         plan["total_deadhead_km"] = 0.0
+        plan["city_yield"] = {}  # start_city -> [orders, total_net, total_minutes]
         for rec in records:
             action = rec.get("action") or {}
             if action.get("action") != "take_order":
@@ -550,6 +575,16 @@ class ModelDecisionService:
             if int(meta.get("cost_time_minutes", 0) or 0) > 480:
                 plan["monthly_longhual"][month_idx] = plan["monthly_longhual"].get(month_idx, 0) + 1
             self._track_category_order(plan, rules, month_idx, str(meta.get("cargo_name", "")))
+            city = str(meta.get("start_city", "") or "")
+            price = float(meta.get("price", 0.0) or 0.0)
+            if city and price > 0:
+                haul_km = float(result.get("haul_distance_km", 0.0) or 0.0)
+                net_v = price - COST_PER_KM * (haul_km + pickup_deadhead)
+                minutes = max(1, int(meta.get("cost_time_minutes", 0) or 0))
+                cy = plan["city_yield"].setdefault(city, [0, 0.0, 0])
+                cy[0] += 1
+                cy[1] += net_v
+                cy[2] += minutes
             if rules is not None and rules.required_region is not None:
                 region = rules.required_region[0]
                 if _region_in_city(region, meta.get("start_city", "")) or _region_in_city(region, meta.get("end_city", "")):
@@ -1131,6 +1166,10 @@ class ModelDecisionService:
         if rules.daily_order_limit:
             today_count = plan.get("orders_today", {}).get(day, 0)
             lines.append(f"- 每日接单上限: {rules.daily_order_limit} (今日已接{today_count})")
+        rule_penalties = getattr(rules, "rule_penalties", {}) or {}
+        if rule_penalties:
+            lines.append("- 各规则单次违约扣款: " + ", ".join(f"{k}:{int(v)}元" for k, v in rule_penalties.items()))
+            lines.append("  罚款只是成本：候选货源的 net/net_per_h 已扣除对应罚款，净收益为正即值得接")
 
         # Category targets with progress
         cat_orders = plan.get("monthly_category_orders", {}).get(month_idx, {})
@@ -1869,9 +1908,18 @@ class ModelDecisionService:
         return net, slat, slng, scity
 
     def _evaluate_cargo(self, cargo, item, rules, blackout_regions, now, day_end, lat, lng):
+        # Economic treatment of preference violations: when the parse step
+        # attributed a per-violation penalty amount to a rule kind, a violating
+        # order is not hard-rejected — the penalty is subtracted from its net
+        # and the order survives only if it is still profitable (same pattern
+        # as the long-haul soft cap). Unknown penalty → conservative hard reject.
+        violation_cost = 0.0
         name = str(cargo.get("cargo_name", ""))
         if self._is_forbidden_cargo(name, rules.forbidden_categories):
-            return None
+            fp = rules.rule_penalties.get("forbidden_categories")
+            if fp is None:
+                return None
+            violation_cost += fp
         # avoid_categories: soft penalty (50% score reduction) rather than hard rejection
         avoid_penalty = 0.5 if self._is_forbidden_cargo(name, rules.avoid_categories) else 1.0
         start = cargo.get("start") or {}
@@ -1881,13 +1929,19 @@ class ModelDecisionService:
         slat, slng = float(start.get("lat", 0.0)), float(start.get("lng", 0.0))
         elat, elng = float(end.get("lat", 0.0)), float(end.get("lng", 0.0))
         if rules.allowed_regions:
-            if not _target_matches_allowed_regions(rules.allowed_regions, slat, slng, scity):
-                return None
-            if not _target_matches_allowed_regions(rules.allowed_regions, elat, elng, ecity):
-                return None
+            if not (_target_matches_allowed_regions(rules.allowed_regions, slat, slng, scity)
+                    and _target_matches_allowed_regions(rules.allowed_regions, elat, elng, ecity)):
+                ap = rules.rule_penalties.get("allowed_regions")
+                if ap is None:
+                    return None
+                violation_cost += ap
         for region in rules.forbidden_regions:
             if _region_in_city(region, scity) or _region_in_city(region, ecity):
-                return None
+                rp = rules.rule_penalties.get("forbidden_regions")
+                if rp is None:
+                    return None
+                violation_cost += rp
+                break
         for region in blackout_regions:
             if _region_in_city(region, scity) or _region_in_city(region, ecity):
                 return None
@@ -1947,7 +2001,7 @@ class ModelDecisionService:
         if rules.haul_max_km is not None and haul_km > rules.haul_max_km:
             return None
         price = float(cargo.get("price", 0.0))
-        net = price - COST_PER_KM * (pickup_km + haul_km)
+        net = price - COST_PER_KM * (pickup_km + haul_km) - violation_cost
         if net <= 0:
             return None
         # Apply avoid_categories soft penalty
@@ -2194,7 +2248,11 @@ class ModelDecisionService:
         '- dated_single: 某天必须到某地办事 [{"date":日期,"lat":纬度,"lng":经度,"wait_minutes":停留分钟,"before_hour":最晚到达整点或null}]\n'
         '  触发词：盘库/清库存/对账/验收/盘点/提货/签收/检查/保养/检修/停一趟/办事/开会/取东西/交货/拿货/走一趟/回一趟/去一趟/看看/办手续/送东西/存东西\n'
         '- dated_route: 某天按顺序经过多个地点 [{"date":日期,"stops":[{"lat":纬度,"lng":经度,"wait_minutes":分钟,"before_hour":整点或null}...]}]\n'
-        '  触发词：赴宴/做寿/先到…再到/先去…再去/先过…赶到/接人/送人/喝喜酒/吃饭/接上配偶/接家人\n\n'
+        '  触发词：赴宴/做寿/先到…再到/先去…再去/先过…赶到/接人/送人/喝喜酒/吃饭/接上配偶/接家人\n'
+        '- rule_penalties: 各类规则的单次违约扣款金额对象（仅当输入含 penalty_amounts 时填写，否则 null）。'
+        '把每条偏好的金额归因到其抽出的规则类别，键限：'
+        '"allowed_regions"/"forbidden_regions"/"forbidden_categories"/"night_window"/"category_targets"/"dated_events"。'
+        '一条偏好含多种规则时金额填到每个对应键；无法确定归因的键省略。\n\n'
         "关键规则：\n"
         "1) 日期用该月日数 1-31。中文数字要转换（十二号→12，二十号→20，三十一号→31）。\n"
         "2) 坐标：偏好中'地名（纬度,经度）'→直接取。输入若有 known_coordinates 优先使用。"
@@ -2213,7 +2271,8 @@ class ModelDecisionService:
         '10) "接上配偶/家人→返回老家/进家门"是 dated_route 事件（多点路线），不是 home_rule。\n'
         '11) "只跑/只接/仅在/不出X"是 allowed_regions，不是 forbidden_regions。\n'
         '12) 输入可能含 penalty_amounts 数组（与 preferences 一一对应的违约扣款金额）。'
-        '金额越高的偏好越要逐字推敞、确保其全部约束被完整抽出，绝不能漏；尤其是每日生效的夜休/禁驶窗口和月度品类指标。\n\n'
+        '金额越高的偏好越要逐字推敲、确保其全部约束被完整抽出，绝不能漏；尤其是每日生效的夜休/禁驶窗口和月度品类指标。'
+        '同时把各金额按规则类别归因填入 rule_penalties。\n\n'
         "示例1：\n"
         '入: {"preferences":["每天零点到六点停着熄火睡觉","凡是生鲜货源碰不得","三月四号五号不往深圳（22.55，114.05）跑"]}\n'
         '出: {"daily_rest_hours":null,"rest_window":{"start_hour":0,"end_hour":6},'
@@ -2533,6 +2592,11 @@ class ModelDecisionService:
 
     def _merge_llm_rules(self, rules: DriverRules, data: dict[str, Any], texts: list[str] | None = None) -> None:
         all_text = "\n".join(texts) if texts else ""
+        rp = data.get("rule_penalties")
+        if isinstance(rp, dict):
+            for k, v in rp.items():
+                if isinstance(k, str) and isinstance(v, (int, float)) and v > 0:
+                    rules.rule_penalties[k] = max(rules.rule_penalties.get(k, 0.0), float(v))
         rest_h = data.get("daily_rest_hours")
         if isinstance(rest_h, (int, float)) and rest_h > 0:
             rules.daily_rest_minutes = max(rules.daily_rest_minutes, int(round(rest_h * 60)))
@@ -3759,8 +3823,16 @@ class ModelDecisionService:
                 return (0, end)
         if len(minutes) >= 2:
             m1, m2 = minutes[0], minutes[1]
-            # fix PM context: "十一点半到下午一点半" → h2=1 should be 13
             h1, h2 = m1 // 60, m2 // 60
+            # PM context for the start: "每晚十点到次日五点" → h1=10 means 22:00
+            if 0 < h1 < 12:
+                first = re.search(r"[零一二两三四五六七八九十\d]+\s*点半?", text)
+                if first is not None:
+                    prefix = text[max(0, first.start() - 2):first.start()]
+                    if any(ch in prefix for ch in "晚夜宵"):
+                        m1 += 12 * 60
+                        h1 += 12
+            # fix PM context: "十一点半到下午一点半" → h2=1 should be 13
             if h2 < h1 and h2 < 12 and ("下午" in text or "中午" in text):
                 m2 += 12 * 60
             return (m1, m2)
