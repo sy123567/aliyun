@@ -1450,6 +1450,22 @@ class ModelDecisionService:
         # the only source of truth now.)
         return (None, 0)
 
+    # Chars too generic to identify a category on their own ("水果" vs "水泥",
+    # "建材" vs "木材" must NOT match through them).
+    _GENERIC_CATEGORY_CHARS = set("水材品类货物用设大小鲜活其他")
+
+    @staticmethod
+    def _category_matches(cat: str, cargo_name: str) -> bool:
+        """容噪品类匹配：精确子串之外，允许通过非泛用共有字匹配
+        （抓住「水果」↔「鲜果」这类措辞差异，同时拒绝「水果」↔「水泥」）。"""
+        cat, cargo_name = cat.strip(), cargo_name.strip()
+        if not cat or not cargo_name:
+            return False
+        if cat in cargo_name or cargo_name in cat:
+            return True
+        shared = (set(cat) & set(cargo_name)) - ModelDecisionService._GENERIC_CATEGORY_CHARS
+        return bool(shared)
+
     @staticmethod
     def _track_category_order(plan, rules, month_idx: int, cargo_name: str) -> None:
         if not cargo_name:
@@ -1458,7 +1474,7 @@ class ModelDecisionService:
         targets = getattr(rules, "monthly_category_targets", {}).get(month_idx, {}) if rules else {}
         if targets:
             for cat in targets:
-                if cat and (cat in cargo_name or cargo_name in cat):
+                if ModelDecisionService._category_matches(cat, cargo_name):
                     cat_orders[cat] = cat_orders.get(cat, 0) + 1
         # No parsed targets -> nothing to track (was a D001-specific 水果/建材
         # fallback that does not generalize to other drivers).
@@ -1535,7 +1551,7 @@ class ModelDecisionService:
             cargo_name = str(cargo.get("cargo_name", ""))
             is_cat_target = False
             if cat_target and cat_needed > 0:
-                if cargo_name == cat_target:
+                if self._category_matches(cat_target, cargo_name):
                     score *= 8.0 if urgent_category else 5.0
                     is_cat_target = True
 
@@ -1642,7 +1658,7 @@ class ModelDecisionService:
         target_locations = []
         for item in items:
             cargo = item.get("cargo", {})
-            if cargo.get("cargo_name") == cat_target:
+            if self._category_matches(cat_target, str(cargo.get("cargo_name", ""))):
                 start = cargo.get("start", {})
                 target_locations.append({
                     "lat": start.get("lat", 0),
@@ -2028,7 +2044,11 @@ class ModelDecisionService:
 
         before = self._rules_fingerprint(rules)
         coord_map = self._collect_coords(prefs)
-        parsed_by_llm = self._llm_parse_preferences(driver_id, texts, rules, coord_map)
+        penalties = [
+            (pref.get("penalty_amount") if isinstance(pref, dict) else None) for pref in prefs
+            if (pref.get("content", "") if isinstance(pref, dict) else str(pref)).strip()
+        ]
+        parsed_by_llm = self._llm_parse_preferences(driver_id, texts, rules, coord_map, penalties)
         if not parsed_by_llm:
             # offline / model unavailable: fall back to the deterministic regex parser.
             for text in texts:
@@ -2085,6 +2105,7 @@ class ModelDecisionService:
         # Dedup avoid/forbidden AFTER supplement so regex-added items are also cleaned
         init_lat, init_lng = self._initial_position[driver_id]
         self._supplement_relative_allowed_regions(texts, rules, init_lat, init_lng)
+        self._supplement_night_failsafe(texts, rules)
         self._dedup_avoid_forbidden(rules)
         if self._rules_fingerprint(rules) != before:
             self._logger.info(
@@ -2191,7 +2212,9 @@ class ModelDecisionService:
         '9) "不接单不空跑/不空驶/收车/归家不动/熄火歇业"类约束，只要含时间段一律填no_drive_windows（夜间跨夜用start>end）；'
         '若同时含"休息/睡觉/停车熄火"→也填rest_window或daily_rest_hours。这类"每日生效"的时段约束漏抽代价极高，务必抽全。\n'
         '10) "接上配偶/家人→返回老家/进家门"是 dated_route 事件（多点路线），不是 home_rule。\n'
-        '11) "只跑/只接/仅在/不出X"是 allowed_regions，不是 forbidden_regions。\n\n'
+        '11) "只跑/只接/仅在/不出X"是 allowed_regions，不是 forbidden_regions。\n'
+        '12) 输入可能含 penalty_amounts 数组（与 preferences 一一对应的违约扣款金额）。'
+        '金额越高的偏好越要逐字推敞、确保其全部约束被完整抽出，绝不能漏；尤其是每日生效的夜休/禁驶窗口和月度品类指标。\n\n'
         "示例1：\n"
         '入: {"preferences":["每天零点到六点停着熄火睡觉","凡是生鲜货源碰不得","三月四号五号不往深圳（22.55，114.05）跑"]}\n'
         '出: {"daily_rest_hours":null,"rest_window":{"start_hour":0,"end_hour":6},'
@@ -2243,6 +2266,7 @@ class ModelDecisionService:
     def _llm_parse_preferences(
         self, driver_id: str, texts: list[str], rules: DriverRules,
         coord_map: dict[str, tuple[float, float]] | None = None,
+        penalties: list[Any] | None = None,
     ) -> bool:
         """用大模型把全部可见偏好解析成结构化规则并合并进 rules。
 
@@ -2252,6 +2276,8 @@ class ModelDecisionService:
         if not texts:
             return False
         payload: dict[str, Any] = {"preferences": texts}
+        if penalties and len(penalties) == len(texts) and any(p for p in penalties):
+            payload["penalty_amounts"] = penalties
         if coord_map:
             payload["known_coordinates"] = {
                 name: {"lat": loc[0], "lng": loc[1]} for name, loc in coord_map.items()
@@ -2343,6 +2369,11 @@ class ModelDecisionService:
             return ""
         return r[:12]
 
+    # Characters that never appear in a real place name; regex captures over the
+    # noisy/scrambled preference text sometimes yield fragments like "浙范跑单"
+    # or "三角个" — those must not become allowed_regions entries.
+    _REGION_JUNK_CHARS = set("跑接单货车驶运范围圈线路内外出不只仅在限的得须必每天月日点号时晚夜元扣罚个这那")
+
     def _canonical_allowed_region(self, raw: str) -> str:
         cleaned = self._clean_region_name(raw)
         if not cleaned:
@@ -2362,6 +2393,11 @@ class ModelDecisionService:
     def _add_allowed_region(self, rules: DriverRules, raw: str, all_text: str) -> None:
         region = self._canonical_allowed_region(raw)
         if not region:
+            return
+        if _allowed_region_key(region) is None and (
+            len(region) > 6 or any(ch in self._REGION_JUNK_CHARS for ch in region)
+        ):
+            self._logger.info("validation: rejected junk allowed_region '%s'", region)
             return
         if self._allowed_region_text_supported(region, all_text):
             rules.allowed_regions.add(region)
@@ -2856,6 +2892,39 @@ class ModelDecisionService:
                 if "在" in raw:
                     raw = raw.rsplit("在", 1)[-1]
                 self._add_allowed_region(rules, raw, text)
+
+    _NIGHT_KW = ("夜", "晚", "宵", "黑")
+    _REST_KW = ("停", "休", "熄", "睡", "眠", "收", "歇", "锁", "不出", "不接", "不动", "归家")
+    _CLOCK_RE = re.compile(r"([01]?\d|2[0-4])(?:[：:]([0-5]\d)|点(半)?|时)")
+
+    def _supplement_night_failsafe(self, texts: list[str], rules: DriverRules) -> None:
+        """夜休 fail-safe：夜间禁驶是按天重复扣分的最大罚项之一，漏抽代价极高。
+
+        若 LLM/正则都未产出任何跨夜窗口，但某条原文同时含夜间词 + 停休词 +
+        可识别的晚间/凌晨时刻对，则直接按文本中的时刻构造跨夜窗口（宁可多休
+        损失少量收入，也不能每天吃夜休罚款）。"""
+        if any(we > DAY_MINUTES for _ws, we in rules.no_drive_windows):
+            return  # an overnight window already exists
+        if rules.rest_window is not None and rules.rest_window[0] == 0 and rules.rest_window[1] > 0:
+            return  # overnight rest already registered via _apply_rest_window
+        for text in texts:
+            if not any(k in text for k in self._NIGHT_KW):
+                continue
+            if not any(k in text for k in self._REST_KW):
+                continue
+            times: list[int] = []
+            for m in self._CLOCK_RE.finditer(text):
+                h = int(m.group(1))
+                mins = int(m.group(2)) if m.group(2) else (30 if m.group(3) else 0)
+                times.append(h * 60 + mins)
+            evening = [t for t in times if t >= 18 * 60]
+            morning = [t for t in times if 0 < t <= 9 * 60]
+            if not evening or not morning:
+                continue
+            sm, em = max(evening), min(morning)
+            self._logger.info("night fail-safe: derived overnight window %d-%d from text %r", sm, em, text[:60])
+            self._apply_rest_window(rules, sm, em)
+            return
 
     def _supplement_relative_allowed_regions(
         self,
