@@ -34,6 +34,22 @@ _STRAND_MIN_BUDGET = 240
 _ORDER_DEADLINE_BUFFER_MIN = 10
 _LLM_CARGO_SUMMARY_LIMIT = 8
 _MIN_BOUNDED_AREA_SPAN = 0.1
+# ---- per-driver LLM token budget governor (finals hard cap: 5M tokens/driver).
+# Advisory (per-step decision) LLM calls are throttled at the soft limit and
+# disabled at the hard limit; compliance-critical calls (preference parsing,
+# coverage verification, daily audit) keep running until the audit limit so
+# penalty avoidance is never starved by token pressure.
+TOKEN_BUDGET_TOTAL = 5_000_000
+TOKEN_SOFT_LIMIT = 3_200_000
+TOKEN_HARD_LIMIT = 4_300_000
+TOKEN_AUDIT_LIMIT = 4_800_000
+# When the gateway returns no usage block we still need to count something:
+# a conservative per-call estimate (chars/2 ≈ CJK token count + completion).
+_TOKEN_FALLBACK_PER_CALL = 1_500
+# A daily directive emitted by the compliance audit may not exceed this span;
+# longer "no drive" windows are almost certainly hallucinated.
+_AUDIT_MAX_WINDOW_MINUTES = 14 * 60
+_MAX_CUSTOM_DIRECTIVES = 6
 
 SHENZHEN_BBOX = (22.42, 22.89, 113.74, 114.66)  # lat_min, lat_max, lng_min, lng_max
 _MONTH_START_DAYS = (0, 31, 61, 92)
@@ -265,6 +281,12 @@ class DriverRules:
         # attributed by the parse LLM). Lets execution treat constraints economically:
         # an order violating a rule is still worth taking when net > penalty.
         self.rule_penalties: dict[str, float] = {}
+        # Obligations found in the raw preference text that could NOT be compiled
+        # into any structured field above (closed-loop coverage check). They are
+        # carried verbatim: injected into every decision prompt and re-examined by
+        # the daily compliance audit, so a preference type outside our schema is
+        # degraded to "LLM-enforced" instead of silently dropped.
+        self.custom_directives: list[str] = []
 
     @property
     def day_rest_block(self) -> int:
@@ -489,6 +511,55 @@ class ModelDecisionService:
         # accumulators from the authoritative decision history (see
         # _sync_monthly_counts_from_history).
         self._cargo_meta: dict[str, dict[str, Any]] = {}
+        # ---- closed-loop compliance state ----
+        # cumulative LLM token usage per driver (read from gateway usage blocks);
+        # drives the budget governor in _llm_advice_allowed / _audit_allowed.
+        self._token_usage: dict[str, int] = {}
+        # driver whose decide() is currently on the stack: lets nested helpers
+        # (semantic confirm, yes/no, parsing) attribute token usage correctly.
+        self._current_driver: str | None = None
+        # drivers whose visible preference set already passed coverage verification
+        # (re-verified whenever a new preference text becomes visible).
+        self._coverage_verified: dict[str, str] = {}
+
+    # ------------------------------------------------------- model gateway I/O
+    def _chat(self, req: dict[str, Any]) -> dict[str, Any]:
+        """Single funnel for every model call: meters token usage per driver.
+
+        The evaluation charges tokens per driver against a hard budget, so all
+        LLM traffic must flow through here for the budget governor to work.
+        """
+        resp = self._api.model_chat_completion(req)
+        used = 0
+        if isinstance(resp, dict):
+            usage = resp.get("usage") or {}
+            if isinstance(usage, dict):
+                used = int(usage.get("total_tokens", 0) or 0)
+                if used <= 0:
+                    used = (int(usage.get("prompt_tokens", 0) or 0)
+                            + int(usage.get("completion_tokens", 0) or 0))
+        if used <= 0:
+            used = _TOKEN_FALLBACK_PER_CALL
+        drv = self._current_driver
+        if drv:
+            self._token_usage[drv] = self._token_usage.get(drv, 0) + used
+        return resp
+
+    def _tokens_used(self, driver_id: str) -> int:
+        return self._token_usage.get(driver_id, 0)
+
+    def _llm_advice_allowed(self, driver_id: str, step: int) -> bool:
+        """Whether an *advisory* (optional, per-step) LLM call fits the budget."""
+        used = self._tokens_used(driver_id)
+        if used >= TOKEN_HARD_LIMIT:
+            return False
+        if used >= TOKEN_SOFT_LIMIT:
+            return step % 2 == 0  # halve advisory frequency under pressure
+        return True
+
+    def _audit_allowed(self, driver_id: str) -> bool:
+        """Compliance-critical calls run until very close to the hard cap."""
+        return self._tokens_used(driver_id) < TOKEN_AUDIT_LIMIT
 
     def _query_cargo(self, driver_id: str, latitude: float, longitude: float, k: int) -> dict[str, Any]:
         """query_cargo wrapper that caches cargo metadata for every scanned item.
@@ -592,6 +663,7 @@ class ModelDecisionService:
 
     # ------------------------------------------------------------------ decide
     def decide(self, driver_id: str) -> dict[str, Any]:
+        self._current_driver = driver_id
         status = self._api.get_driver_status(driver_id)
         rules = self._ensure_rules(driver_id, status)
         plan = self._plan.setdefault(
@@ -631,22 +703,45 @@ class ModelDecisionService:
         lng = float(status["current_lng"])
         day, tod = divmod(now, DAY_MINUTES)
 
-        # Try LLM-driven decision with history context
-        action = None
+        # Closed-loop runtime audit: once per day, judge YESTERDAY's actual
+        # behaviour against the RAW preference text (not the parsed rules), so a
+        # constraint the extractor missed is caught after one day instead of
+        # compounding into a season-long daily penalty.
+        self._daily_compliance_audit(driver_id, rules, plan, day)
+
         step = self._step_count[driver_id]
         consecutive_waits = plan.get("_consecutive_waits", 0)
-        # Call LLM every 3 steps (or when idle), but skip if stuck in wait loop (>2 consecutive)
-        use_llm = (step % 3 == 0 or plan.get("_last_action") == "wait") and consecutive_waits < 3
-        if use_llm:
-            action = self._llm_decide_with_history(
-                driver_id, status, rules, plan, history, now, lat, lng, day, tod
-            )
+        # Whether the current moment is governed by a mandatory compliance block
+        # (computed BEFORE _schedule mutates rest_done etc.).
+        locked = self._is_compliance_locked(rules, plan, now, day)
 
-        # Fallback to rule engine if LLM decision is None or failed
-        if action is None:
-            action = self._schedule(driver_id, status, rules, plan, now, lat, lng)
+        # Scheduler-first: the deterministic, compliance-vetted scheduler picks
+        # the action. The LLM is an *advisor*, consulted only when the scheduler
+        # has nothing better than idling outside mandatory windows — it can no
+        # longer override a strong deterministic order into a wait (variance
+        # reduction) and is skipped entirely when busy (token reduction).
+        action = self._schedule(driver_id, status, rules, plan, now, lat, lng)
+        if (
+            action.get("action") == "wait"
+            and not locked
+            and consecutive_waits < 3
+            and self._llm_advice_allowed(driver_id, step)
+        ):
+            now2 = int(self._api.get_driver_status(driver_id)["simulation_progress_minutes"])
+            day2, tod2 = divmod(now2, DAY_MINUTES)
+            if day2 == day and not self._is_compliance_locked(rules, plan, now2, day2):
+                llm_action = self._llm_decide_with_history(
+                    driver_id, status, rules, plan, history, now2, lat, lng, day2, tod2
+                )
+                if llm_action is not None and llm_action.get("action") != "wait":
+                    action = llm_action
 
-        # Track consecutive waits to detect LLM getting stuck
+        # Last-resort shield: no code path may emit an action that drives inside
+        # a hard no-drive window.
+        now3 = int(self._api.get_driver_status(driver_id)["simulation_progress_minutes"])
+        action = self._guard_action(rules, now3, action)
+
+        # Track consecutive waits to detect idle loops
         if action.get("action") == "wait":
             plan["_consecutive_waits"] = consecutive_waits + 1
         else:
@@ -729,9 +824,15 @@ class ModelDecisionService:
         if block > 0 and day not in plan.get("rest_done", set()):
             return None  # let rule engine handle rest
 
-        # Query available cargo for context
-        cargo_resp = self._query_cargo(driver_id=driver_id, latitude=lat, longitude=lng, k=30)
-        items = cargo_resp.get("items", [])
+        # Reuse the cargo scan the scheduler already paid for in this step when
+        # it is fresh enough; only fall back to a (small) fresh query otherwise.
+        items: list[dict[str, Any]] = []
+        scan = plan.get("_scan_items")
+        if scan is not None and 0 <= now - int(scan[0]) <= 30:
+            items = scan[1]
+        else:
+            cargo_resp = self._query_cargo(driver_id=driver_id, latitude=lat, longitude=lng, k=30)
+            items = cargo_resp.get("items", [])
         now = int(self._api.get_driver_status(driver_id)["simulation_progress_minutes"])
         hard_end = self._hard_order_deadline(rules, plan, now, day)
         blackout_regions = {r for r, days in rules.blackout if day in days}
@@ -835,7 +936,7 @@ class ModelDecisionService:
                 "response_format": {"type": "json_object"},
                 "max_tokens": 180,
             }
-            resp = self._api.model_chat_completion(req)
+            resp = self._chat(req)
             elapsed = time.time() - start_time
 
             # Timeout check: if >60s, log warning (for next iteration consider disabling thinking)
@@ -1145,6 +1246,184 @@ class ModelDecisionService:
                          "今日务必严格遵守上述时段，避免每日重复扣分。")
         return "\n".join(parts)
 
+    # ------------------------------------------- closed-loop compliance layer
+    def _is_compliance_locked(self, rules: DriverRules, plan: dict, now: int, day: int) -> bool:
+        """Whether the current moment is governed by a mandatory compliance block
+        (off day / pending daily rest / inside a no-drive window / dated event),
+        i.e. the deterministic scheduler's choice must not be second-guessed by
+        the advisory LLM."""
+        tod = now % DAY_MINUTES
+        if day in plan.get("off_days", set()):
+            return True
+        if any(self._tod_in_window(tod, ws, we) for ws, we in rules.no_drive_windows):
+            return True
+        if rules.day_rest_block > 0 and day not in plan.get("rest_done", set()):
+            return True
+        if any(ev["day"] == day for ev in rules.dated_single):
+            return True
+        if any(ev["day"] in (day, day + 1) for ev in rules.dated_route):
+            return True
+        if any(day in days for _r, days in rules.blackout):
+            return True
+        return False
+
+    def _guard_action(self, rules: DriverRules, now: int, action: dict[str, Any]) -> dict[str, Any]:
+        """Final shield applied to EVERY outgoing action regardless of which code
+        path produced it: driving actions inside a hard no-drive window are
+        converted into a wait that covers the window, and waits that end inside
+        a window are extended through it. Waiting is never penalised, so this
+        transform can only avoid penalties, never create them."""
+        kind = action.get("action")
+        tod = now % DAY_MINUTES
+        if kind == "wait":
+            dur = int((action.get("params") or {}).get("duration_minutes", 1) or 1)
+            safe = self._extend_wait_for_no_drive(rules, now, dur)
+            if safe != dur:
+                self._logger.info("[guard] extended wait %d→%d (no-drive window)", dur, safe)
+                return self._wait(safe)
+            return action
+        if kind in ("take_order", "reposition"):
+            for ws, we in rules.no_drive_windows:
+                if self._tod_in_window(tod, ws, we):
+                    wait_min = self._minutes_until_window_end(tod, ws, we)
+                    if wait_min > 0:
+                        self._logger.info(
+                            "[guard] blocked %s inside no-drive window tod=%d → wait %d",
+                            kind, tod, wait_min,
+                        )
+                        return self._safe_wait(rules, now, wait_min)
+        return action
+
+    def _daily_compliance_audit(self, driver_id: str, rules: DriverRules, plan: dict, day: int) -> None:
+        """Runtime closed loop (1 small LLM call per simulated day).
+
+        Judges YESTERDAY's actual action timeline against the RAW preference
+        texts — not the parsed rules — so constraints the extractor missed or
+        mangled are still caught. When the verdict reports violations it may
+        emit corrective directives in a minimal machine-checkable vocabulary
+        (extra ``no_drive_windows``); free-text reminders flow into today's
+        decision prompts. Because daily preference penalties compound, catching
+        a systematic violation after one day caps its cost at ~1/92 of the
+        worst case. Fail-safe: any error is a silent no-op.
+        """
+        if day <= 0 or day >= MONTH_DAYS:
+            return
+        done = plan.setdefault("audit_days", set())
+        if day in done:
+            return
+        done.add(day)
+        texts = sorted(self._seen_prefs.get(driver_id, set()))
+        if not texts or not self._audit_allowed(driver_id):
+            return
+        timeline = self._yesterday_timeline(driver_id, day - 1)
+        if not timeline:
+            return
+        enforced = [
+            f"{ws // 60:02d}:{ws % 60:02d}-{(we % DAY_MINUTES) // 60:02d}:{(we % DAY_MINUTES) % 60:02d}"
+            for ws, we in rules.no_drive_windows
+        ]
+        payload = {
+            "偏好原文": texts,
+            "已强制执行的每日禁驶时段": enforced,
+            "未结构化偏好": rules.custom_directives,
+            "昨日行为时间线": timeline,
+        }
+        system = (
+            "你是货运司机合规审查员。对照「偏好原文」（自然语言，可能口语化/乱序），"
+            "检查「昨日行为时间线」是否违反了其中任何约束。"
+            "重点是每日生效的时段类约束（如夜间不得接单/空驶）：漏执行会每天重复扣分。\n"
+            '只输出JSON：{"violations":["昨日违规描述"...],'
+            '"add_no_drive_windows":[{"start_hour":数字,"end_hour":数字}],'
+            '"notes":["给今日决策的简短提醒"...]}\n'
+            "- violations: 昨日确实发生的违规，没有则[]\n"
+            "- add_no_drive_windows: 仅当偏好要求的某个每日禁驶时段没有被「已强制执行的每日禁驶时段」"
+            "覆盖、且昨日确实在该时段出了车时填写（跨夜用 end_hour<start_hour），否则[]\n"
+            "- notes: 最多3条，没有则[]\n"
+            "宁缺毋滥：不确定就留空。"
+        )
+        try:
+            req: dict[str, Any] = {
+                "messages": [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+                ],
+                "temperature": 0,
+                "max_tokens": 250,
+            }
+            try:
+                req["response_format"] = {"type": "json_object"}
+                resp = self._chat(req)
+            except Exception:
+                req.pop("response_format", None)
+                resp = self._chat(req)
+            data = self._extract_json(resp)
+        except Exception as exc:
+            self._logger.info("[audit] unavailable driver_id=%s day=%d err=%s", driver_id, day, exc)
+            return
+        if not isinstance(data, dict):
+            return
+        notes = [str(n).strip() for n in (data.get("notes") or []) if isinstance(n, str) and str(n).strip()]
+        if notes:
+            plan["audit_notes"] = notes[:3]
+        violations = [str(v).strip() for v in (data.get("violations") or []) if isinstance(v, str) and str(v).strip()]
+        if not violations:
+            return
+        plan["audit_violations"] = violations[:3]
+        self._logger.info("[audit] driver_id=%s day=%d violations=%s", driver_id, day, violations[:3])
+        # Self-healing hard windows: only accepted when an actual violation was
+        # reported (evidence-driven, not hallucination-driven), bounded in span,
+        # and not already covered by an enforced window.
+        for w in (data.get("add_no_drive_windows") or [])[:2]:
+            if not isinstance(w, dict):
+                continue
+            sh, eh = w.get("start_hour"), w.get("end_hour")
+            if not (isinstance(sh, (int, float)) and isinstance(eh, (int, float))):
+                continue
+            if not (0 <= sh <= 24 and 0 <= eh <= 24):
+                continue
+            sm, em = int(round(sh * 60)), int(round(eh * 60))
+            if sm > em:
+                em += DAY_MINUTES  # cross-midnight
+            elif em <= sm:
+                continue
+            if em - sm > _AUDIT_MAX_WINDOW_MINUTES:
+                self._logger.info("[audit] rejected oversized window %d-%d", sm, em)
+                continue
+            if any(ws <= sm and em <= we for ws, we in rules.no_drive_windows):
+                continue  # already covered
+            rules.no_drive_windows.append((sm, em))
+            self._logger.info("[audit] self-heal: added no_drive_window %d-%d driver_id=%s", sm, em, driver_id)
+
+    def _yesterday_timeline(self, driver_id: str, prev_day: int, limit: int = 40) -> list[str]:
+        """Compact human-readable timeline of the previous day's executed steps,
+        rebuilt from the authoritative decision history."""
+        try:
+            resp = self._api.query_decision_history(driver_id, -1)
+        except Exception:
+            return []
+        records = (resp or {}).get("records") or []
+        lines: list[str] = []
+        for rec in records:
+            action = rec.get("action") or {}
+            kind = str(action.get("action") or "")
+            if not kind:
+                continue
+            result = rec.get("result") or {}
+            end_min = int(result.get("simulation_progress_minutes", 0) or 0)
+            step_elapsed = int(rec.get("step_elapsed_minutes", 0) or 0)
+            query_scan = int(rec.get("query_scan_cost_minutes", 0) or 0)
+            start = max(0, end_min - step_elapsed + query_scan)
+            if start // DAY_MINUTES != prev_day:
+                continue
+            sh, smn = divmod(start % DAY_MINUTES, 60)
+            eh, emn = divmod(end_min % DAY_MINUTES, 60)
+            desc = kind
+            if kind == "take_order":
+                desc += "(成交)" if result.get("accepted") else "(失败)"
+            cross = "次日" if end_min // DAY_MINUTES > prev_day else ""
+            lines.append(f"{sh:02d}:{smn:02d} {desc} →{cross}{eh:02d}:{emn:02d}")
+        return lines[-limit:]
+
     def _format_rules_for_llm(self, driver_id: str, rules: DriverRules, plan: dict, day: int) -> str:
         """Format driver rules and compliance progress as concise text for LLM."""
         month_idx = _month_index_for_day(day)
@@ -1170,6 +1449,11 @@ class ModelDecisionService:
         if rule_penalties:
             lines.append("- 各规则单次违约扣款: " + ", ".join(f"{k}:{int(v)}元" for k, v in rule_penalties.items()))
             lines.append("  罚款只是成本：候选货源的 net/net_per_h 已扣除对应罚款，净收益为正即值得接")
+        if rules.custom_directives:
+            lines.append("- 未结构化偏好（必须按原文遵守）: " + "；".join(rules.custom_directives))
+        audit_notes = plan.get("audit_notes") or []
+        if audit_notes:
+            lines.append("- 今日合规提醒（来自昨日合规审计）: " + "；".join(audit_notes))
 
         # Category targets with progress
         cat_orders = plan.get("monthly_category_orders", {}).get(month_idx, {})
@@ -1732,7 +2016,7 @@ class ModelDecisionService:
                 "response_format": {"type": "json_object"},
                 "max_tokens": 100,
             }
-            resp = self._api.model_chat_completion(req)
+            resp = self._chat(req)
             content = resp.get("choices", [{}])[0].get("message", {}).get("content", "")
             data = json.loads(content) if content else None
             if data and "latitude" in data and "longitude" in data:
@@ -2160,6 +2444,11 @@ class ModelDecisionService:
         self._supplement_relative_allowed_regions(texts, rules, init_lat, init_lng)
         self._supplement_night_failsafe(texts, rules)
         self._dedup_avoid_forbidden(rules)
+        # Extraction closed loop: verify the merged rule set covers every
+        # obligation in the raw texts; repair gaps or carry them as custom
+        # directives instead of silently dropping them.
+        if parsed_by_llm:
+            self._verify_rule_coverage(driver_id, texts, rules, coord_map, penalties)
         if self._rules_fingerprint(rules) != before:
             self._logger.info(
                 "parsed rules driver_id=%s rest=%s window=%s off=%s forbid_cat=%s avoid_cat=%s "
@@ -2208,6 +2497,154 @@ class ModelDecisionService:
         if to_remove:
             rules.forbidden_categories -= to_remove
             self._logger.info("dedup: removed %s from forbidden (overlap with avoid)", to_remove)
+
+    # ---------------------------------------- extraction coverage closed loop
+    def _describe_rules(self, rules: DriverRules) -> list[str]:
+        """Natural-language restatement of every structured rule currently in
+        force — the 'executed contract' side of the coverage verification."""
+
+        def _hm(m: int) -> str:
+            m %= DAY_MINUTES
+            return f"{m // 60:02d}:{m % 60:02d}"
+
+        out: list[str] = []
+        if rules.daily_rest_minutes > 0:
+            out.append(f"每天连续休息至少{rules.daily_rest_minutes / 60:.1f}小时")
+        if rules.rest_window:
+            rs, re_ = rules.rest_window
+            out.append(f"每天 {_hm(rs)}-{_hm(re_)} 固定停车休息")
+        for ws, we in rules.no_drive_windows:
+            out.append(f"每天 {_hm(ws)}-{_hm(we)} 不接单、不空驶")
+        if rules.off_days_min > 0:
+            out.append(f"整月至少 {rules.off_days_min} 天完全不出车")
+        if rules.forbidden_categories:
+            out.append("一律不接货物品类: " + "、".join(sorted(rules.forbidden_categories)))
+        if rules.avoid_categories:
+            out.append("尽量少接货物品类: " + "、".join(sorted(rules.avoid_categories)))
+        if rules.forbidden_regions:
+            out.append("不接装货地或卸货地在这些区域的货: " + "、".join(sorted(rules.forbidden_regions)))
+        if rules.allowed_regions:
+            out.append("只在这些区域内运营: " + "、".join(sorted(rules.allowed_regions)))
+        if rules.required_region:
+            out.append(f"每月至少 {rules.required_region[1]} 天接触区域「{rules.required_region[0]}」")
+        if rules.pickup_max_km is not None:
+            out.append(f"赴装空驶不超过 {rules.pickup_max_km:.0f} 公里")
+        if rules.haul_max_km is not None:
+            out.append(f"单笔干线距离不超过 {rules.haul_max_km:.0f} 公里")
+        if rules.monthly_deadhead_max_km is not None:
+            out.append(f"月累计空驶不超过 {rules.monthly_deadhead_max_km:.0f} 公里")
+        if rules.daily_order_limit is not None:
+            out.append(f"每天最多接 {rules.daily_order_limit} 单")
+        if rules.first_order_before_minute is not None:
+            out.append(f"每天首单不晚于 {_hm(rules.first_order_before_minute)}")
+        for region, days in rules.blackout:
+            ds = "、".join(str(d + 1) for d in sorted(days))
+            out.append(f"{ds} 号不去「{region}」")
+        for ev in rules.dated_single:
+            out.append(f"第{ev['day'] + 1}天到 ({ev['lat']:.2f},{ev['lng']:.2f}) 办事/停留")
+        for ev in rules.dated_route:
+            stops = "→".join(f"({s['lat']:.2f},{s['lng']:.2f})" for s in ev.get("stops", []))
+            out.append(f"第{ev['day'] + 1}天按顺序途经 {stops}")
+        for flat, flng, fr in rules.forbidden_zones:
+            out.append(f"禁入以 ({flat:.2f},{flng:.2f}) 为圆心半径 {fr:.0f} 公里的区域")
+        if rules.bounded_area is not None:
+            la_min, la_max, ln_min, ln_max = rules.bounded_area
+            out.append(f"仅在矩形范围 纬度{la_min:.2f}-{la_max:.2f} 经度{ln_min:.2f}-{ln_max:.2f} 内运营")
+        for mv in rules.must_visit:
+            out.append(f"每月至少 {mv['required_days']} 天到达 ({mv['lat']:.2f},{mv['lng']:.2f}) 附近")
+        if rules.home_lat is not None and rules.home_by_minute is not None:
+            out.append(f"每天 {_hm(rules.home_by_minute)} 前回到家 ({rules.home_lat:.2f},{rules.home_lng or 0:.2f}) 附近")
+        if rules.no_drive_until_minute is not None:
+            out.append(f"每天 {_hm(rules.no_drive_until_minute)} 前不接单")
+        for month_idx, targets in sorted(rules.monthly_category_targets.items()):
+            for cat, n in targets.items():
+                out.append(f"{_month_name(month_idx)}品类「{cat}」至少接 {n} 单")
+        out.extend(rules.custom_directives)
+        return out
+
+    def _coverage_missing(self, texts: list[str], rules: DriverRules,
+                          penalties: list[Any] | None = None) -> list[str]:
+        """One LLM reviewer call: list the obligations in the raw preference
+        texts that the executed rule set does NOT cover. Fail-safe: [] on any
+        error (then nothing changes)."""
+        described = self._describe_rules(rules)
+        payload: dict[str, Any] = {"偏好原文": texts, "已落实的执行规则": described}
+        if penalties and len(penalties) == len(texts) and any(p for p in penalties):
+            payload["各偏好违约扣款"] = penalties
+        system = (
+            "你是货运司机偏好的合规核查员。「偏好原文」是司机的自然语言偏好（可能口语化/乱序/缺字），"
+            "「已落实的执行规则」是系统当前会强制执行的规则清单。\n"
+            "找出原文中提出、但执行规则清单没有覆盖的义务/约束。"
+            "改写为简洁、可执行的一句话（保留时间/地点/数量等关键参数）。\n"
+            '只输出JSON：{"missing":["遗漏的义务描述"...]}；全部覆盖则 {"missing":[]}。\n'
+            "注意：同一约束措辞不同不算遗漏；执行规则比原文更严格也不算遗漏；"
+            "扣款金额越高的偏好越要逐字核对。宁可多报也不要漏报。"
+        )
+        try:
+            req: dict[str, Any] = {
+                "messages": [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+                ],
+                "temperature": 0,
+                "max_tokens": 300,
+            }
+            try:
+                req["response_format"] = {"type": "json_object"}
+                resp = self._chat(req)
+            except Exception:
+                req.pop("response_format", None)
+                resp = self._chat(req)
+            data = self._extract_json(resp)
+        except Exception as exc:
+            self._logger.info("coverage check unavailable err=%s", exc)
+            return []
+        if not isinstance(data, dict):
+            return []
+        out: list[str] = []
+        for m in data.get("missing") or []:
+            if isinstance(m, str) and m.strip():
+                out.append(m.strip())
+            elif isinstance(m, dict):
+                ob = str(m.get("obligation", "") or m.get("missing", "")).strip()
+                if ob:
+                    out.append(ob)
+        return out[:5]
+
+    def _verify_rule_coverage(
+        self, driver_id: str, texts: list[str], rules: DriverRules,
+        coord_map: dict[str, tuple[float, float]] | None,
+        penalties: list[Any] | None,
+    ) -> None:
+        """Extraction closed loop: verify the structured rules cover every
+        obligation in the raw texts; missing ones get ONE focused re-extraction
+        pass, and whatever still cannot be structured is kept verbatim as a
+        custom directive (LLM-enforced at decision time) instead of being
+        silently dropped — the failure mode that produced the six-figure
+        penalty on the unknown finals drivers."""
+        key = "\n".join(sorted(texts))
+        if self._coverage_verified.get(driver_id) == key:
+            return
+        self._coverage_verified[driver_id] = key
+        if not self._audit_allowed(driver_id):
+            return
+        missing = self._coverage_missing(texts, rules, penalties)
+        if not missing:
+            return
+        self._logger.info("coverage: missing obligations driver_id=%s missing=%s", driver_id, missing)
+        # Repair round: focused re-extraction with the gaps as explicit hints.
+        try:
+            self._llm_parse_preferences(driver_id, texts, rules, coord_map, penalties, focus=missing)
+        except Exception as exc:  # pragma: no cover - defensive
+            self._logger.info("coverage repair parse failed driver_id=%s err=%s", driver_id, exc)
+        still_missing = self._coverage_missing(texts, rules, penalties)
+        for ob in still_missing:
+            if ob in rules.custom_directives:
+                continue
+            if len(rules.custom_directives) >= _MAX_CUSTOM_DIRECTIVES:
+                break
+            rules.custom_directives.append(ob)
+            self._logger.info("coverage: kept as custom directive driver_id=%s «%s»", driver_id, ob)
 
     # ----------------------------------------------------------- LLM preference parsing
     _PARSE_SYSTEM = (
@@ -2325,11 +2762,13 @@ class ModelDecisionService:
         self, driver_id: str, texts: list[str], rules: DriverRules,
         coord_map: dict[str, tuple[float, float]] | None = None,
         penalties: list[Any] | None = None,
+        focus: list[str] | None = None,
     ) -> bool:
         """用大模型把全部可见偏好解析成结构化规则并合并进 rules。
 
         返回 True 表示 LLM 成功产出结构化结果；False 表示模型不可用/解析失败
-        （此时调用方会退回正则解析）。
+        （此时调用方会退回正则解析）。``focus`` 为覆盖率核查发现的遗漏义务，
+        作为修复轮的补抽提示。
         """
         if not texts:
             return False
@@ -2340,6 +2779,8 @@ class ModelDecisionService:
             payload["known_coordinates"] = {
                 name: {"lat": loc[0], "lng": loc[1]} for name, loc in coord_map.items()
             }
+        if focus:
+            payload["补抽提示_上轮遗漏的约束"] = focus[:5]
         user = json.dumps(payload, ensure_ascii=False)
         msgs = [
             {"role": "system", "content": self._PARSE_SYSTEM},
@@ -2352,7 +2793,7 @@ class ModelDecisionService:
             if attempt == 0:
                 req["response_format"] = {"type": "json_object"}
             try:
-                resp = self._api.model_chat_completion(req)
+                resp = self._chat(req)
             except Exception as exc:
                 self._logger.info("llm parse attempt %d unavailable driver_id=%s err=%s", attempt, driver_id, exc)
                 continue
@@ -2526,10 +2967,10 @@ class ModelDecisionService:
             req: dict[str, Any] = {"messages": msgs, "temperature": 0, "max_tokens": 30}
             try:
                 req["response_format"] = {"type": "json_object"}
-                resp = self._api.model_chat_completion(req)
+                resp = self._chat(req)
             except Exception:
                 req.pop("response_format", None)
-                resp = self._api.model_chat_completion(req)
+                resp = self._chat(req)
             data = self._extract_json(resp)
             if isinstance(data, dict) and data.get("holds") is False:
                 verdict = False
@@ -2562,10 +3003,10 @@ class ModelDecisionService:
             req: dict[str, Any] = {"messages": msgs, "temperature": 0, "max_tokens": 30}
             try:
                 req["response_format"] = {"type": "json_object"}
-                resp = self._api.model_chat_completion(req)
+                resp = self._chat(req)
             except Exception:
                 req.pop("response_format", None)
-                resp = self._api.model_chat_completion(req)
+                resp = self._chat(req)
             data = self._extract_json(resp)
             if isinstance(data, dict) and isinstance(data.get("answer"), bool):
                 verdict = data["answer"]
