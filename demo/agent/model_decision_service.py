@@ -791,6 +791,26 @@ class ModelDecisionService:
             if len(cargo_summary) >= _LLM_CARGO_SUMMARY_LIMIT:
                 break
 
+        # Category-quota guard: the LLM only sees the few nearest feasible
+        # candidates. When an unmet monthly category quota is under time
+        # pressure and none of those candidates is of the target category,
+        # defer to the deterministic engine -- it widens the scan (k=200/600),
+        # boosts the target category and repositions toward it. Otherwise the
+        # LLM keeps taking whatever is nearby and the quota silently slips
+        # (each missed order is a fixed penalty at month end).
+        cat_target, cat_needed = self._get_category_target(rules, plan, day)
+        if cat_target and cat_needed > 0:
+            month_idx_now = _month_index_for_day(day)
+            remaining_days = max(1, _month_end_day_exclusive(month_idx_now) - day)
+            if remaining_days <= cat_needed + 15 and not any(
+                self._category_matches_sem(cat_target, str(c.get("name", ""))) for c in cargo_summary
+            ):
+                self._logger.info(
+                    "[LLM] skip LLM decision: category quota pressure cat=%s needed=%d remaining_days=%d",
+                    cat_target, cat_needed, remaining_days,
+                )
+                return None
+
         # Build preference rules summary
         pref_summary = self._format_rules_for_llm(driver_id, rules, plan, day)
 
@@ -824,7 +844,6 @@ class ModelDecisionService:
         )
 
         # Add category target warning
-        cat_target, cat_needed = self._get_category_target(rules, plan, day)
         month_deadhead = plan.setdefault("monthly_deadhead_km", {}).get(month_idx, 0.0)
         cat_warning = ""
         if cat_target and cat_needed > 0:
@@ -1761,23 +1780,26 @@ class ModelDecisionService:
             prompt += f"附近发现{len(target_locations)}条'{cat_target}'货源:\n"
             for i, loc in enumerate(target_locations[:5]):
                 prompt += f"  {i+1}. ({loc['lat']:.2f},{loc['lng']:.2f}) {loc['city']} 距离{loc['distance_km']:.0f}km\n"
-            prompt += "\n请选择最佳重定位目的地，输出JSON: {\"latitude\": 纬度, \"longitude\": 经度, \"reason\": \"理由\"}"
+            prompt += "\n请选择最佳重定位目的地，输出JSON: {\"latitude\": 纬度, \"longitude\": 经度, \"reason\": \"15字内\"}"
         else:
             prompt += (
                 f"附近200条货源中无'{cat_target}'类。请根据你对中国物流地理的了解，"
                 f"推测'{cat_target}'货源可能集中的区域，输出JSON: "
-                f"{{\"latitude\": 纬度, \"longitude\": 经度, \"reason\": \"理由\"}}"
+                f"{{\"latitude\": 纬度, \"longitude\": 经度, \"reason\": \"15字内\"}}"
             )
 
         try:
             req = {
                 "messages": [
-                    {"role": "system", "content": "你是货运路线规划助手。输出纯JSON，不要markdown。"},
+                    {"role": "system", "content": "你是货运路线规划助手。输出纯JSON，不要markdown，reason限15字内。"},
                     {"role": "user", "content": prompt},
                 ],
                 "temperature": 0,
                 "response_format": {"type": "json_object"},
-                "max_tokens": 100,
+                # 100 tokens used to truncate the JSON mid-"reason" (the model
+                # writes a long Chinese rationale), losing the reposition
+                # entirely right when a category quota hunt needs it.
+                "max_tokens": 200,
             }
             resp = self._api.model_chat_completion(req)
             content = resp.get("choices", [{}])[0].get("message", {}).get("content", "")
@@ -1846,16 +1868,19 @@ class ModelDecisionService:
         # widest list it queried). Only escalate to a fresh wide k=600 query when
         # the reused list yields no reachable relocation target.
         best_target = best_net = None
+        items_used: list[dict[str, Any]] = []
         scan = plan.get("_scan_items")
         if scan is not None and scan[0] == now:
-            best_target, best_net = _best_target(scan[1])
+            items_used = scan[1]
+            best_target, best_net = _best_target(items_used)
         if best_target is None:
             cargo_resp = self._query_cargo(driver_id=driver_id, latitude=lat, longitude=lng, k=600)
             now = int(self._api.get_driver_status(driver_id)["simulation_progress_minutes"])
             day_end = min(day_end, self._hard_order_deadline(rules, plan, now, day))
-            best_target, best_net = _best_target(cargo_resp.get("items", []))
+            items_used = cargo_resp.get("items", [])
+            best_target, best_net = _best_target(items_used)
         if best_target is None:
-            return None
+            return self._strand_escape(rules, plan, now, lat, lng, day, day_end, items_used)
         action = self._safe_reposition(
             rules,
             now,
@@ -1872,6 +1897,58 @@ class ModelDecisionService:
         plan["strand_repo"].add(day)
         plan.setdefault("strand_count", {})
         plan["strand_count"][day] = plan["strand_count"].get(day, 0) + 1
+        return action
+
+    def _strand_escape(self, rules, plan, now, lat, lng, day, day_end, items):
+        """Multi-day stranding escape.
+
+        _anti_strand only relocates when reposition + a full order still fits
+        in TODAY. When a haul drops the driver in a region with no outbound
+        cargo at all, that test fails again every single day and the driver
+        can sit idle for weeks (observed: parked 20 days at month end, quota
+        blown). If even the nearest pickup of the widest scan is far away, the
+        driver is genuinely stranded: head toward it anyway -- arriving
+        tonight makes tomorrow a normal working day. The leg is clamped to end
+        before day end / the night window, and at most one escape per day.
+        """
+        if day in plan.get("strand_escape_days", set()):
+            return None
+        nearest: tuple[float, float, str] | None = None
+        nearest_km: float | None = None
+        for item in items:
+            cargo = item.get("cargo", {}) if isinstance(item, dict) else {}
+            if self._is_forbidden_cargo(str(cargo.get("cargo_name", "")), rules.forbidden_categories):
+                continue
+            start = cargo.get("start") or {}
+            try:
+                slat, slng = float(start.get("lat", 0.0)), float(start.get("lng", 0.0))
+            except (TypeError, ValueError):
+                continue
+            d = _haversine_km(lat, lng, slat, slng)
+            if nearest_km is None or d < nearest_km:
+                nearest, nearest_km = (slat, slng, str(start.get("city", ""))), d
+        if nearest is None or nearest_km is None or nearest_km < 100.0:
+            return None  # not genuinely stranded; the 2h wait-and-retry handles it
+        budget_min = day_end - now - 30
+        if budget_min < 120:
+            return None
+        tlat, tlng, tcity = nearest
+        travel_min = _travel_minutes(nearest_km)
+        if travel_min > budget_min:
+            # Move partway along the bearing so the leg still ends in time.
+            frac = max(0.1, budget_min / travel_min * 0.95)
+            tlat = lat + (tlat - lat) * frac
+            tlng = lng + (tlng - lng) * frac
+            tcity = None
+        action = self._safe_reposition(
+            rules, now, lat, lng, tlat, tlng, deadline=day_end, tag="strand_escape", target_city=tcity
+        )
+        if action is not None:
+            plan.setdefault("strand_escape_days", set()).add(day)
+            self._logger.info(
+                "strand_escape day=%d from=(%.2f,%.2f) toward=(%.2f,%.2f) nearest_pickup_km=%.0f",
+                day, lat, lng, tlat, tlng, nearest_km,
+            )
         return action
 
     def _evaluate_relocation(self, cargo, rules, blackout_regions, now, day_end, lat, lng):
@@ -2150,7 +2227,13 @@ class ModelDecisionService:
             (pref.get("penalty_amount") if isinstance(pref, dict) else None) for pref in prefs
             if (pref.get("content", "") if isinstance(pref, dict) else str(pref)).strip()
         ]
-        parsed_by_llm = self._llm_parse_preferences(driver_id, texts, rules, coord_map, penalties)
+        # Relative months ("本月") in quota preferences resolve to the month in
+        # which the (date-windowed) preference became visible.
+        now_min = int(status.get("simulation_progress_minutes", 0) or 0)
+        cur_month_idx = _month_index_for_day(min(max(0, now_min // DAY_MINUTES), MONTH_DAYS - 1))
+        parsed_by_llm = self._llm_parse_preferences(
+            driver_id, texts, rules, coord_map, penalties, default_month_idx=cur_month_idx
+        )
         if not parsed_by_llm:
             # offline / model unavailable: fall back to the deterministic regex parser.
             for text in texts:
@@ -2268,6 +2351,7 @@ class ModelDecisionService:
         '  适用于任何"某时段不出车/不接单/不空驶/收车/熄火/落锁/归家不动/歇业/宵禁"。跨午夜时 end_hour<start_hour，如23→5。\n'
         '  **极重要（夜休按天扣分，漏抽代价极高，务必抽出）**：凡表达"夜里/入夜/天黑后/后半夜/晚上X点后/到次日X点 不出车·不揽货·收车·归家·熄火·睡觉·歇着"等含义的，'
         '无论用词多口语/方言，都必须填 no_drive_windows（跨夜用 start>end）；若同时有"休息/睡觉/停车熄火"含义，则 rest_window 也一并填。宁可多抽一个夜休窗口，也不要漏掉。\n'
+        '  注意：同一条夜休规则只填一个基准窗口；"周末/特定日可以晚X小时再休息"是宽松例外，不是新增窗口，绝不要为例外另加一个更长/平移的窗口。\n'
         '- off_days_min: 整月完全不出车天数（整数，默认 0）\n'
         '- forbidden_categories: 禁运货物**品类名**数组（仅货物名称如"蔬菜""机械设备""生鲜"，'
         '绝不放城市/区域名！"在惠州的货"是区域禁令不是品类禁令）\n'
@@ -2393,7 +2477,9 @@ class ModelDecisionService:
         "日期事件(dated_single/dated_route，坐标按原文「地名（纬度,经度）」取)、回家规则(home_rule)。\n"
         "4) 删多——删除原文并未施加的臆造约束。重点检查 forbidden_zones/bounded_area/must_visit/"
         "home_rule/allowed_regions/daily_order_limit/blackout：原文没有明确说就置 null/空数组。"
-        "注意「尽量不/最好别」是 avoid_categories（软性），不要放进 forbidden_categories。\n"
+        "注意「尽量不/最好别」是 avoid_categories（软性），不要放进 forbidden_categories。"
+        "同一条夜休规则只应有一个基准 no_drive 窗口：「周末/特定日可晚X小时」是宽松例外，"
+        "若 extracted 把例外拆成了额外/更长的窗口，必须删掉多余的那个。\n"
         "5) 纠错——校对数字与单位、时刻（中午十二点→12，下午两点→14，半点用0.5）、"
         "日期（三十一号→31）、坐标（纬度在前 18-55，经度在后 70-140）；"
         "区分货物品类名与地名（「在惠州的货」是区域约束不是品类）。\n"
@@ -2438,6 +2524,7 @@ class ModelDecisionService:
         self, driver_id: str, texts: list[str], rules: DriverRules,
         coord_map: dict[str, tuple[float, float]] | None = None,
         penalties: list[Any] | None = None,
+        default_month_idx: int | None = None,
     ) -> bool:
         """偏好编译器：两遍 LLM（抽取 → 审计修复）后合并进 rules。
 
@@ -2488,7 +2575,7 @@ class ModelDecisionService:
                     )
                     data = reviewed
                 try:
-                    self._merge_llm_rules(rules, data, texts)
+                    self._merge_llm_rules(rules, data, texts, default_month_idx)
                 except Exception as exc:
                     self._logger.warning("llm parse: merge failed driver_id=%s err=%s", driver_id, exc)
                     continue
@@ -2668,7 +2755,10 @@ class ModelDecisionService:
         )
         return self._llm_semantic_yes_no(question, default=self._category_matches(cat, cargo_name))
 
-    def _merge_llm_rules(self, rules: DriverRules, data: dict[str, Any], texts: list[str] | None = None) -> None:
+    def _merge_llm_rules(
+        self, rules: DriverRules, data: dict[str, Any], texts: list[str] | None = None,
+        default_month_idx: int | None = None,
+    ) -> None:
         all_text = "\n".join(texts) if texts else ""
         rp = data.get("rule_penalties")
         if isinstance(rp, dict):
@@ -2894,7 +2984,7 @@ class ModelDecisionService:
                     rules.first_order_before_minute = h * 60
 
         # monthly_category_targets
-        self._merge_category_targets_from_llm(data, rules, all_text)
+        self._merge_category_targets_from_llm(data, rules, all_text, default_month_idx)
 
         # monthly_longhaul_cap — preference-driven long-haul order cap.
         lhc = data.get("monthly_longhaul_cap")
@@ -2969,7 +3059,10 @@ class ModelDecisionService:
         mapping = {3: 0, 4: 1, 5: 2, 0: 0, 1: 1, 2: 2}
         return mapping.get(month)
 
-    def _merge_category_targets_from_llm(self, data: dict[str, Any], rules: DriverRules, all_text: str) -> None:
+    def _merge_category_targets_from_llm(
+        self, data: dict[str, Any], rules: DriverRules, all_text: str,
+        default_month_idx: int | None = None,
+    ) -> None:
         raw_targets = data.get("monthly_category_targets") or []
         if not isinstance(raw_targets, list):
             return
@@ -2978,7 +3071,11 @@ class ModelDecisionService:
                 continue
             cat = str(item.get("category", "")).strip()
             req = item.get("min_orders")
-            month_idx = self._month_to_idx(item.get("month"))
+            # Preferences are date-windowed and parsed when they first become
+            # visible, so a relative month ("本月"/missing) resolves to the
+            # current simulation month -- otherwise quotas phrased relatively
+            # (the unknown-driver case) would be silently dropped.
+            month_idx = self._month_to_idx(item.get("month"), default_month_idx)
             if not cat or month_idx is None or not isinstance(req, (int, float)) or req <= 0:
                 continue
             rules.monthly_category_targets.setdefault(month_idx, {})[cat] = max(

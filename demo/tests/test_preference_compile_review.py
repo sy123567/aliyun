@@ -137,6 +137,20 @@ def test_regex_supplements_do_not_run_on_successful_compile() -> None:
     assert rules.daily_rest_minutes == 0, rules.daily_rest_minutes
 
 
+def test_relative_month_quota_resolves_to_current_month() -> None:
+    """A quota phrased as 「本月…」(month missing/relative) must land in the
+    month the preference became visible, not be silently dropped."""
+    svc = ModelDecisionService(_SeqModelApi())
+    rules = DriverRules()
+    svc._merge_llm_rules(
+        rules,
+        {"monthly_category_targets": [{"month": None, "category": "聚酯切片", "min_orders": 8}]},
+        ["本月聚酯切片这类化工货起码要拉满八车，缺一车罚一回钞票。"],
+        default_month_idx=1,
+    )
+    assert rules.monthly_category_targets == {1: {"聚酯切片": 8}}, rules.monthly_category_targets
+
+
 def test_offline_fallback_still_parses_longhaul_cap() -> None:
     """With the model unreachable, the regex fallback must still recover the
     sample driver's long-haul cap preference."""
