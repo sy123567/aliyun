@@ -37,13 +37,14 @@ MONTH_DAYS = 92
 SPEED_KM_PER_HOUR = 60.0
 EARTH_RADIUS_KM = 6371.0
 COST_PER_KM = 1.5
-# Monthly long-haul (>8h haul) cap and the per-order penalty for exceeding it.
-# The cap is *soft*: exceeding it only costs LONGHAUL_PENALTY of net income per
-# extra order, so taking one is still worth it when the order's own net income
-# beats the penalty. Threshold/cap/penalty match the scorer
-# (calc_monthly_income._eval_monthly_long_haul_cap).
+# Long-haul defaults. The monthly long-haul cap is PREFERENCE-DRIVEN: it is
+# only enforced when a driver's own preferences impose one (parsed into
+# DriverRules.longhaul_cap_orders), because applying D001's "≤5 per month" to
+# every driver would actively throttle a long-haul-focused finals driver.
+# These constants are only the defaults for threshold (8h) and per-violation
+# penalty when the preference text does not specify them.
 LONGHAUL_MINUTES = 480
-LONGHAUL_CAP = 5
+LONGHAUL_CAP = 5  # retained for reference/tests; no longer applied globally
 LONGHAUL_PENALTY = 1000.0
 # Minimum remaining minutes in the day worth attempting an anti-stranding reposition:
 # below this there is no time to relocate and still complete an order before day end.
@@ -306,6 +307,16 @@ class DriverRules:
         # attributed by the parse LLM). Lets execution treat constraints economically:
         # an order violating a rule is still worth taking when net > penalty.
         self.rule_penalties: dict[str, float] = {}
+        # Monthly long-haul cap — ONLY when this driver's preferences impose one
+        # (e.g. D001 "每月超过八小时的长途最多5单"). None == no cap: a driver with
+        # the opposite preference (long-haul focused) must not be throttled.
+        self.longhaul_cap_orders: int | None = None
+        self.longhaul_min_minutes: int = LONGHAUL_MINUTES
+        # Category whitelist ("只拉/只接X类货"): when non-empty, orders whose
+        # cargo does not match any listed category are non-compliant.
+        self.allowed_categories: set[str] = set()
+        # Minimum haul distance ("低于X公里的短活不接") — mirror of haul_max_km.
+        self.haul_min_km: float | None = None
         # Preferences the compile+audit loop could NOT fully express as structured
         # rules. They are never silently dropped: each entry is injected into the
         # decision prompt (with its penalty amount) so the decision LLM enforces
@@ -357,6 +368,11 @@ class DriverRules:
         if self.no_drive_windows:
             return True
         return any(d.get("windows") for d in self.daily_directives.values())
+
+    @property
+    def longhaul_penalty(self) -> float:
+        """Per-order penalty for exceeding this driver's long-haul cap."""
+        return float(self.rule_penalties.get("longhaul_cap", LONGHAUL_PENALTY))
 
     @property
     def day_rest_block(self) -> int:
@@ -471,7 +487,7 @@ class DecisionHistory:
             longhual = plan.get("monthly_longhual", {}).get(month_idx, 0)
             cat_orders = plan.get("monthly_category_orders", {}).get(month_idx, {}) or {}
             lines.append(f"累计接单: {total_orders}单 (本{month_name}已接{month_orders}单)")
-            lines.append(f"{month_name}长途(>8h): {longhual}/{LONGHAUL_CAP}单上限")
+            lines.append(f"{month_name}长途(>8h): {longhual}单")
             if cat_orders:
                 top = sorted(cat_orders.items(), key=lambda x: -x[1])[:5]
                 lines.append(f"{month_name}品类接单: " + ", ".join(f"{c}:{n}单" for c, n in top))
@@ -668,7 +684,8 @@ class ModelDecisionService:
             plan["total_deadhead_km"] += pickup_deadhead
             plan["monthly_deadhead_km"][month_idx] = plan["monthly_deadhead_km"].get(month_idx, 0.0) + pickup_deadhead
             meta = self._cargo_meta.get(cargo_id, {})
-            if int(meta.get("cost_time_minutes", 0) or 0) > 480:
+            lh_min = rules.longhaul_min_minutes if rules is not None else LONGHAUL_MINUTES
+            if int(meta.get("cost_time_minutes", 0) or 0) > lh_min:
                 plan["monthly_longhual"][month_idx] = plan["monthly_longhual"].get(month_idx, 0) + 1
             self._track_category_order(plan, rules, month_idx, str(meta.get("cargo_name", "")))
             city = str(meta.get("start_city", "") or "")
@@ -888,7 +905,7 @@ class ModelDecisionService:
             '当附近无目标品类货源时，主动移动到可能有货的区域（根据地理常识判断）\n\n'
             "重要规则：\n"
             "- 在司机自己的休息/禁驶时段内不得接单或空驶，只能wait(具体时段见下方【硬约束】与偏好规则，不同司机时段不同，不要假设固定21:00-06:00)；空驶须在该时段开始前结束\n"
-            "- 每月长途(>8h)软上限5单：超出每单扣1000，但只要该单净收益明显大于1000就仍应接\n"
+            "- 长途/品类/区域等限制以下方偏好规则为准：没有列出的限制就不存在，不要自行假设(例如不要假设有长途单数上限)\n"
             "- 不要连续wait超过2次！如果当前货源不合适，应该reposition到新区域寻找更好货源\n"
             "- 品类指标很重要：未达标会有高额罚款。优先接指标品类的货\n"
             "- 只能从候选货源列表里选 cargo_id；候选为空或都不合适就 wait/reposition\n"
@@ -1183,10 +1200,14 @@ class ModelDecisionService:
             self._logger.info("[LLM] rejected take_order: cargo_id=%s failed deterministic feasibility", cargo_id)
             return False
         net, _touches_required, _occupied, _pickup_km = ev
-        # Long-haul cap is soft (net maximization): only reject an over-cap >8h
-        # order when its net income does not cover the penalty it would incur.
+        # Long-haul cap is preference-driven AND soft (net maximization): it only
+        # exists when this driver's preferences impose one, and even then an
+        # over-cap order is rejected only when its net does not cover the penalty.
         cost_time = int(cargo.get("cost_time_minutes", 0) or 0)
-        if cost_time > LONGHAUL_MINUTES and longhual_count >= LONGHAUL_CAP and net <= LONGHAUL_PENALTY:
+        if (rules.longhaul_cap_orders is not None
+                and cost_time > rules.longhaul_min_minutes
+                and longhual_count >= rules.longhaul_cap_orders
+                and net <= rules.longhaul_penalty):
             self._logger.info(
                 "[LLM] rejected take_order: over long-haul cap and net=%.0f<=penalty month=%d", net, month_idx
             )
@@ -1421,6 +1442,10 @@ class ModelDecisionService:
             lines.append(f"- 今日合规计划: {directive['notes']}")
         if rules.forbidden_categories:
             lines.append(f"- 禁运品类: {', '.join(rules.forbidden_categories)}")
+        if rules.allowed_categories:
+            lines.append(f"- 仅允许承运品类(其余一律不接): {', '.join(sorted(rules.allowed_categories))}")
+        if rules.haul_min_km is not None:
+            lines.append(f"- 单笔干线距离下限: {rules.haul_min_km:g}km (更短的不接)")
         if rules.forbidden_regions:
             lines.append(f"- 禁入区域: {', '.join(rules.forbidden_regions)}")
         if rules.allowed_regions:
@@ -1438,13 +1463,20 @@ class ModelDecisionService:
         # Category targets with progress
         cat_orders = plan.get("monthly_category_orders", {}).get(month_idx, {})
         longhual = plan.get("monthly_longhual", {}).get(month_idx, 0)
-        if longhual >= LONGHAUL_CAP:
-            lines.append(
-                f"- 本月长途(>8h): {longhual}单 (已达{LONGHAUL_CAP}单上限; 再接每单扣{int(LONGHAUL_PENALTY)}罚分，"
-                f"仅当该单净利润>{int(LONGHAUL_PENALTY)}才值得接)"
-            )
-        else:
-            lines.append(f"- 本月长途(>8h): {longhual}/{LONGHAUL_CAP}单上限 (超限后每单扣{int(LONGHAUL_PENALTY)})")
+        # The long-haul cap is preference-driven: only mention it when this
+        # driver's preferences impose one. A cap-free or long-haul-focused
+        # driver must not be steered away from long hauls.
+        if rules.longhaul_cap_orders is not None:
+            cap = rules.longhaul_cap_orders
+            pen = int(rules.longhaul_penalty)
+            lh_h = rules.longhaul_min_minutes // 60
+            if longhual >= cap:
+                lines.append(
+                    f"- 本月长途(>{lh_h}h): {longhual}单 (已达{cap}单上限; 再接每单扣{pen}罚分，"
+                    f"仅当该单净利润>{pen}才值得接)"
+                )
+            else:
+                lines.append(f"- 本月长途(>{lh_h}h): {longhual}/{cap}单上限 (超限后每单扣{pen})")
         lines.append(f"- 本月品类接单: {json.dumps(cat_orders, ensure_ascii=False)}")
         targets = getattr(rules, "monthly_category_targets", {}).get(month_idx, {})
         if targets:
@@ -1851,16 +1883,18 @@ class ModelDecisionService:
             if rules.monthly_deadhead_max_km is not None:
                 if month_deadhead + pkm > rules.monthly_deadhead_max_km:
                     return
-            # [OPT] Long-haul cap is a *soft* limit. Exceeding 5 >8h orders in a
-            # month costs LONGHAUL_PENALTY of net each, so instead of hard-rejecting
-            # we subtract the penalty from the order's value: it is still picked
-            # when its net beats the penalty (net maximization), and is correctly
-            # deprioritised otherwise. Threshold uses cost_time (the haul time the
-            # scorer counts), not the full occupied time.
+            # [OPT] Long-haul cap is preference-driven and *soft*. It only applies
+            # when this driver's preferences impose one (a long-haul-focused or
+            # cap-free driver must not be throttled). Over-cap orders have the
+            # per-violation penalty subtracted from their value: still picked when
+            # net beats the penalty (net maximization), deprioritised otherwise.
+            # Threshold uses cost_time (the haul time the scorer counts).
             cost_time = int(cargo.get("cost_time_minutes", 0))
             eff_net = net
-            if cost_time > LONGHAUL_MINUTES and longhual_count >= LONGHAUL_CAP:
-                eff_net = net - LONGHAUL_PENALTY
+            if (rules.longhaul_cap_orders is not None
+                    and cost_time > rules.longhaul_min_minutes
+                    and longhual_count >= rules.longhaul_cap_orders):
+                eff_net = net - rules.longhaul_penalty
                 if eff_net <= 0:
                     return
             score = eff_net / occupied
@@ -1938,13 +1972,14 @@ class ModelDecisionService:
             )
             return None
         latest_net, _latest_required, latest_occupied, latest_pickup_km = latest_ev
-        # Soft long-haul cap: keep an over-cap >8h order only if its net beats the
-        # penalty (consistent with _score_item / _validate_llm_take_order).
+        # Preference-driven soft long-haul cap: keep an over-cap order only if its
+        # net beats the penalty (consistent with _score_item / _validate_llm_take_order).
         latest_cost_time = int(best.get("cost_time_minutes", 0) or 0)
         if (
-            latest_cost_time > LONGHAUL_MINUTES
-            and longhual_count >= LONGHAUL_CAP
-            and latest_net - LONGHAUL_PENALTY <= 0
+            rules.longhaul_cap_orders is not None
+            and latest_cost_time > rules.longhaul_min_minutes
+            and longhual_count >= rules.longhaul_cap_orders
+            and latest_net - rules.longhaul_penalty <= 0
         ):
             return None
         if rules.monthly_deadhead_max_km is not None:
@@ -2114,6 +2149,11 @@ class ModelDecisionService:
         name = str(cargo.get("cargo_name", ""))
         if self._is_forbidden_cargo(name, rules.forbidden_categories):
             return None
+        # allowed_categories whitelist: relocation anchor must also comply
+        if rules.allowed_categories and not any(
+            self._category_matches_sem(cat, name) for cat in rules.allowed_categories
+        ):
+            return None
         # avoid_categories: soft penalty for relocation too
         avoid_penalty = 0.5 if self._is_forbidden_cargo(name, rules.avoid_categories) else 1.0
         start = cargo.get("start") or {}
@@ -2179,6 +2219,8 @@ class ModelDecisionService:
         haul_km = _haversine_km(slat, slng, elat, elng)
         if rules.haul_max_km is not None and haul_km > rules.haul_max_km:
             return None
+        if rules.haul_min_km is not None and haul_km < rules.haul_min_km:
+            return None
         price = float(cargo.get("price", 0.0))
         net = price - COST_PER_KM * (move_km + haul_km)
         if net <= 0:
@@ -2199,6 +2241,16 @@ class ModelDecisionService:
             if fp is None:
                 return None
             violation_cost += fp
+        # allowed_categories whitelist ("只拉X"): cargo outside the whitelist is a
+        # violation. Same economics as forbidden: known penalty → soft cost,
+        # unknown penalty → conservative hard reject.
+        if rules.allowed_categories and not any(
+            self._category_matches_sem(cat, name) for cat in rules.allowed_categories
+        ):
+            ap = rules.rule_penalties.get("allowed_categories")
+            if ap is None:
+                return None
+            violation_cost += ap
         # avoid_categories: soft penalty (50% score reduction) rather than hard rejection
         avoid_penalty = 0.5 if self._is_forbidden_cargo(name, rules.avoid_categories) else 1.0
         start = cargo.get("start") or {}
@@ -2276,8 +2328,10 @@ class ModelDecisionService:
         ):
             return None
         haul_km = _haversine_km(slat, slng, elat, elng)
-        # haul_max_km: single-order haul distance limit
+        # haul_max_km / haul_min_km: single-order haul distance limits
         if rules.haul_max_km is not None and haul_km > rules.haul_max_km:
+            return None
+        if rules.haul_min_km is not None and haul_km < rules.haul_min_km:
             return None
         price = float(cargo.get("price", 0.0))
         net = price - COST_PER_KM * (pickup_km + haul_km) - violation_cost
@@ -2522,6 +2576,8 @@ class ModelDecisionService:
         '- forbidden_categories: 禁运货物**品类名**数组（仅货物名称如"蔬菜""机械设备""生鲜"，'
         '绝不放城市/区域名！"在惠州的货"是区域禁令不是品类禁令）\n'
         '- avoid_categories: 尽量避免的货物品类名数组（"尽量不拉""尽量不接"→放这里）\n'
+        '- allowed_categories: 仅允许承运的货物品类名数组（"只拉X""只接X类货""除了X一律不接"→放这里）。'
+        '仅当文本明确表达"只/仅承运某品类"时填写，与 forbidden_categories 严格区分。\n'
         '- forbidden_regions: 禁接的装/卸货**城市/区域名**数组（仅地名如"惠州""深圳"，'
         '不带"的货""那一路"等后缀）\n'
         '- allowed_regions: 仅允许运营的城市/区域名数组（如"长三角""江浙沪""广东""苏州"）。'
@@ -2535,6 +2591,10 @@ class ModelDecisionService:
         '  适用于"每月至少N天到过某地"之类约束。\n'
         '- pickup_max_km: 赴装空驶上限公里数（数字或 null）。中文数字要转换。\n'
         '- haul_max_km: 单笔干线距离上限公里数（装货点到卸货点，数字或 null）\n'
+        '- haul_min_km: 单笔干线距离下限公里数（"低于X公里的短活不接"，数字或 null）\n'
+        '- monthly_longhaul_cap: 月度长途单数上限 {"max_orders":整数,"min_hours":小时数}（或 null）。\n'
+        '  适用于"每月超过X小时的长途最多/只能接N单，多一单扣一次"。文本没提长途单数限制就必须为 null，'
+        '绝不能默认存在上限（有的司机专跑长途）。\n'
         '- monthly_deadhead_max_km: 月累计空驶上限公里数（数字或 null）\n'
         '- daily_order_limit: 每天最多接几单（整数或 null）\n'
         '- first_order_before_hour: 每天首单不得晚于几点（整数或 null）\n'
@@ -2549,7 +2609,7 @@ class ModelDecisionService:
         '  触发词：赴宴/做寿/先到…再到/先去…再去/先过…赶到/接人/送人/喝喜酒/吃饭/接上配偶/接家人\n'
         '- rule_penalties: 各类规则的单次违约扣款金额对象（仅当输入含 penalty_amounts 时填写，否则 null）。'
         '把每条偏好的金额归因到其抽出的规则类别，键限：'
-        '"allowed_regions"/"forbidden_regions"/"forbidden_categories"/"night_window"/"category_targets"/"dated_events"。'
+        '"allowed_regions"/"forbidden_regions"/"forbidden_categories"/"allowed_categories"/"night_window"/"category_targets"/"dated_events"/"longhaul_cap"。'
         '一条偏好含多种规则时金额填到每个对应键；无法确定归因的键省略。\n\n'
         "关键规则：\n"
         "1) 日期用该月日数 1-31。中文数字要转换（十二号→12，二十号→20，三十一号→31）。\n"
@@ -2702,8 +2762,9 @@ class ModelDecisionService:
         "patch 可用字段（与抽取器一致，未缺失的不要填）：\n"
         "daily_rest_hours; rest_window{start_hour,end_hour}; "
         "no_drive_windows[{start_hour,end_hour}]（跨夜时 end_hour<start_hour）; off_days_min; "
-        "forbidden_categories[]; avoid_categories[]; forbidden_regions[]; allowed_regions[]; "
-        "pickup_max_km; haul_max_km; monthly_deadhead_max_km; daily_order_limit; "
+        "forbidden_categories[]; avoid_categories[]; allowed_categories[]; forbidden_regions[]; allowed_regions[]; "
+        "pickup_max_km; haul_max_km; haul_min_km; monthly_longhaul_cap{max_orders,min_hours}; "
+        "monthly_deadhead_max_km; daily_order_limit; "
         "first_order_before_hour; monthly_category_targets[{month,category,min_orders,carryover}]; "
         "home_rule{lat,lng,radius_km,home_by_hour,no_drive_until_hour}; "
         "blackout[{region,dates[]}]; dated_single[{date,lat,lng,wait_minutes,before_hour}]; "
@@ -2737,6 +2798,8 @@ class ModelDecisionService:
             lines.append("禁运品类: " + "、".join(sorted(rules.forbidden_categories)))
         if rules.avoid_categories:
             lines.append("尽量避开品类: " + "、".join(sorted(rules.avoid_categories)))
+        if rules.allowed_categories:
+            lines.append("仅承运品类: " + "、".join(sorted(rules.allowed_categories)))
         if rules.forbidden_regions:
             lines.append("禁接区域: " + "、".join(sorted(rules.forbidden_regions)))
         if rules.allowed_regions:
@@ -2748,6 +2811,12 @@ class ModelDecisionService:
             lines.append(f"赴装空驶≤{rules.pickup_max_km:g}km")
         if rules.haul_max_km:
             lines.append(f"单笔干线≤{rules.haul_max_km:g}km")
+        if rules.haul_min_km:
+            lines.append(f"单笔干线≥{rules.haul_min_km:g}km")
+        if rules.longhaul_cap_orders is not None:
+            lines.append(
+                f"每月超过{rules.longhaul_min_minutes / 60:g}小时的长途≤{rules.longhaul_cap_orders}单"
+            )
         if rules.monthly_deadhead_max_km:
             lines.append(f"月累计空驶≤{rules.monthly_deadhead_max_km:g}km")
         if rules.daily_order_limit:
@@ -3244,6 +3313,24 @@ class ModelDecisionService:
                 else:
                     self._logger.info("llm semantic-confirm: dropped avoid_category '%s'", s)
 
+        # allowed_categories — category whitelist ("只拉/只接X"), the OPPOSITE of
+        # forbidden_categories. Wrongly adding one throttles everything, wrongly
+        # dropping one costs per-order penalties, so each entry is gated with a
+        # semantic confirm (offline default: text must contain a whitelist marker).
+        for ac in data.get("allowed_categories") or []:
+            if isinstance(ac, str) and ac.strip():
+                s = re.sub(r"^(?:凡是|所有|一切|任何)", "", ac.strip()).strip()
+                if not s:
+                    continue
+                if self._confirm_rule_holds(
+                    f"司机只承运/只接货物品类「{s}」（除此之外的品类不接）",
+                    all_text,
+                    default=any(k in all_text for k in ("只拉", "只接", "只运", "专拉", "专运", "专跑", "除了")),
+                ):
+                    rules.allowed_categories.add(s)
+                else:
+                    self._logger.info("llm semantic-confirm: dropped allowed_category '%s'", s)
+
         # NOTE: avoid/forbidden dedup moved to _dedup_avoid_forbidden (runs after supplement)
 
         # allowed_regions — semantic confirm replaces the keyword whitelist gate
@@ -3363,6 +3450,39 @@ class ModelDecisionService:
                 rules.haul_max_km = float(hm)
             else:
                 self._logger.info("llm semantic-confirm: dropped haul_max_km=%s", hm)
+
+        # haul_min_km — opposite of haul_max_km ("低于X公里的短活不接")
+        hmin = data.get("haul_min_km")
+        if isinstance(hmin, (int, float)) and hmin > 0:
+            if self._confirm_rule_holds(
+                f"司机单笔订单的运输距离（装货点到卸货点）不得低于{hmin:g}公里",
+                all_text,
+                default=_text_has_any(_HAUL_KW),
+            ):
+                rules.haul_min_km = float(hmin)
+            else:
+                self._logger.info("llm semantic-confirm: dropped haul_min_km=%s", hmin)
+
+        # monthly_longhaul_cap — preference-driven long-haul order cap. Only set
+        # when the driver's own text imposes one: missing a real cap costs
+        # per-order penalties, while inventing one throttles a long-haul-focused
+        # driver all season.
+        lhc = data.get("monthly_longhaul_cap")
+        if isinstance(lhc, dict):
+            mx = lhc.get("max_orders")
+            mh = lhc.get("min_hours")
+            if isinstance(mx, (int, float)) and int(mx) > 0:
+                hours_txt = f"{float(mh):g}" if isinstance(mh, (int, float)) and mh > 0 else "若干"
+                if self._confirm_rule_holds(
+                    f"司机每月超过{hours_txt}小时的长途订单最多只能接{int(mx)}单",
+                    all_text,
+                    default=("长途" in all_text or "远活" in all_text),
+                ):
+                    rules.longhaul_cap_orders = int(mx)
+                    if isinstance(mh, (int, float)) and mh > 0:
+                        rules.longhaul_min_minutes = int(float(mh) * 60)
+                else:
+                    self._logger.info("llm semantic-confirm: dropped monthly_longhaul_cap=%s", lhc)
 
         # monthly_deadhead_max_km (keep as before — low risk, rarely hallucinated)
         mdh = data.get("monthly_deadhead_max_km")
@@ -3718,6 +3838,9 @@ class ModelDecisionService:
                 len(rules.must_visit),
                 rules.first_order_before_minute,
                 sorted(rules.avoid_categories),
+                sorted(rules.allowed_categories),
+                rules.haul_min_km,
+                (rules.longhaul_cap_orders, rules.longhaul_min_minutes),
                 {m: dict(sorted(v.items())) for m, v in sorted(rules.monthly_category_targets.items())},
                 sorted(rules.category_carryover_months),
                 sorted(rc.get("text", "") for rc in rules.residual_constraints),
@@ -3749,6 +3872,25 @@ class ModelDecisionService:
         high-confidence forbidden category/region patterns with very specific
         trigger phrases that are unlikely to false-match.
         """
+        # Monthly long-haul order cap (preference-driven; e.g. D001 "每个月超过
+        # 八小时的长途只能接最多5单"). Offline fallback for the LLM extractor —
+        # without it a cap-having driver would take unlimited long hauls offline.
+        if (rules.longhaul_cap_orders is None
+                and ("长途" in text or "远活" in text)
+                and ("每月" in text or "每个月" in text or "一个月" in text)):
+            m_n = re.search(
+                r"(?:最多|只能|不超过?|至多)[接拉]?\s*(?:最多)?\s*([零一二两三四五六七八九十\d]+)\s*单",
+                text,
+            )
+            if m_n:
+                cap = _cn_to_int(m_n.group(1))
+                if cap > 0:
+                    rules.longhaul_cap_orders = cap
+                    m_h = re.search(r"超过\s*([零一二两三四五六七八九十\d]+)\s*个?\s*(?:小时|钟头)", text)
+                    if m_h:
+                        hours = _cn_to_int(m_h.group(1))
+                        if hours > 0:
+                            rules.longhaul_min_minutes = hours * 60
         if ("连续" in text and "休息" in text) or ("连轴" in text):
             m = re.search(r"(\d+)\s*(?:个)?\s*小时", text)
             if m:
