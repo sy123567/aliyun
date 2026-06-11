@@ -132,6 +132,54 @@ cd demo && python calc_monthly_income.py
 
 ---
 
+## 3.6 架构重构：编译 → 审计修复 → 通用约束引擎（面向未知司机泛化）
+
+> 背景：复赛是广东 + 江浙沪两位**未知司机**，偏好为自然语言且措辞与本地 D001 完全不同；
+> 线上评测看三个指标：**得分、扣分、token 消耗**。此前架构"解析偏好 → 硬编码执行"
+> 在未知司机上扣分严重，根因是解析前端对措辞过拟合。本轮把偏好处理前端整体重构。
+
+### 旧架构的三类失效模式（都与"措辞过拟合"有关）
+1. **关键词白名单接地丢规则**：`_merge_llm_rules` 里 allowed_regions / forbidden_zones /
+   bounded_area / must_visit / haul_max / daily_order_limit / home_rule 等字段都要求原文
+   命中硬编码关键词表（`_ALLOW_REGION_KW` …）才被采纳——未知司机换个说法，正确抽出的
+   规则被**静默丢弃**，每日生效的约束按天复利扣分（复赛 −44.7 万事故的同款机制）。
+2. **逐条 LLM 确认调用**：每条规则一次 `_confirm_rule_holds` 调用（携带全部偏好原文），
+   规则多时 token 成本成倍增长，且又多了一个静默丢规则的通道。
+3. **正则补丁层在线误触发**：`_supplement_basic_rules` / `_supplement_dated_events` 等
+   按样例措辞调出来的正则**在 LLM 解析成功后仍然叠加运行**，在未知司机文本上会
+   **误加**黑名单区域 / 每日限单 / 日期事件等规则，确定性引擎随后忠实执行错误规则。
+
+### 新架构（全部在 `demo/agent/model_decision_service.py`）
+1. **两遍编译**：第一遍 temperature=0 抽取（schema 不变，新增 `monthly_longhaul_cap`）；
+   第二遍 `_llm_review_rules` **审计修复**——把偏好原文 + penalty_amounts + 抽取结果一起
+   交给模型，按「找漏（每日时段约束 > 品类指标/结转 > 整休/长途上限/日期事件/回家）→
+   删多（臆造约束）→ 纠值（数字/时刻/日期/坐标）」输出修正后的完整 JSON。
+   - fail-safe 方向：审计调用失败 → 沿用第一遍结果；审计**可修改但不可整体删除**
+     第一遍抽出的 no_drive_windows / rest_window（漏一条每日窗 ≈ 25万/司机，多一条
+     只损失几小时收入）。
+   - 一次审计调用替代 N 次逐条确认调用 → **token 净下降**。
+2. **合并层只做确定性结构校验**：坐标范围(18-55/70-140)、经纬互换、半径钳制(≤100km)、
+   bounded_area/home_rule/must_visit 仍要求原文出现过坐标数字（与措辞无关的信号）、
+   allowed_regions 保留垃圾地名检测 + 字符覆盖率接地。**删除全部措辞关键词门**。
+3. **正则层降级为离线兜底**：仅当模型完全不可用时运行（此时决策 LLM 也不可用），
+   不再叠加在 LLM 结果之上。
+4. **长途上限改为偏好驱动**：`LONGHAUL_CAP=5` 全局常量删除，改为
+   `DriverRules.longhaul_max_orders / longhaul_threshold_minutes`（从司机自己的偏好
+   解析，罚额走 `rule_penalties["longhaul"]`）。没有该偏好的司机**不再被硬编码限制**。
+   决策 prompt 里写死的"每月长途(>8h)软上限5单"与"本月需要X至少12单"文案同步改为
+   完全由解析结果驱动。
+5. **运行期兜底强化**：决策 prompt 始终携带**全部**偏好原文（按首次出现顺序，最多8条），
+   并明示"规则摘要与原文冲突时以原文为准"；每日合规自检（硬时间窗 + 昨日违规扫描）保留。
+
+### 回归测试
+- `demo/tests/test_preference_compile_review.py`（新增）：白名单外措辞不丢规则、
+  审计修复找漏、审计不可删每日窗、审计失败回退、正则补丁不在线上叠加、离线兜底可用。
+- `demo/tests/test_longhaul_cap_history.py`：改为偏好驱动上限口径（新增"无偏好则无上限"
+  与 merge 用例），全部通过。
+- `demo/tests/test_overnight_rest_window.py`：不变，全部通过。
+
+> 提醒：满月跑分仍受 §2 网关不确定性影响，对比新旧架构请多跑取均值/下限。
+
 ## 4. 仍然通用、未写死的既有设计（接手者可直接用）
 
 - **偏好解析**：自然语言 → 结构化 `DriverRules`，按时间窗增量触发；
