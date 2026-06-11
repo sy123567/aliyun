@@ -101,10 +101,20 @@ def test_query_cargo_wrapper_caches_metadata() -> None:
     assert svc._cargo_meta["7"]["cargo_name"] == "水果", svc._cargo_meta
 
 
-def _validate_with_net(svc, plan, *, cost_time, net):  # noqa: ANN001, ANN201
+def _d001_longhaul_rules() -> DriverRules:
+    """Rules for a driver whose OWN preferences impose the >8h/5-order cap.
+
+    The cap is no longer a module-level constant applied to every driver — it
+    is enforced only when parsed from the driver's preference text."""
+    rules = DriverRules()
+    rules.longhaul_cap = {"threshold_minutes": 480, "max_orders": 5, "penalty": 1000.0}
+    return rules
+
+
+def _validate_with_net(svc, plan, *, cost_time, net, rules=None):  # noqa: ANN001, ANN201
     """Drive _validate_llm_take_order with a controlled marginal net via a stub
     _evaluate_cargo, so we test only the soft long-haul gate (not geo feasibility)."""
-    rules = DriverRules()
+    rules = rules if rules is not None else _d001_longhaul_rules()
     items = [{"cargo": {"cargo_id": "99", "cost_time_minutes": cost_time, "cargo_name": "",
                         "start": {"city": ""}, "end": {"city": ""}}}]
     svc._evaluate_cargo = lambda *a, **k: (float(net), False, 600, 0.0)  # type: ignore[assignment]
@@ -142,6 +152,49 @@ def test_under_cap_longhaul_is_accepted_regardless_of_net() -> None:
     svc = ModelDecisionService(_StubApi(records=[]))
     plan = {"monthly_longhual": {0: 4}}
     assert _validate_with_net(svc, plan, cost_time=600, net=800) is True
+
+
+def test_no_longhaul_preference_means_no_enforcement() -> None:
+    """A driver WITHOUT a long-haul preference must never have the cap applied:
+    even past 5 long-hauls, a low-net >8h order stays acceptable (the old
+    module-constant cap wrongly throttled every driver)."""
+    svc = ModelDecisionService(_StubApi(records=[]))
+    plan = {"monthly_longhual": {0: 9}}
+    assert _validate_with_net(svc, plan, cost_time=600, net=800, rules=DriverRules()) is True
+
+
+def test_longhaul_cap_parsed_from_llm_extraction() -> None:
+    """monthly_longhaul_cap from the extraction JSON becomes rules.longhaul_cap
+    (with the per-rule penalty amount when attributed)."""
+    svc = ModelDecisionService(_StubApi())
+    svc._confirm_rule_holds = lambda desc, all_text, default=True: True  # type: ignore[assignment]
+    rules = DriverRules()
+    svc._merge_llm_rules(
+        rules,
+        {"monthly_longhaul_cap": {"min_hours": 10, "max_orders": 3},
+         "rule_penalties": {"longhaul_cap": 800}},
+        ["每月超过十个钟头的远活顶多3单，多一单扣800"],
+    )
+    assert rules.longhaul_cap == {"threshold_minutes": 600, "max_orders": 3, "penalty": 800.0}, rules.longhaul_cap
+
+
+def test_longhaul_cap_regex_failsafe_on_d001_text() -> None:
+    """Offline fail-safe: D001's own wording must yield the cap without the LLM."""
+    svc = ModelDecisionService(_StubApi())
+    rules = DriverRules()
+    svc._supplement_longhaul_cap(
+        "不爱接那种一跑就是大半天、人困马乏的远活，每个月超过八小时的长途只能接最多5单，多一单扣一次。",
+        rules,
+    )
+    assert rules.longhaul_cap == {"threshold_minutes": 480, "max_orders": 5, "penalty": 1000.0}, rules.longhaul_cap
+
+
+def test_longhaul_regex_does_not_fire_without_longhaul_wording() -> None:
+    """Generic texts must not create a phantom cap for other drivers."""
+    svc = ModelDecisionService(_StubApi())
+    rules = DriverRules()
+    svc._supplement_longhaul_cap("每天最多接3单，超过9小时就休息", rules)
+    assert rules.longhaul_cap is None, rules.longhaul_cap
 
 
 def test_empty_history_leaves_plan_untouched() -> None:

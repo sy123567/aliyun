@@ -195,8 +195,11 @@ decide() 在硬窗口内零 LLM 调用且动作合规。原有 `test_overnight_r
   支持品类指标、结转、禁运品类/区域、仅允许区域、空驶上限、每日接单上限、长途软上限等。
 - **区域分组**：内置 广东/上海/江苏/浙江/安徽/江浙沪/**长三角**/珠三角/大湾区 + 别名归一，
   广东与长三角司机都能覆盖（`_ALLOWED_REGION_GROUPS`）。
-- **长途软上限**：`_score_item()` 里对 >8h 且已达上限的单 `eff_net = net − LONGHAUL_PENALTY`，
-  净收益为正才接 → 天然实现"毛高带点罚也接"。
+- **长途软上限（按司机解析，不再全局硬编码）**：月度长途上限从司机自己的偏好解析
+  （LLM 抽取 `monthly_longhaul_cap` + 正则 fail-safe `_supplement_longhaul_cap`）进
+  `rules.longhaul_cap`；只有解析到才执行/才提示给 LLM。对超限单 `eff_net = net − 该司机罚金`，
+  净收益为正才接 → 天然实现"毛高带点罚也接"。没有该偏好的司机完全不受长途限制
+  （旧版把 D001 的 ">8h≤5单" 常量套在所有司机头上，会错误压制其他司机的高净值长途）。
 - **历史驱动的权威计数**：`_sync_monthly_counts_from_history()` 每步用
   `query_decision_history` 重建月度长途/品类/空驶/接单累计，保证额度判断准确
   （因为 harness 不回调结果）。
