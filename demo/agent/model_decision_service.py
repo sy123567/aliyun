@@ -1,8 +1,18 @@
 """模型决策服务：依赖 `simkit.ports.SimulationApiPort`，由评测进程注入具体环境。
 
-策略：在大模型解析司机自然语言偏好的基础上，用确定性调度器保证偏好合规
-（每日休息 / 夜间休息窗 / 整月整休天数 / 禁接货类 / 禁接区域 / 必接区域 /
-赴装空驶上限 / 特定日期到点事件），并在合规候选中按净收益择单。
+架构（闭环偏好编译，面向未知司机泛化）：
+
+1. 编译（LLM 优先，逐条）：每条自然语言偏好单独交给 LLM 抽取成结构化规则
+   （时间窗 / 区域 / 品类 / 配额 / 日期事件…），逐字段做语义接地确认。
+2. 审计修复（闭环）：编译完成后，再用一次 LLM 审计「每条偏好的全部约束是否
+   都已体现在结构化规则里」，缺失的部分以补丁形式回填——这取代了旧版按
+   D001 措辞写死的正则补抽层（正则解析仅在模型不可用时作为离线兜底）。
+3. 零静默丢弃：审计后仍无法用结构化字段表达的偏好，进入
+   ``DriverRules.residual_constraints``，逐步注入决策 prompt（带违约金额），
+   由决策 LLM 在线遵守——任何偏好都不会被悄悄丢掉。
+4. 执行：确定性调度器保证已结构化的偏好合规（每日休息 / 夜间休息窗 /
+   整月整休天数 / 禁接货类 / 禁接区域 / 必接区域 / 赴装空驶上限 /
+   特定日期到点事件），并在合规候选中按净收益择单。
 """
 
 from __future__ import annotations
@@ -265,6 +275,11 @@ class DriverRules:
         # attributed by the parse LLM). Lets execution treat constraints economically:
         # an order violating a rule is still worth taking when net > penalty.
         self.rule_penalties: dict[str, float] = {}
+        # Preferences the compile+audit loop could NOT fully express as structured
+        # rules. They are never silently dropped: each entry is injected into the
+        # decision prompt (with its penalty amount) so the decision LLM enforces
+        # it online. Entries: {"text": str, "penalty": float|None, "note": str}.
+        self.residual_constraints: list[dict[str, Any]] = []
 
     @property
     def day_rest_block(self) -> int:
@@ -1110,7 +1125,8 @@ class ModelDecisionService:
             else:  # cross-midnight -> split into tail-of-day + head-of-next
                 spans.append((ws, DAY_MINUTES))
                 spans.append((0, we - DAY_MINUTES))
-        if not spans and not rules.rest_window:
+        residuals = getattr(rules, "residual_constraints", []) or []
+        if not spans and not rules.rest_window and not residuals:
             return ""
 
         reminders: list[str] = []
@@ -1143,6 +1159,15 @@ class ModelDecisionService:
         if violations:
             parts.append(f"【历史自检】昨日检测到 {violations} 次在休息/禁驶时段出车的记录，"
                          "今日务必严格遵守上述时段，避免每日重复扣分。")
+        if residuals:
+            snippets = []
+            for rc in residuals[:4]:
+                t = str(rc.get("text", ""))
+                t = t if len(t) <= 60 else t[:60] + "…"
+                pen = rc.get("penalty")
+                snippets.append(f"「{t}」" + (f"(违约扣{int(pen)})" if pen else ""))
+            parts.append("【未结构化偏好·必须遵守】调度引擎无法自动执行以下偏好，决策时逐条核对："
+                         + "；".join(snippets))
         return "\n".join(parts)
 
     def _format_rules_for_llm(self, driver_id: str, rules: DriverRules, plan: dict, day: int) -> str:
@@ -1190,8 +1215,19 @@ class ModelDecisionService:
             recent_failed = list(failed_reasons.items())[-3:]
             lines.append("- 近期失败货源: " + "; ".join(f"{cid}:{reason}" for cid, reason in recent_failed))
 
-        # Add raw preference texts for context
-        prefs = self._get_active_preferences(driver_id)
+        # Residual (non-structured) constraints: the compile+audit loop could not
+        # express these as structured rules, so the decision LLM is the enforcer.
+        residuals = getattr(rules, "residual_constraints", []) or []
+        residual_texts = {rc.get("text", "") for rc in residuals}
+        if residuals:
+            lines.append("\n【必须遵守·未结构化偏好】以下偏好未被自动调度引擎覆盖，每次决策都必须逐条核对，违反会被扣罚:")
+            for rc in residuals:
+                pen = rc.get("penalty")
+                pen_txt = f"（违约每次扣{int(pen)}元）" if pen else ""
+                lines.append(f"  「{rc.get('text', '')}」{pen_txt}")
+
+        # Add raw preference texts for context (skip ones already shown above)
+        prefs = [p for p in self._get_active_preferences(driver_id) if p not in residual_texts]
         if prefs:
             lines.append("\n原始偏好文本:")
             for p in prefs:
@@ -2073,10 +2109,19 @@ class ModelDecisionService:
 
     # ------------------------------------------------------------- preferences
     def _ensure_rules(self, driver_id: str, status: dict[str, Any]) -> DriverRules:
-        # Re-parse and merge: preferences can be date-windowed and only become
-        # visible inside their window (e.g. 深圳 blackout, 盘库, 寿宴). The LLM is the
-        # primary parser (generalises to unseen drivers/wordings); it is re-invoked
-        # only when a *new* preference text appears. Regex is the offline fallback.
+        # Closed-loop preference compilation. Preferences can be date-windowed and
+        # only become visible inside their window (e.g. 深圳 blackout, 盘库, 寿宴),
+        # so this runs each step but only compiles *new* texts.
+        #
+        # Pipeline per new preference text:
+        #   1. compile: one LLM extraction call per text (per-text grounding —
+        #      semantic confirms check against the right text, no cross-pref noise);
+        #   2. audit & repair: a second LLM pass checks that every obligation in
+        #      the text is represented by the structured rules and patches misses
+        #      (replaces the old D001-phrasing regex supplement layer);
+        #   3. no silent drop: anything still not representable lands in
+        #      rules.residual_constraints and is enforced via the decision prompt.
+        # The regex parser remains only as an offline fallback (model unavailable).
         rules = self._rules.get(driver_id)
         if rules is None:
             rules = DriverRules()
@@ -2086,41 +2131,35 @@ class ModelDecisionService:
             (float(status.get("current_lat", 0.0)), float(status.get("current_lng", 0.0))),
         )
         prefs = status.get("preferences") or []
-        texts = [
-            (pref.get("content", "") if isinstance(pref, dict) else str(pref)) for pref in prefs
-        ]
-        texts = [t for t in texts if t.strip()]
+        items: list[tuple[str, Any]] = []
+        for pref in prefs:
+            if isinstance(pref, dict):
+                text = str(pref.get("content", "") or "")
+                penalty = pref.get("penalty_amount")
+            else:
+                text, penalty = str(pref), None
+            if text.strip():
+                items.append((text, penalty))
+        texts = [t for t, _ in items]
         seen = self._seen_prefs.setdefault(driver_id, set())
-        new_texts = [t for t in texts if t not in seen]
-        if not new_texts:
+        new_items = [(t, p) for t, p in items if t not in seen]
+        if not new_items:
             return rules
 
         before = self._rules_fingerprint(rules)
         coord_map = self._collect_coords(prefs)
-        penalties = [
-            (pref.get("penalty_amount") if isinstance(pref, dict) else None) for pref in prefs
-            if (pref.get("content", "") if isinstance(pref, dict) else str(pref)).strip()
-        ]
-        parsed_by_llm = self._llm_parse_preferences(driver_id, texts, rules, coord_map, penalties)
-        if not parsed_by_llm:
-            # offline / model unavailable: fall back to the deterministic regex parser.
-            for text in texts:
+        compiled: list[tuple[str, Any]] = []
+        for text, penalty in new_items:
+            if self._llm_parse_preferences(driver_id, [text], rules, coord_map, [penalty]):
+                compiled.append((text, penalty))
+            else:
+                # offline / model unavailable: deterministic regex fallback for
+                # this text only.
                 self._parse_one(text, rules, coord_map)
-            for text in texts:
                 self._supplement_basic_rules(text, rules)
-            for text in texts:
                 self._supplement_dated_events(text, rules, coord_map)
-        else:
-            # LLM succeeded: supplement with safe, high-confidence regex patterns
-            # for basic scalar rules that are easy to verify and unlikely to
-            # false-match (rest hours, rest window, off days, pickup cap,
-            # forbidden categories/regions with very specific trigger patterns).
-            for text in texts:
-                self._supplement_basic_rules(text, rules)
-            # Supplement dated events: detect date+coordinate patterns the LLM may
-            # have missed (e.g. wrong coords, missed events entirely).
-            for text in texts:
-                self._supplement_dated_events(text, rules, coord_map)
+        if compiled:
+            self._audit_preference_coverage(driver_id, compiled, rules, coord_map)
             # Cross-check LLM dated event coords against text-extracted coords.
             # If an LLM coord doesn't match any known coord, snap it to the
             # nearest known one (LLM often inverts or rounds coordinates).
@@ -2154,7 +2193,7 @@ class ModelDecisionService:
                 if _region_in_city(region, name):
                     rules.blackout_coords[region] = loc
                     break
-        seen.update(texts)
+        seen.update(t for t, _ in new_items)
         # Dedup avoid/forbidden AFTER supplement so regex-added items are also cleaned
         init_lat, init_lng = self._initial_position[driver_id]
         self._supplement_relative_allowed_regions(texts, rules, init_lat, init_lng)
@@ -2165,7 +2204,8 @@ class ModelDecisionService:
                 "parsed rules driver_id=%s rest=%s window=%s off=%s forbid_cat=%s avoid_cat=%s "
                 "forbid_reg=%s allowed_reg=%s required=%s pickup_max=%s haul_max=%s blackout=%s "
                 "dated_single=%s dated_route=%s no_drive=%s order_limit=%s home=%s "
-                "forbidden_zones=%d bounded=%s must_visit=%d first_order=%s category_targets=%s carryover=%s",
+                "forbidden_zones=%d bounded=%s must_visit=%d first_order=%s category_targets=%s carryover=%s "
+                "residual=%d",
                 driver_id,
                 rules.daily_rest_minutes,
                 rules.rest_window,
@@ -2189,6 +2229,7 @@ class ModelDecisionService:
                 rules.first_order_before_minute,
                 rules.monthly_category_targets,
                 rules.category_carryover_months,
+                len(rules.residual_constraints),
             )
         return rules
 
@@ -2391,6 +2432,199 @@ class ModelDecisionService:
                 return None
         return data if isinstance(data, dict) else None
 
+    # ------------------------------------------------- coverage audit & repair
+    _PREF_AUDIT_SYSTEM = (
+        "你是货运司机偏好「覆盖审计器」。调度引擎已把司机的自然语言偏好编译成结构化规则；"
+        "你逐条审计：每条偏好原文里的**全部约束**是否都已体现在 structured_rules 里。\n"
+        '输入 JSON: {"preferences":[原文...], "penalty_amounts":[违约扣款金额或null...], '
+        '"structured_rules":"已结构化规则清单"}\n'
+        "只输出一个 JSON 对象，禁止 markdown/解释：\n"
+        '{"audits":[{"index":偏好序号从0起,"covered":true/false,'
+        '"missing":"缺了什么(covered=false时填)","representable":true/false,'
+        '"patch":{仅含缺失部分的补丁字段}}]}\n\n'
+        "patch 可用字段（与抽取器一致，未缺失的不要填）：\n"
+        "daily_rest_hours; rest_window{start_hour,end_hour}; "
+        "no_drive_windows[{start_hour,end_hour}]（跨夜时 end_hour<start_hour）; off_days_min; "
+        "forbidden_categories[]; avoid_categories[]; forbidden_regions[]; allowed_regions[]; "
+        "pickup_max_km; haul_max_km; monthly_deadhead_max_km; daily_order_limit; "
+        "first_order_before_hour; monthly_category_targets[{month,category,min_orders,carryover}]; "
+        "home_rule{lat,lng,radius_km,home_by_hour,no_drive_until_hour}; "
+        "blackout[{region,dates[]}]; dated_single[{date,lat,lng,wait_minutes,before_hour}]; "
+        "dated_route[{date,stops[{lat,lng,wait_minutes,before_hour}]}]; "
+        "forbidden_zones[{lat,lng,radius_km}]; bounded_area{lat_min,lat_max,lng_min,lng_max}; "
+        "must_visit[{lat,lng,radius_km,required_days}]; required_region{region,min_days}\n\n"
+        "审计准则：\n"
+        "1) 漏一条「每日生效」约束（夜休/禁驶时段/回家）代价最高：重点核对时间窗是否齐全、起止时刻与原文一致。\n"
+        "2) 月度品类指标、整月休息天数、日期事件（某天到某地）逐条核对数字与日期。\n"
+        "3) 某约束无法用上述字段表达时：representable=false、patch 留空、missing 写明该约束原意。\n"
+        "4) penalty_amounts 金额越高的偏好越要逐字核对。\n"
+        "5) 已完整覆盖就 covered=true 且不输出 patch；拿不准时 covered=false 并给出 patch"
+        "（结构化引擎对重复规则免疫，宁可重复、不可漏掉）。"
+    )
+
+    def _describe_rules_for_audit(self, rules: DriverRules) -> str:
+        """Compact, complete human-readable dump of the structured rules so the
+        audit model can judge coverage. Must mention every populated field."""
+        lines: list[str] = []
+        if rules.daily_rest_minutes:
+            lines.append(f"每日连续休息≥{rules.daily_rest_minutes / 60:g}小时")
+        if rules.rest_window:
+            rs, re_ = rules.rest_window
+            lines.append(f"每日休息窗 {rs // 60:02d}:{rs % 60:02d}-{re_ // 60:02d}:{re_ % 60:02d}")
+        for ws, we in rules.no_drive_windows:
+            we_d = we % DAY_MINUTES
+            lines.append(f"每日禁驶(不接单不空驶) {ws // 60:02d}:{ws % 60:02d}-{we_d // 60:02d}:{we_d % 60:02d}")
+        if rules.off_days_min:
+            lines.append(f"整月完全不出车≥{rules.off_days_min}天")
+        if rules.forbidden_categories:
+            lines.append("禁运品类: " + "、".join(sorted(rules.forbidden_categories)))
+        if rules.avoid_categories:
+            lines.append("尽量避开品类: " + "、".join(sorted(rules.avoid_categories)))
+        if rules.forbidden_regions:
+            lines.append("禁接区域: " + "、".join(sorted(rules.forbidden_regions)))
+        if rules.allowed_regions:
+            lines.append("仅允许运营区域: " + "、".join(sorted(rules.allowed_regions)))
+        if rules.required_region:
+            reg, md = rules.required_region
+            lines.append(f"每月至少{md}天接「{reg}」的货")
+        if rules.pickup_max_km:
+            lines.append(f"赴装空驶≤{rules.pickup_max_km:g}km")
+        if rules.haul_max_km:
+            lines.append(f"单笔干线≤{rules.haul_max_km:g}km")
+        if rules.monthly_deadhead_max_km:
+            lines.append(f"月累计空驶≤{rules.monthly_deadhead_max_km:g}km")
+        if rules.daily_order_limit:
+            lines.append(f"每日接单≤{rules.daily_order_limit}单")
+        if rules.first_order_before_minute is not None:
+            m = rules.first_order_before_minute
+            lines.append(f"每日首单不晚于{m // 60:02d}:{m % 60:02d}")
+        for month_idx, targets in sorted(rules.monthly_category_targets.items()):
+            for cat, req in sorted(targets.items()):
+                carry = "(欠额结转下月)" if month_idx in rules.category_carryover_months else ""
+                lines.append(f"{_month_name(month_idx)}品类「{cat}」至少{req}单{carry}")
+        if rules.home_lat is not None:
+            hb = rules.home_by_minute
+            hb_txt = f"，每天{hb // 60:02d}:{hb % 60:02d}前到家" if hb is not None else ""
+            nd = rules.no_drive_until_minute
+            nd_txt = f"，次日{nd // 60:02d}:{nd % 60:02d}前不接单" if nd is not None else ""
+            lines.append(
+                f"回家规则: 家({rules.home_lat:.2f},{rules.home_lng or 0:.2f})"
+                f"半径{rules.home_radius_km:g}km{hb_txt}{nd_txt}"
+            )
+        for region, days in rules.blackout:
+            lines.append(f"{sorted(d + 1 for d in days)}号不去「{region}」")
+        for ev in rules.dated_single:
+            lines.append(
+                f"{ev['day'] + 1}号需到({ev['lat']:.2f},{ev['lng']:.2f})停留{ev['min_wait']}分钟"
+            )
+        for ev in rules.dated_route:
+            stops = "→".join(f"({s['lat']:.2f},{s['lng']:.2f})" for s in ev.get("stops", []))
+            lines.append(f"{ev['day'] + 1}号按序经过 {stops}")
+        for flat, flng, fr in rules.forbidden_zones:
+            lines.append(f"禁入圆区: 圆心({flat:.2f},{flng:.2f})半径{fr:g}km")
+        if rules.bounded_area:
+            la_min, la_max, ln_min, ln_max = rules.bounded_area
+            lines.append(f"仅允许运营矩形: 纬{la_min:.2f}-{la_max:.2f} 经{ln_min:.2f}-{ln_max:.2f}")
+        for mv in rules.must_visit:
+            lines.append(
+                f"每月至少{mv['required_days']}天到({mv['lat']:.2f},{mv['lng']:.2f})"
+                f"{mv.get('radius_km', 1.0):g}km内"
+            )
+        return "\n".join(lines) if lines else "（当前没有任何已结构化规则）"
+
+    def _audit_preference_coverage(
+        self,
+        driver_id: str,
+        compiled: list[tuple[str, Any]],
+        rules: DriverRules,
+        coord_map: dict[str, tuple[float, float]] | None = None,
+    ) -> None:
+        """Closed-loop verification: ask the model whether every obligation in
+        each compiled preference is represented by the structured rules; merge
+        repair patches for misses; record anything unrepresentable as a residual
+        constraint (enforced via the decision prompt — never silently dropped).
+
+        This replaces the old phrasing-specific regex supplement layer as the
+        recall mechanism, so unseen drivers/wordings generalise. Fail-open: if
+        the audit call is unavailable the compiled rules simply stand as-is.
+        """
+        texts = [t for t, _ in compiled]
+        penalties = [p for _, p in compiled]
+        payload: dict[str, Any] = {
+            "preferences": texts,
+            "penalty_amounts": penalties,
+            "structured_rules": self._describe_rules_for_audit(rules),
+        }
+        if coord_map:
+            payload["known_coordinates"] = {
+                name: {"lat": loc[0], "lng": loc[1]} for name, loc in coord_map.items()
+            }
+        msgs = [
+            {"role": "system", "content": self._PREF_AUDIT_SYSTEM},
+            {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+        ]
+        data: dict[str, Any] | None = None
+        for attempt in range(2):
+            req: dict[str, Any] = {"messages": msgs, "temperature": 0}
+            if attempt == 0:
+                req["response_format"] = {"type": "json_object"}
+            try:
+                resp = self._api.model_chat_completion(req)
+            except Exception as exc:
+                self._logger.info(
+                    "coverage audit attempt %d unavailable driver_id=%s err=%s",
+                    attempt, driver_id, exc,
+                )
+                continue
+            data = self._extract_json(resp)
+            if data is not None:
+                break
+        if data is None:
+            self._logger.info("coverage audit unavailable driver_id=%s (rules stand as-is)", driver_id)
+            return
+        audits = data.get("audits")
+        if not isinstance(audits, list):
+            return
+        for entry in audits:
+            if not isinstance(entry, dict):
+                continue
+            try:
+                idx = int(entry.get("index"))
+            except (TypeError, ValueError):
+                continue
+            if not (0 <= idx < len(texts)) or entry.get("covered") is True:
+                continue
+            text = texts[idx]
+            patch = entry.get("patch")
+            patched = False
+            if isinstance(patch, dict) and any(v for v in patch.values()):
+                try:
+                    self._merge_llm_rules(rules, patch, [text])
+                    patched = True
+                    self._logger.info(
+                        "coverage audit: repaired pref #%d driver_id=%s missing=%s",
+                        idx, driver_id, str(entry.get("missing", ""))[:120],
+                    )
+                except Exception as exc:
+                    self._logger.warning(
+                        "coverage audit: patch merge failed driver_id=%s err=%s", driver_id, exc
+                    )
+            if entry.get("representable") is False or not patched:
+                self._add_residual_constraint(
+                    rules, text, penalties[idx], str(entry.get("missing", ""))
+                )
+                self._logger.info(
+                    "coverage audit: pref #%d kept as residual constraint driver_id=%s",
+                    idx, driver_id,
+                )
+
+    @staticmethod
+    def _add_residual_constraint(rules: DriverRules, text: str, penalty: Any, note: str = "") -> None:
+        if any(rc.get("text") == text for rc in rules.residual_constraints):
+            return
+        pen = float(penalty) if isinstance(penalty, (int, float)) and penalty > 0 else None
+        rules.residual_constraints.append({"text": text, "penalty": pen, "note": note[:120]})
+
     # Suffixes / patterns that indicate the LLM put a *region* into forbidden_categories
     _REGION_HINT_RE = re.compile(
         r"(?:装货|卸货|目的)(?:地|地点)?在|"          # "卸货地在惠州"
@@ -2498,10 +2732,12 @@ class ModelDecisionService:
         same constraint with words not on a hard-coded whitelist. The model
         decides by meaning, so paraphrases / dialect / idioms all generalise.
 
-        Fail-safe: returns ``default`` (keep the rule) on any error, empty
-        text, or unparseable response. We only drop a rule when the model
-        clearly says it does not hold, so a flaky verifier never silently
-        discards a real constraint.
+        Fail-safe: returns ``default`` on any error, empty text, or
+        unparseable response. An explicit verdict from the model overrides the
+        default in BOTH directions — so a keyword-miss default of False can be
+        lifted by a clear "yes" (off-vocabulary phrasings generalise), while a
+        flaky/unavailable verifier never silently discards a real constraint
+        whose default is True.
         """
         if not all_text.strip():
             return default
@@ -2531,10 +2767,10 @@ class ModelDecisionService:
                 req.pop("response_format", None)
                 resp = self._api.model_chat_completion(req)
             data = self._extract_json(resp)
-            if isinstance(data, dict) and data.get("holds") is False:
-                verdict = False
+            if isinstance(data, dict) and isinstance(data.get("holds"), bool):
+                verdict = data["holds"]
         except Exception as exc:
-            self._logger.info("rule-confirm unavailable (keep rule) desc=%s err=%s", rule_desc, exc)
+            self._logger.info("rule-confirm unavailable (default=%s) desc=%s err=%s", default, rule_desc, exc)
             verdict = default
         cache[key] = verdict
         return verdict
@@ -2753,44 +2989,65 @@ class ModelDecisionService:
 
         # NOTE: avoid/forbidden dedup moved to _dedup_avoid_forbidden (runs after supplement)
 
-        # allowed_regions — only strong "operate within X" wording becomes a hard constraint.
-        if _text_has_any(_ALLOW_REGION_KW):
-            for ar in data.get("allowed_regions") or []:
-                if isinstance(ar, str) and ar.strip():
-                    self._add_allowed_region(rules, ar, all_text)
-        elif data.get("allowed_regions"):
-            self._logger.info("llm grounding: rejected allowed_regions (no strong region-limit keywords)")
+        # allowed_regions — semantic confirm replaces the keyword whitelist gate
+        # (keyword hit only remains as the offline default when the verifier is
+        # unavailable). _add_allowed_region still applies junk-name and
+        # text-support validation on top.
+        for ar in data.get("allowed_regions") or []:
+            if not (isinstance(ar, str) and ar.strip()):
+                continue
+            region = self._canonical_allowed_region(ar)
+            if not region:
+                continue
+            if self._confirm_rule_holds(
+                f"司机的运营范围被限定在「{region}」之内（装货地和卸货地都必须在该范围，不得出该范围接活）",
+                all_text,
+                default=_text_has_any(_ALLOW_REGION_KW),
+            ):
+                self._add_allowed_region(rules, ar, all_text)
+            else:
+                self._logger.info("llm semantic-confirm: dropped allowed_region '%s'", region)
 
-        # forbidden_zones — grounded + coordinate validation
-        if _text_has_any(_FZ_KW):
-            for fz in data.get("forbidden_zones") or []:
-                if not isinstance(fz, dict):
-                    continue
-                try:
-                    flat, flng, fr = float(fz["lat"]), float(fz["lng"]), float(fz.get("radius_km", 10))
-                except (TypeError, ValueError, KeyError):
-                    continue
-                if flat > 90 and flng < 90:
-                    flat, flng = flng, flat
-                # Validate coordinates are in China range
-                if not (18 <= flat <= 55 and 70 <= flng <= 140):
-                    self._logger.info("llm grounding: rejected forbidden_zone (%.2f,%.2f) out of range", flat, flng)
-                    continue
-                # Validate radius is reasonable (not too large)
-                if fr > 100:
-                    self._logger.info("llm grounding: clamped forbidden_zone radius %.0f→100 km", fr)
-                    fr = 100
-                rules.forbidden_zones.append((flat, flng, fr))
-        elif data.get("forbidden_zones"):
-            self._logger.info("llm grounding: rejected forbidden_zones (no keywords in text)")
+        # forbidden_zones — semantic confirm + coordinate validation
+        fz_default = _text_has_any(_FZ_KW)
+        for fz in data.get("forbidden_zones") or []:
+            if not isinstance(fz, dict):
+                continue
+            try:
+                flat, flng, fr = float(fz["lat"]), float(fz["lng"]), float(fz.get("radius_km", 10))
+            except (TypeError, ValueError, KeyError):
+                continue
+            if flat > 90 and flng < 90:
+                flat, flng = flng, flat
+            # Validate coordinates are in China range
+            if not (18 <= flat <= 55 and 70 <= flng <= 140):
+                self._logger.info("llm grounding: rejected forbidden_zone (%.2f,%.2f) out of range", flat, flng)
+                continue
+            # Validate radius is reasonable (not too large)
+            if fr > 100:
+                self._logger.info("llm grounding: clamped forbidden_zone radius %.0f→100 km", fr)
+                fr = 100
+            if not self._confirm_rule_holds(
+                f"司机禁止进入以({flat:.2f},{flng:.2f})为圆心、半径{fr:g}公里的区域",
+                all_text,
+                default=fz_default,
+            ):
+                self._logger.info("llm semantic-confirm: dropped forbidden_zone (%.2f,%.2f)", flat, flng)
+                continue
+            rules.forbidden_zones.append((flat, flng, fr))
 
-        # bounded_area — grounded + coordinate validation
+        # bounded_area — semantic confirm + coordinate validation
         ba = data.get("bounded_area")
         if isinstance(ba, dict) and rules.bounded_area is None:
-            # Require BOTH keyword AND explicit lat/lng numbers in the text
-            has_kw = _text_has_any(_BA_KW)
+            # Explicit lat/lng numbers must appear in the text (data gate, not a
+            # phrasing gate); the keyword hit is only the offline default.
             has_coords = bool(re.search(r'(?:纬度|经度|[纬经]\s*[0-9]|\d{2,3}\.\d)', all_text))
-            if has_kw and has_coords:
+            confirmed = has_coords and self._confirm_rule_holds(
+                "司机只允许在一个明确给出经纬度边界的矩形范围内运营",
+                all_text,
+                default=_text_has_any(_BA_KW),
+            )
+            if confirmed:
                 try:
                     la_min = float(ba["lat_min"])
                     la_max = float(ba["lat_max"])
@@ -2803,60 +3060,76 @@ class ModelDecisionService:
                         self._logger.info("llm grounding: rejected bounded_area (unreasonable range)")
                 except (TypeError, ValueError, KeyError):
                     pass
-            elif has_kw:
-                self._logger.info("llm grounding: rejected bounded_area (keywords found but no explicit coordinates)")
+            elif not has_coords:
+                self._logger.info("llm grounding: rejected bounded_area (no explicit coordinates in text)")
             else:
-                self._logger.info("llm grounding: rejected bounded_area (no keywords in text)")
+                self._logger.info("llm semantic-confirm: dropped bounded_area")
 
-        # must_visit — grounded + coordinate validation
-        if _text_has_any(_MV_KW):
-            has_coords = bool(re.search(r'\d{2,3}\.\d{1,}', all_text))
-            for mv in data.get("must_visit") or []:
-                if not isinstance(mv, dict):
-                    continue
-                try:
-                    mlat, mlng = float(mv["lat"]), float(mv["lng"])
-                    mrd = int(mv.get("required_days", 1))
-                    mr = float(mv.get("radius_km", 1.0))
-                except (TypeError, ValueError, KeyError):
-                    continue
-                if mlat > 90 and mlng < 90:
-                    mlat, mlng = mlng, mlat
-                # Validate coordinates
-                if not (18 <= mlat <= 55 and 70 <= mlng <= 140):
-                    self._logger.info("llm grounding: rejected must_visit (coords out of range: %.2f,%.2f)", mlat, mlng)
-                    continue
-                if not has_coords:
-                    self._logger.info("llm grounding: rejected must_visit (no explicit coords in text)")
-                    continue
-                rules.must_visit.append({"lat": mlat, "lng": mlng, "radius_km": mr, "required_days": mrd})
-        elif data.get("must_visit"):
-            self._logger.info("llm grounding: rejected must_visit (no keywords in text)")
+        # must_visit — semantic confirm + coordinate validation
+        mv_default = _text_has_any(_MV_KW)
+        has_mv_coords = bool(re.search(r'\d{2,3}\.\d{1,}', all_text))
+        for mv in data.get("must_visit") or []:
+            if not isinstance(mv, dict):
+                continue
+            try:
+                mlat, mlng = float(mv["lat"]), float(mv["lng"])
+                mrd = int(mv.get("required_days", 1))
+                mr = float(mv.get("radius_km", 1.0))
+            except (TypeError, ValueError, KeyError):
+                continue
+            if mlat > 90 and mlng < 90:
+                mlat, mlng = mlng, mlat
+            # Validate coordinates
+            if not (18 <= mlat <= 55 and 70 <= mlng <= 140):
+                self._logger.info("llm grounding: rejected must_visit (coords out of range: %.2f,%.2f)", mlat, mlng)
+                continue
+            if not has_mv_coords:
+                self._logger.info("llm grounding: rejected must_visit (no explicit coords in text)")
+                continue
+            if not self._confirm_rule_holds(
+                f"司机每月至少{mrd}天需要到达({mlat:.2f},{mlng:.2f})附近{mr:g}公里内",
+                all_text,
+                default=mv_default,
+            ):
+                self._logger.info("llm semantic-confirm: dropped must_visit (%.2f,%.2f)", mlat, mlng)
+                continue
+            rules.must_visit.append({"lat": mlat, "lng": mlng, "radius_km": mr, "required_days": mrd})
 
-        # haul_max_km — grounded
+        # haul_max_km — semantic confirm
         hm = data.get("haul_max_km")
         if isinstance(hm, (int, float)) and hm > 0:
-            if _text_has_any(_HAUL_KW):
+            if self._confirm_rule_holds(
+                f"司机单笔订单的运输距离（装货点到卸货点）不得超过{hm:g}公里",
+                all_text,
+                default=_text_has_any(_HAUL_KW),
+            ):
                 rules.haul_max_km = float(hm)
             else:
-                self._logger.info("llm grounding: rejected haul_max_km=%s (no keywords in text)", hm)
+                self._logger.info("llm semantic-confirm: dropped haul_max_km=%s", hm)
 
         # monthly_deadhead_max_km (keep as before — low risk, rarely hallucinated)
         mdh = data.get("monthly_deadhead_max_km")
         if isinstance(mdh, (int, float)) and mdh > 0:
             rules.monthly_deadhead_max_km = float(mdh)
 
-        # daily_order_limit — grounded
+        # daily_order_limit — semantic confirm
         dol = data.get("daily_order_limit")
-        if _text_has_any(_DOL_KW) and _text_has_any(_DOL_SCOPE_KW):
-            if isinstance(dol, (int, float)) and dol > 0:
-                rules.daily_order_limit = int(dol)
-            elif isinstance(dol, str):
-                dm = re.search(r'(\d+)', dol)
-                if dm:
-                    rules.daily_order_limit = int(dm.group(1))
-        elif dol is not None:
-            self._logger.info("llm grounding: rejected daily_order_limit=%s (no keywords in text)", dol)
+        dol_val: int | None = None
+        if isinstance(dol, (int, float)) and dol > 0:
+            dol_val = int(dol)
+        elif isinstance(dol, str):
+            dm = re.search(r'(\d+)', dol)
+            if dm:
+                dol_val = int(dm.group(1))
+        if dol_val is not None:
+            if self._confirm_rule_holds(
+                f"司机每天（同一天内）最多接{dol_val}单",
+                all_text,
+                default=_text_has_any(_DOL_KW) and _text_has_any(_DOL_SCOPE_KW),
+            ):
+                rules.daily_order_limit = dol_val
+            else:
+                self._logger.info("llm semantic-confirm: dropped daily_order_limit=%s", dol_val)
 
         # first_order_before_hour — grounded
         fob = data.get("first_order_before_hour")
@@ -2879,15 +3152,19 @@ class ModelDecisionService:
         # monthly_category_targets — grounded by category/target wording.
         self._merge_category_targets_from_llm(data, rules, all_text)
 
-        # home_rule — grounded + coordinate validation
-        # Require both home keywords AND explicit coordinates in text to reduce
-        # hallucination risk (home_rule with wrong coordinates is very costly).
+        # home_rule — semantic confirm + coordinate validation
+        # Explicit coordinates must appear in the text (data gate — a home_rule
+        # with hallucinated coordinates is very costly); the phrasing decision is
+        # made semantically, keyword hit only remains as the offline default.
         hr = data.get("home_rule")
         if isinstance(hr, dict) and rules.home_lat is None:
-            has_home_kw = _text_has_any(_HOME_KW)
             # Check if text contains explicit coordinate-like numbers (e.g., "23.10" or "(23.10,113.50)")
             has_coords_in_text = bool(re.search(r'\d{2,3}\.\d{1,}', all_text))
-            if has_home_kw and has_coords_in_text:
+            if has_coords_in_text and self._confirm_rule_holds(
+                "司机每天必须在规定时刻前回到自家/住所位置附近，且在次日规定时刻前不再接单或空驶（回家规则）",
+                all_text,
+                default=_text_has_any(_HOME_KW),
+            ):
                 try:
                     hlat, hlng = float(hr["lat"]), float(hr["lng"])
                 except (TypeError, ValueError, KeyError):
@@ -2908,10 +3185,10 @@ class ModelDecisionService:
                             rules.no_drive_until_minute = int(nduh) * 60
                     else:
                         self._logger.info("llm grounding: rejected home_rule (coordinates out of range: %.2f,%.2f)", hlat, hlng)
-            elif has_home_kw:
-                self._logger.info("llm grounding: rejected home_rule (keywords found but no explicit coordinates in text)")
+            elif not has_coords_in_text:
+                self._logger.info("llm grounding: rejected home_rule (no explicit coordinates in text)")
             else:
-                self._logger.info("llm grounding: rejected home_rule (no keywords in text)")
+                self._logger.info("llm semantic-confirm: dropped home_rule")
 
     @staticmethod
     def _month_to_idx(value: Any, default_idx: int | None = None) -> int | None:
@@ -3186,6 +3463,7 @@ class ModelDecisionService:
                 sorted(rules.avoid_categories),
                 {m: dict(sorted(v.items())) for m, v in sorted(rules.monthly_category_targets.items())},
                 sorted(rules.category_carryover_months),
+                sorted(rc.get("text", "") for rc in rules.residual_constraints),
             )
         )
 
