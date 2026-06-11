@@ -1,6 +1,6 @@
 """模型决策服务：依赖 `simkit.ports.SimulationApiPort`，由评测进程注入具体环境。
 
-架构（闭环偏好编译，面向未知司机泛化）：
+架构（闭环偏好编译 + 每日合规计划，面向未知司机泛化；偏好原文为第一公民）：
 
 1. 编译（LLM 优先，逐条）：每条自然语言偏好单独交给 LLM 抽取成结构化规则
    （时间窗 / 区域 / 品类 / 配额 / 日期事件…），逐字段做语义接地确认。
@@ -10,9 +10,15 @@
 3. 零静默丢弃：审计后仍无法用结构化字段表达的偏好，进入
    ``DriverRules.residual_constraints``，逐步注入决策 prompt（带违约金额），
    由决策 LLM 在线遵守——任何偏好都不会被悄悄丢掉。
-4. 执行：确定性调度器保证已结构化的偏好合规（每日休息 / 夜间休息窗 /
-   整月整休天数 / 禁接货类 / 禁接区域 / 必接区域 / 赴装空驶上限 /
-   特定日期到点事件），并在合规候选中按净收益择单。
+4. 每日合规计划层：每个仿真日开始时，把**偏好原文** + 当天日历（几月几号、
+   星期几）+ 月度合规进度交给 LLM，产出"今天"的具体约束（今日禁驶时段、
+   今日必须做/避免的事、品类缺口提醒）。任意措辞、任意条件式偏好（周末
+   不同时段、特定日期事件、月度结转）都在这一层被按天具象化，不依赖固定
+   schema 能否表达。计划层失效时自动退化为纯静态规则（fail-safe）。
+5. 确定性执行：调度器与各动作守卫使用"静态窗 ∪ 当日计划窗"的**有效禁驶窗**
+   硬性拦截违规动作（每日休息 / 夜间休息窗 / 整月整休天数 / 禁接货类 /
+   禁接区域 / 必接区域 / 赴装空驶上限 / 特定日期到点事件），并在合规候选中
+   按净收益择单。
 """
 
 from __future__ import annotations
@@ -21,6 +27,7 @@ import json
 import logging
 import math
 import re
+from datetime import datetime, timedelta
 from typing import Any
 
 from simkit.ports import SimulationApiPort
@@ -72,6 +79,30 @@ _ALLOWED_REGION_ALIASES = {
     "江浙沪皖": "长三角",
 }
 _RELATIVE_PROVINCE_REGIONS = ("上海", "江苏", "浙江", "安徽", "广东")
+
+
+_SIM_EPOCH = datetime(2026, 3, 1)
+_WEEKDAY_NAMES = ("一", "二", "三", "四", "五", "六", "日")
+
+
+def _calendar_for_day(day: int) -> tuple[str, str, bool]:
+    """(YYYY-MM-DD, 星期X, is_weekend) for a simulation day index."""
+    dt = _SIM_EPOCH + timedelta(days=int(day))
+    weekday = dt.weekday()
+    return dt.strftime("%Y-%m-%d"), f"星期{_WEEKDAY_NAMES[weekday]}", weekday >= 5
+
+
+def _windows_intersect(a: tuple[int, int], b: tuple[int, int]) -> bool:
+    """Whether two within-day windows overlap in time-of-day space.
+
+    Windows use the (start_min, end_min) convention where an overnight window
+    has end_min > DAY_MINUTES (e.g. 21:00→06:00 == (1260, 1800)), so plain
+    interval overlap must also be checked under ±1-day shifts.
+    """
+    for shift in (-DAY_MINUTES, 0, DAY_MINUTES):
+        if a[0] < b[1] + shift and a[1] > b[0] + shift:
+            return True
+    return False
 
 
 def _month_index_for_day(day: int) -> int:
@@ -280,6 +311,52 @@ class DriverRules:
         # decision prompt (with its penalty amount) so the decision LLM enforces
         # it online. Entries: {"text": str, "penalty": float|None, "note": str}.
         self.residual_constraints: list[dict[str, Any]] = []
+        # Per-day compliance directives produced by the LLM daily planner from
+        # the *raw* preference texts:
+        # day -> {"windows": [(sm, em), ...], "replace": bool, "notes": str}.
+        # These concretize calendar-conditional preferences (weekend shifts,
+        # dated events, month carryovers) that a static schema cannot express.
+        self.daily_directives: dict[int, dict[str, Any]] = {}
+
+    def no_drive_windows_for(self, day: int) -> list[tuple[int, int]]:
+        """Effective no-drive windows for one simulation day.
+
+        Default: union of the statically parsed windows and the day's planner
+        directive (additive == fail-safe; a missed daily window costs a daily
+        penalty, an extra one only costs a few idle hours).
+
+        A directive may *replace* the static set (e.g. weekend night rest that
+        starts later), but only when it acknowledges each standing constraint
+        and merely reshapes it: every static window must intersect some
+        directive window AND the directive's total coverage must be at least
+        half of the static coverage. A directive that silently drops or
+        trivializes a static window falls back to the additive union.
+        """
+        directive = self.daily_directives.get(int(day))
+        if not directive:
+            return list(self.no_drive_windows)
+        extra = [tuple(w) for w in (directive.get("windows") or [])]
+        if directive.get("replace") and extra:
+            static_cov = sum(e - s for s, e in self.no_drive_windows)
+            extra_cov = sum(e - s for s, e in extra)
+            if extra_cov * 2 >= static_cov and all(
+                any(_windows_intersect(sw, dw) for dw in extra)
+                for sw in self.no_drive_windows
+            ):
+                return extra
+        merged = list(self.no_drive_windows)
+        for w in extra:
+            if w not in merged:
+                merged.append(w)
+        return merged
+
+    def has_no_drive(self, day: int) -> bool:
+        return bool(self.no_drive_windows_for(day))
+
+    def has_any_no_drive(self) -> bool:
+        if self.no_drive_windows:
+            return True
+        return any(d.get("windows") for d in self.daily_directives.values())
 
     @property
     def day_rest_block(self) -> int:
@@ -499,6 +576,10 @@ class ModelDecisionService:
         # preference texts already fed to the parser (LLM is only re-invoked when a
         # new, date-windowed preference becomes visible).
         self._seen_prefs: dict[str, set[str]] = {}
+        # ordered raw preference records (content + penalty amount) — the daily
+        # compliance planner and the decision prompt always work from the raw
+        # text, never only from the parsed schema.
+        self._pref_records: dict[str, list[dict[str, Any]]] = {}
         self._initial_position: dict[str, tuple[float, float]] = {}
         # cargo_id -> metadata seen during scans; used to reconstruct monthly
         # accumulators from the authoritative decision history (see
@@ -645,6 +726,11 @@ class ModelDecisionService:
         lat = float(status["current_lat"])
         lng = float(status["current_lng"])
         day, tod = divmod(now, DAY_MINUTES)
+
+        # Daily compliance planning: concretize the raw NL preferences for
+        # *today* (calendar-aware) before any action is chosen. Fail-safe: on
+        # any failure the static parse stays in charge.
+        self._ensure_daily_directive(driver_id, rules, plan, day)
 
         # Try LLM-driven decision with history context
         action = None
@@ -879,7 +965,7 @@ class ModelDecisionService:
                     return self._take_order(cargo_id)
                 elif action_type == "wait" and "duration_minutes" in params:
                     dur = int(params["duration_minutes"])
-                    for ws, we in rules.no_drive_windows:
+                    for ws, we in rules.no_drive_windows_for(day):
                         if self._tod_in_window(tod, ws, we):
                             wait_until_window_end = self._minutes_until_window_end(tod, ws, we)
                             if wait_until_window_end > 0:
@@ -932,7 +1018,7 @@ class ModelDecisionService:
         """Extend waits touching a no-drive window until that window is fully covered."""
         start = int(now)
         end = start + max(1, int(duration))
-        if not rules.no_drive_windows:
+        if not rules.has_any_no_drive():
             return max(1, int(duration))
         changed = True
         while changed:
@@ -941,7 +1027,7 @@ class ModelDecisionService:
             last_day = (end - 1) // DAY_MINUTES + 1
             for day_idx in range(first_day, last_day + 1):
                 base = day_idx * DAY_MINUTES
-                for ws, we in rules.no_drive_windows:
+                for ws, we in rules.no_drive_windows_for(day_idx):
                     win_start = base + int(ws)
                     win_end = base + int(we)
                     if win_end <= win_start:
@@ -959,7 +1045,7 @@ class ModelDecisionService:
         day_start = day * DAY_MINUTES
         day_end = day_start + DAY_MINUTES
         hard_end = day_end
-        for ws, _we in rules.no_drive_windows:
+        for ws, _we in rules.no_drive_windows_for(day):
             ws_today = day_start + min(ws, DAY_MINUTES)
             if now < ws_today < hard_end:
                 hard_end = max(now, ws_today - _ORDER_DEADLINE_BUFFER_MIN)
@@ -972,13 +1058,13 @@ class ModelDecisionService:
 
     def _interval_overlaps_no_drive(self, rules: DriverRules, start: int, end: int) -> bool:
         """Whether an absolute minute interval touches a repeated no-drive window."""
-        if end <= start or not rules.no_drive_windows:
+        if end <= start or not rules.has_any_no_drive():
             return False
         first_day = start // DAY_MINUTES - 1
         last_day = (end - 1) // DAY_MINUTES + 1
         for day_idx in range(first_day, last_day + 1):
             day_base = day_idx * DAY_MINUTES
-            for ws, we in rules.no_drive_windows:
+            for ws, we in rules.no_drive_windows_for(day_idx):
                 win_start = day_base + int(ws)
                 win_end = day_base + int(we)
                 if win_end <= win_start:
@@ -1049,7 +1135,7 @@ class ModelDecisionService:
                 tag, finish, deadline, distance_km,
             )
             return None
-        guard_end = finish + (_ORDER_DEADLINE_BUFFER_MIN if rules.no_drive_windows else 0)
+        guard_end = finish + (_ORDER_DEADLINE_BUFFER_MIN if rules.has_no_drive(int(now) // DAY_MINUTES) else 0)
         if self._interval_overlaps_no_drive(rules, now, guard_end):
             self._logger.info(
                 "[%s] rejected reposition: no_drive overlap start=%d finish=%d target=(%.4f,%.4f)",
@@ -1073,7 +1159,10 @@ class ModelDecisionService:
         if cargo_id in plan.get("failed_cargo_ids", set()):
             self._logger.info("[LLM] rejected take_order: cargo_id=%s failed earlier", cargo_id)
             return False
-        if any(self._tod_in_window(now % DAY_MINUTES, ws, we) for ws, we in rules.no_drive_windows):
+        if any(
+            self._tod_in_window(now % DAY_MINUTES, ws, we)
+            for ws, we in rules.no_drive_windows_for(day)
+        ):
             self._logger.info("[LLM] rejected take_order: in no_drive_window tod=%d", now % DAY_MINUTES)
             return False
         match = None
@@ -1104,6 +1193,146 @@ class ModelDecisionService:
             return False
         return True
 
+    # ------------------------------------------------ daily compliance planner
+    _DIRECTIVE_SYSTEM = (
+        "你是货运司机的每日合规计划助手。司机有若干自然语言偏好（违反会扣钱），"
+        "你的任务是把这些偏好换算成【今天】的具体执行约束。偏好可能与日历有关"
+        "（如周末时段不同、特定日期有事、月度指标与上月欠额结转），必须结合今天的日期/星期推算。\n"
+        "只输出一个JSON对象：\n"
+        '{"no_drive_today":[{"start_hour":数字,"end_hour":数字}],'
+        '"replaces_default":true或false,'
+        '"today_plan":"100字内的今日执行要点",'
+        '"category_focus":"今天应优先承接的货物品类名或null"}\n'
+        "字段说明：\n"
+        '- no_drive_today: 今天（含跨入明晨）不得接单/空驶、只能停车等待的时段。'
+        '跨午夜用 end_hour<start_hour（如21点到次日6点→start_hour 21, end_hour 6）。半小时用0.5。'
+        '凡偏好含"某时段不出车/不揽货/收车/熄火/休息/睡觉/归家不动"含义且今天适用的，必须全部列出——'
+        '这类约束按天扣钱，漏一条代价极高；偏好中没有此类约束则给空数组。\n'
+        "- replaces_default: 仅当你确定 no_drive_today 已**完整**给出今天的全部时段约束、"
+        "且今天的时段与平日默认不同（例如偏好明确说周末可以晚些休息，而今天正是周末）时才填 true；"
+        "不确定时一律 false。\n"
+        "- today_plan: 简述今天必须做/必须避免的事（品类缺口与欠额、特定日期事项、区域或长途限制等）。\n"
+        "- category_focus: 若有月度品类指标且尚有缺口（含上月欠额需本月同品类补）则给出应优先的品类名，否则 null。\n"
+        "规则：宁可保守，绝不编造偏好中不存在的约束；时段必须严格按偏好原文给出的时刻推算。"
+    )
+
+    def _ensure_daily_directive(
+        self, driver_id: str, rules: DriverRules, plan: dict[str, Any], day: int
+    ) -> None:
+        """每日一次：把偏好原文按"今天"的日历具象化为可执行约束。
+
+        这是对未知司机泛化的核心层——它不依赖静态 schema 能否表达某类偏好，
+        只依赖偏好原文 + 今天的日期/星期/月度进度。产出的今日禁驶窗由
+        ``DriverRules.no_drive_windows_for`` 与各动作守卫确定性强制执行；
+        today_plan/category_focus 注入决策 prompt。任何失败都只是退回静态
+        解析结果（fail-safe），且每天最多重试 2 次、结果按天缓存，token
+        开销 ~1 次小调用/司机日。
+        """
+        records = self._pref_records.get(driver_id) or []
+        if not records:
+            return
+        # re-plan within the day only if new (date-windowed) preferences appear
+        cache_key = (int(day), len(records))
+        if plan.get("_directive_key") == cache_key:
+            return
+        attempts = plan.setdefault("_directive_attempts", {})
+        if attempts.get(cache_key, 0) >= 2:
+            return
+        attempts[cache_key] = attempts.get(cache_key, 0) + 1
+
+        date_str, weekday_str, is_weekend = _calendar_for_day(day)
+        month_idx = _month_index_for_day(day)
+        payload: dict[str, Any] = {
+            "今天": f"{date_str} {weekday_str}" + ("（周末）" if is_weekend else "（工作日）"),
+            "本月": _month_name(month_idx),
+            "偏好": [
+                {"原文": r["content"], "单次违约扣款": r.get("penalty_amount")}
+                for r in records
+            ],
+        }
+        if rules.no_drive_windows:
+            payload["平日默认禁驶时段"] = [
+                f"{ws // 60:02d}:{ws % 60:02d}-{(we % DAY_MINUTES) // 60:02d}:{(we % DAY_MINUTES) % 60:02d}"
+                for ws, we in rules.no_drive_windows
+            ]
+        targets = rules.monthly_category_targets.get(month_idx) or {}
+        if targets:
+            payload["本月品类指标"] = targets
+            payload["本月品类已接"] = plan.get("monthly_category_orders", {}).get(month_idx, {}) or {}
+        if month_idx > 0:
+            prev_targets = rules.monthly_category_targets.get(month_idx - 1) or {}
+            if prev_targets:
+                payload["上月品类指标"] = prev_targets
+                payload["上月品类实接"] = plan.get("monthly_category_orders", {}).get(month_idx - 1, {}) or {}
+
+        try:
+            req: dict[str, Any] = {
+                "messages": [
+                    {"role": "system", "content": self._DIRECTIVE_SYSTEM},
+                    {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+                ],
+                "temperature": 0,
+                "max_tokens": 300,
+                "response_format": {"type": "json_object"},
+            }
+            try:
+                resp = self._api.model_chat_completion(req)
+            except Exception:
+                req.pop("response_format", None)
+                resp = self._api.model_chat_completion(req)
+            data = self._extract_json(resp)
+        except Exception as exc:
+            self._logger.info(
+                "daily directive unavailable driver_id=%s day=%d err=%s", driver_id, day, exc
+            )
+            return
+        if not isinstance(data, dict):
+            self._logger.info("daily directive: no JSON driver_id=%s day=%d", driver_id, day)
+            return
+
+        windows: list[tuple[int, int]] = []
+        for w in data.get("no_drive_today") or []:
+            win = self._coerce_directive_window(w)
+            if win is not None and win not in windows:
+                windows.append(win)
+        notes_parts: list[str] = []
+        today_plan = str(data.get("today_plan") or "").strip()
+        if today_plan:
+            notes_parts.append(today_plan[:160])
+        focus = data.get("category_focus")
+        if isinstance(focus, str) and focus.strip() and focus.strip().lower() != "null":
+            notes_parts.append(f"今日优先品类：{focus.strip()}")
+        rules.daily_directives[int(day)] = {
+            "windows": windows,
+            "replace": bool(data.get("replaces_default")),
+            "notes": "；".join(notes_parts),
+        }
+        plan["_directive_key"] = cache_key
+        self._logger.info(
+            "daily directive driver_id=%s day=%d windows=%s replace=%s effective=%s notes=%s",
+            driver_id, day, windows, bool(data.get("replaces_default")),
+            rules.no_drive_windows_for(day), "；".join(notes_parts)[:120],
+        )
+
+    @staticmethod
+    def _coerce_directive_window(w: Any) -> tuple[int, int] | None:
+        if not isinstance(w, dict):
+            return None
+        try:
+            sh = float(w.get("start_hour"))
+            eh = float(w.get("end_hour"))
+        except (TypeError, ValueError):
+            return None
+        if not (0 <= sh <= 24 and 0 <= eh <= 24):
+            return None
+        sm = int(round(sh * 60)) % DAY_MINUTES
+        em = int(round(eh * 60)) % DAY_MINUTES
+        if em == sm:
+            return None
+        if em < sm:
+            em += DAY_MINUTES  # overnight window crossing into the next day
+        return (sm, em)
+
     def _compliance_self_audit(self, rules: "DriverRules", history: "DecisionHistory", day: int) -> str:
         """P3 — history-driven daily self-audit.
 
@@ -1114,17 +1343,23 @@ class ModelDecisionService:
         repeating for the rest of the season. Pure history lookup — no extra
         LLM call. Returns "" when the driver has no time-window constraints.
         """
-        # Build the within-day "must not drive" spans (minutes of day).
-        spans: list[tuple[int, int]] = []
-        block = rules.day_rest_block
-        if block > 0:
-            spans.append((0, block))
-        for ws, we in rules.no_drive_windows:
-            if we <= DAY_MINUTES:
-                spans.append((ws, we))
-            else:  # cross-midnight -> split into tail-of-day + head-of-next
-                spans.append((ws, DAY_MINUTES))
-                spans.append((0, we - DAY_MINUTES))
+        # Build the within-day "must not drive" spans (minutes of day) for a
+        # given day, from that day's *effective* (static ∪ directive) windows.
+        def _spans_for(d: int) -> list[tuple[int, int]]:
+            sp: list[tuple[int, int]] = []
+            block_ = rules.day_rest_block
+            if block_ > 0:
+                sp.append((0, block_))
+            for ws, we in rules.no_drive_windows_for(d):
+                if we <= DAY_MINUTES:
+                    sp.append((ws, we))
+                else:  # cross-midnight -> split into tail-of-day + head-of-next
+                    sp.append((ws, DAY_MINUTES))
+                    sp.append((0, we - DAY_MINUTES))
+            return sp
+
+        today_windows = rules.no_drive_windows_for(day)
+        spans = _spans_for(day)
         residuals = getattr(rules, "residual_constraints", []) or []
         if not spans and not rules.rest_window and not residuals:
             return ""
@@ -1133,13 +1368,14 @@ class ModelDecisionService:
         if rules.rest_window:
             rs, re_ = rules.rest_window
             reminders.append(f"休息 {rs // 60:02d}:{rs % 60:02d}-{re_ // 60:02d}:{re_ % 60:02d}")
-        for ws, we in rules.no_drive_windows:
+        for ws, we in today_windows:
             we_d = we % DAY_MINUTES
             reminders.append(f"禁驶 {ws // 60:02d}:{ws % 60:02d}-{we_d // 60:02d}:{we_d % 60:02d}")
 
         violations = 0
         prev = day - 1
-        if spans and prev >= 0:
+        prev_spans = _spans_for(prev) if prev >= 0 else []
+        if prev_spans:
             for e in history.recent_actions():
                 if e.get("day") != prev:
                     continue
@@ -1149,7 +1385,7 @@ class ModelDecisionService:
                 if act == "take_order" and e.get("accepted") is False:
                     continue
                 t = int(e.get("tod", -1))
-                if any(s <= t < en for s, en in spans):
+                if any(s <= t < en for s, en in prev_spans):
                     violations += 1
 
         parts: list[str] = []
@@ -1177,9 +1413,12 @@ class ModelDecisionService:
         if rules.rest_window:
             rs, re_ = rules.rest_window
             lines.append(f"- 休息窗口: {rs//60:02d}:{rs%60:02d}-{re_//60:02d}:{re_%60:02d}")
-        if rules.no_drive_windows:
-            for ws, we in rules.no_drive_windows:
-                lines.append(f"- 禁止接单/空驶: {ws//60:02d}:{ws%60:02d}-{we//60:02d}:{we%60:02d}")
+        for ws, we in rules.no_drive_windows_for(day):
+            we_d = we % DAY_MINUTES
+            lines.append(f"- 今日禁止接单/空驶: {ws//60:02d}:{ws%60:02d}-{we_d//60:02d}:{we_d%60:02d}")
+        directive = rules.daily_directives.get(day)
+        if directive and directive.get("notes"):
+            lines.append(f"- 今日合规计划: {directive['notes']}")
         if rules.forbidden_categories:
             lines.append(f"- 禁运品类: {', '.join(rules.forbidden_categories)}")
         if rules.forbidden_regions:
@@ -1236,8 +1475,11 @@ class ModelDecisionService:
         return "\n".join(lines)
 
     def _get_active_preferences(self, driver_id: str) -> list[str]:
-        """Get the active preference texts for the current day (from seen_prefs)."""
-        return list(self._seen_prefs.get(driver_id, set()))[:4]
+        """Raw preference texts seen so far, in stable first-seen order."""
+        records = self._pref_records.get(driver_id)
+        if records:
+            return [r["content"] for r in records][:6]
+        return sorted(self._seen_prefs.get(driver_id, set()))[:4]
 
     # --------------------------------------------------------------- scheduler
     def _schedule(self, driver_id, status, rules, plan, now, lat, lng) -> dict[str, Any]:
@@ -1322,8 +1564,8 @@ class ModelDecisionService:
                 return self._safe_wait(rules, now, day_end - now)
 
         # (D3) no_drive_windows: if current time-of-day falls inside a no-drive
-        # window, idle until the window ends.
-        for ws, we in rules.no_drive_windows:
+        # window (static or today's directive), idle until the window ends.
+        for ws, we in rules.no_drive_windows_for(day):
             if self._tod_in_window(tod, ws, we):
                 wait_min = self._minutes_until_window_end(tod, ws, we)
                 if wait_min > 0:
@@ -1416,7 +1658,8 @@ class ModelDecisionService:
         # the next day is an ordinary working day — never crossing into an off day,
         # blackout day or a dated-event day.
         hard_end = self._hard_order_deadline(rules, plan, now, day)
-        if rules.rest_window is None and not rules.no_drive_windows and rules.daily_rest_minutes > 0:
+        if (rules.rest_window is None and not rules.has_no_drive(day)
+                and not rules.has_no_drive(day + 1) and rules.daily_rest_minutes > 0):
             if self._next_day_is_ordinary(rules, plan, day):
                 hard_end = max(hard_end, day_end + (DAY_MINUTES - rules.day_rest_block))
         order = self._pick_order(driver_id, status, rules, plan, now, lat, lng, day, hard_end)
@@ -1913,7 +2156,7 @@ class ModelDecisionService:
         move_km = _haversine_km(lat, lng, slat, slng)
         arrival = now + (_travel_minutes(move_km) if move_km > 1e-6 else 0)
         if self._interval_overlaps_no_drive(
-            rules, now, arrival + (_ORDER_DEADLINE_BUFFER_MIN if rules.no_drive_windows else 0)
+            rules, now, arrival + (_ORDER_DEADLINE_BUFFER_MIN if rules.has_no_drive(now // DAY_MINUTES) else 0)
         ):
             return None
         load_window = cargo.get("load_time")
@@ -1930,7 +2173,7 @@ class ModelDecisionService:
         if finish > day_end:
             return None
         if self._interval_overlaps_no_drive(
-            rules, now, finish + (_ORDER_DEADLINE_BUFFER_MIN if rules.no_drive_windows else 0)
+            rules, now, finish + (_ORDER_DEADLINE_BUFFER_MIN if rules.has_no_drive(now // DAY_MINUTES) else 0)
         ):
             return None
         haul_km = _haversine_km(slat, slng, elat, elng)
@@ -2013,7 +2256,7 @@ class ModelDecisionService:
         pickup_min = _travel_minutes(pickup_km) if pickup_km > 1e-6 else 0
         arrival = now + pickup_min
         if self._interval_overlaps_no_drive(
-            rules, now, arrival + (_ORDER_DEADLINE_BUFFER_MIN if rules.no_drive_windows else 0)
+            rules, now, arrival + (_ORDER_DEADLINE_BUFFER_MIN if rules.has_no_drive(now // DAY_MINUTES) else 0)
         ):
             return None
         load_window = cargo.get("load_time")
@@ -2029,7 +2272,7 @@ class ModelDecisionService:
         if finish > day_end:
             return None  # don't cross midnight (keeps rest windows clean)
         if self._interval_overlaps_no_drive(
-            rules, now, finish + (_ORDER_DEADLINE_BUFFER_MIN if rules.no_drive_windows else 0)
+            rules, now, finish + (_ORDER_DEADLINE_BUFFER_MIN if rules.has_no_drive(now // DAY_MINUTES) else 0)
         ):
             return None
         haul_km = _haversine_km(slat, slng, elat, elng)
@@ -2145,6 +2388,20 @@ class ModelDecisionService:
         new_items = [(t, p) for t, p in items if t not in seen]
         if not new_items:
             return rules
+
+        # Keep the raw preference records (ordered, with penalty amounts) for
+        # the daily compliance planner and the decision prompt.
+        records = self._pref_records.setdefault(driver_id, [])
+        known_contents = {r["content"] for r in records}
+        for pref in prefs:
+            content = (pref.get("content", "") if isinstance(pref, dict) else str(pref)).strip()
+            if not content or content in known_contents:
+                continue
+            known_contents.add(content)
+            records.append({
+                "content": content,
+                "penalty_amount": (pref.get("penalty_amount") if isinstance(pref, dict) else None),
+            })
 
         before = self._rules_fingerprint(rules)
         coord_map = self._collect_coords(prefs)
