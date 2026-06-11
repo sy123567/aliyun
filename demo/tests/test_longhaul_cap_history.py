@@ -101,10 +101,15 @@ def test_query_cargo_wrapper_caches_metadata() -> None:
     assert svc._cargo_meta["7"]["cargo_name"] == "水果", svc._cargo_meta
 
 
-def _validate_with_net(svc, plan, *, cost_time, net):  # noqa: ANN001, ANN201
+def _validate_with_net(svc, plan, *, cost_time, net, cap=5):  # noqa: ANN001, ANN201
     """Drive _validate_llm_take_order with a controlled marginal net via a stub
-    _evaluate_cargo, so we test only the soft long-haul gate (not geo feasibility)."""
+    _evaluate_cargo, so we test only the soft long-haul gate (not geo feasibility).
+
+    The long-haul cap is preference-driven now (no global hard-coded rule), so
+    the test driver's parsed rules carry the cap explicitly (cap=None simulates
+    a driver who never asked for one)."""
     rules = DriverRules()
+    rules.longhaul_max_orders = cap
     items = [{"cargo": {"cargo_id": "99", "cost_time_minutes": cost_time, "cargo_name": "",
                         "start": {"city": ""}, "end": {"city": ""}}}]
     svc._evaluate_cargo = lambda *a, **k: (float(net), False, 600, 0.0)  # type: ignore[assignment]
@@ -142,6 +147,27 @@ def test_under_cap_longhaul_is_accepted_regardless_of_net() -> None:
     svc = ModelDecisionService(_StubApi(records=[]))
     plan = {"monthly_longhual": {0: 4}}
     assert _validate_with_net(svc, plan, cost_time=600, net=800) is True
+
+
+def test_driver_without_longhaul_preference_has_no_cap() -> None:
+    """A driver whose preferences never mention a long-haul cap must not be
+    capped by any hard-coded default (the rule is preference-driven)."""
+    svc = ModelDecisionService(_StubApi(records=[]))
+    plan = {"monthly_longhual": {0: 20}}
+    assert _validate_with_net(svc, plan, cost_time=600, net=800, cap=None) is True
+
+
+def test_parsed_longhaul_cap_is_merged_from_llm_output() -> None:
+    """The compile step must turn monthly_longhaul_cap into DriverRules fields."""
+    svc = ModelDecisionService(_StubApi(records=[]))
+    rules = DriverRules()
+    svc._merge_llm_rules(
+        rules,
+        {"monthly_longhaul_cap": {"max_orders": 5, "min_hours": 8}},
+        ["不爱接那种一跑就是大半天的远活，每个月超过八小时的长途只能接最多5单，多一单扣一次。"],
+    )
+    assert rules.longhaul_max_orders == 5, rules.longhaul_max_orders
+    assert rules.longhaul_threshold_minutes == 480, rules.longhaul_threshold_minutes
 
 
 def test_empty_history_leaves_plan_untouched() -> None:

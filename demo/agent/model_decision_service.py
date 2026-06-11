@@ -1,8 +1,22 @@
 """模型决策服务：依赖 `simkit.ports.SimulationApiPort`，由评测进程注入具体环境。
 
-策略：在大模型解析司机自然语言偏好的基础上，用确定性调度器保证偏好合规
-（每日休息 / 夜间休息窗 / 整月整休天数 / 禁接货类 / 禁接区域 / 必接区域 /
-赴装空驶上限 / 特定日期到点事件），并在合规候选中按净收益择单。
+架构（编译 → 审计修复 → 通用约束引擎 → 运行期自检，面向未知司机泛化）：
+
+1. 偏好编译（LLM 两遍）：第一遍 temperature=0 把自然语言偏好抽取成通用约束
+   IR（DriverRules）；第二遍「审计修复」把原文 + 抽取结果一起交给模型，
+   找漏（尤其每日生效的时段约束、月度品类指标）、删多（臆造约束）、纠值，
+   输出修正后的完整 IR。不再依赖措辞关键词白名单接地，也不再对每条规则
+   单独发一次确认调用 —— 换措辞不丢规则，token 也更省。
+2. 合并层只做确定性结构校验（坐标范围 / 经纬互换 / 半径钳制 / 时刻合法性），
+   不用任何措辞关键词决定取舍。
+3. 通用约束引擎：确定性调度器只读 IR 执行（休息窗 / 禁驶窗 / 整休天数 /
+   禁接货类与区域 / 必接区域 / 空驶上限 / 长途单数上限 / 日期事件 …），
+   引擎本身不含任何特定司机（品类名 / 地名 / 指标数）的硬编码分支。
+4. 运行期自检闭环：每步从权威决策历史重建月度计数；每天把硬时间窗 +
+   昨日违规扫描置顶到决策 prompt；决策 prompt 始终携带偏好原文，即便
+   编译有遗漏，决策模型仍能按原文兜底合规。
+5. 正则解析只作为「模型完全不可用」时的离线降级路径，绝不在线上叠加，
+   避免样例措辞专属的正则在未知司机文本上误触发。
 """
 
 from __future__ import annotations
@@ -20,13 +34,13 @@ MONTH_DAYS = 92
 SPEED_KM_PER_HOUR = 60.0
 EARTH_RADIUS_KM = 6371.0
 COST_PER_KM = 1.5
-# Monthly long-haul (>8h haul) cap and the per-order penalty for exceeding it.
-# The cap is *soft*: exceeding it only costs LONGHAUL_PENALTY of net income per
-# extra order, so taking one is still worth it when the order's own net income
-# beats the penalty. Threshold/cap/penalty match the scorer
-# (calc_monthly_income._eval_monthly_long_haul_cap).
+# Default parameters for a *parsed* monthly long-haul cap rule. The cap itself
+# is preference-driven (DriverRules.longhaul_max_orders, extracted from the
+# driver's own text) -- drivers without such a preference have NO cap. The cap
+# is *soft*: exceeding it only costs the per-violation penalty of net income
+# per extra order, so taking one is still worth it when the order's own net
+# income beats the penalty.
 LONGHAUL_MINUTES = 480
-LONGHAUL_CAP = 5
 LONGHAUL_PENALTY = 1000.0
 # Minimum remaining minutes in the day worth attempting an anti-stranding reposition:
 # below this there is no time to relocate and still complete an order before day end.
@@ -261,6 +275,11 @@ class DriverRules:
         self.first_order_before_minute: int | None = None
         self.monthly_category_targets: dict[int, dict[str, int]] = {}
         self.category_carryover_months: set[int] = set()
+        # Monthly long-haul order cap, parsed from the driver's own preference
+        # ("每月超过8小时的长途最多接N单" 之类). None = the driver never asked
+        # for one, so no cap is enforced (no hard-coded per-driver rule).
+        self.longhaul_max_orders: int | None = None
+        self.longhaul_threshold_minutes: int = LONGHAUL_MINUTES
         # rule kind -> per-violation penalty amount (from preference penalty_amounts,
         # attributed by the parse LLM). Lets execution treat constraints economically:
         # an order violating a rule is still worth taking when net > penalty.
@@ -379,7 +398,10 @@ class DecisionHistory:
             longhual = plan.get("monthly_longhual", {}).get(month_idx, 0)
             cat_orders = plan.get("monthly_category_orders", {}).get(month_idx, {}) or {}
             lines.append(f"累计接单: {total_orders}单 (本{month_name}已接{month_orders}单)")
-            lines.append(f"{month_name}长途(>8h): {longhual}/{LONGHAUL_CAP}单上限")
+            lh_cap = plan.get("_longhaul_cap")
+            if lh_cap:
+                lh_hours = int(plan.get("_longhaul_threshold_min", LONGHAUL_MINUTES)) // 60
+                lines.append(f"{month_name}长途(>{lh_hours}h): {longhual}/{lh_cap}单上限")
             if cat_orders:
                 top = sorted(cat_orders.items(), key=lambda x: -x[1])[:5]
                 lines.append(f"{month_name}品类接单: " + ", ".join(f"{c}:{n}单" for c, n in top))
@@ -484,6 +506,9 @@ class ModelDecisionService:
         # preference texts already fed to the parser (LLM is only re-invoked when a
         # new, date-windowed preference becomes visible).
         self._seen_prefs: dict[str, set[str]] = {}
+        # same texts in first-seen order (the set above has no stable order),
+        # used to surface the verbatim preferences in every decision prompt.
+        self._pref_texts: dict[str, list[str]] = {}
         self._initial_position: dict[str, tuple[float, float]] = {}
         # cargo_id -> metadata seen during scans; used to reconstruct monthly
         # accumulators from the authoritative decision history (see
@@ -537,6 +562,7 @@ class ModelDecisionService:
         if not records:
             return
         rules = self._rules.get(driver_id)
+        longhaul_threshold = rules.longhaul_threshold_minutes if rules is not None else LONGHAUL_MINUTES
         plan["monthly_longhual"] = {}
         plan["monthly_category_orders"] = {}
         plan["monthly_deadhead_km"] = {}
@@ -572,7 +598,7 @@ class ModelDecisionService:
             plan["total_deadhead_km"] += pickup_deadhead
             plan["monthly_deadhead_km"][month_idx] = plan["monthly_deadhead_km"].get(month_idx, 0.0) + pickup_deadhead
             meta = self._cargo_meta.get(cargo_id, {})
-            if int(meta.get("cost_time_minutes", 0) or 0) > 480:
+            if int(meta.get("cost_time_minutes", 0) or 0) > longhaul_threshold:
                 plan["monthly_longhual"][month_idx] = plan["monthly_longhual"].get(month_idx, 0) + 1
             self._track_category_order(plan, rules, month_idx, str(meta.get("cargo_name", "")))
             city = str(meta.get("start_city", "") or "")
@@ -626,6 +652,9 @@ class ModelDecisionService:
         # Preferences may only become visible inside their date window, so the off-day
         # set is recomputed each step from the rules known so far.
         plan["off_days"] = self._plan_off_days(rules)
+        # Expose the (preference-driven) long-haul cap to the history summary.
+        plan["_longhaul_cap"] = rules.longhaul_max_orders
+        plan["_longhaul_threshold_min"] = rules.longhaul_threshold_minutes
         now = int(status["simulation_progress_minutes"])
         lat = float(status["current_lat"])
         lng = float(status["current_lng"])
@@ -786,8 +815,8 @@ class ModelDecisionService:
             '- reposition: 空驶到新位置。参数: {"latitude": 纬度, "longitude": 经度}。'
             '当附近无目标品类货源时，主动移动到可能有货的区域（根据地理常识判断）\n\n'
             "重要规则：\n"
-            "- 在司机自己的休息/禁驶时段内不得接单或空驶，只能wait(具体时段见下方【硬约束】与偏好规则，不同司机时段不同，不要假设固定21:00-06:00)；空驶须在该时段开始前结束\n"
-            "- 每月长途(>8h)软上限5单：超出每单扣1000，但只要该单净收益明显大于1000就仍应接\n"
+            "- 在司机自己的休息/禁驶时段内不得接单或空驶，只能wait(具体时段见下方【硬约束】与偏好规则，不同司机时段不同，不要假设任何固定时段)；空驶须在该时段开始前结束\n"
+            "- 司机的全部约束以下方偏好规则与原始偏好文本为准；若规则摘要与原文冲突，以原文为准\n"
             "- 不要连续wait超过2次！如果当前货源不合适，应该reposition到新区域寻找更好货源\n"
             "- 品类指标很重要：未达标会有高额罚款。优先接指标品类的货\n"
             "- 只能从候选货源列表里选 cargo_id；候选为空或都不合适就 wait/reposition\n"
@@ -799,7 +828,7 @@ class ModelDecisionService:
         month_deadhead = plan.setdefault("monthly_deadhead_km", {}).get(month_idx, 0.0)
         cat_warning = ""
         if cat_target and cat_needed > 0:
-            cat_warning = f"\n⚠️ 品类指标警告: 本月需要'{cat_target}'至少12单，还差{cat_needed}单！优先接此品类。\n"
+            cat_warning = f"\n⚠️ 品类指标警告: 本月品类'{cat_target}'的接单指标还差{cat_needed}单！优先接此品类。\n"
 
         # P3: history-driven daily compliance self-audit (hard time-windows +
         # any previous-day in-window driving). Placed up top so it anchors the
@@ -1079,10 +1108,15 @@ class ModelDecisionService:
             self._logger.info("[LLM] rejected take_order: cargo_id=%s failed deterministic feasibility", cargo_id)
             return False
         net, _touches_required, _occupied, _pickup_km = ev
-        # Long-haul cap is soft (net maximization): only reject an over-cap >8h
-        # order when its net income does not cover the penalty it would incur.
+        # The parsed long-haul cap is soft (net maximization): only reject an
+        # over-cap long-haul order when its net does not cover the penalty.
         cost_time = int(cargo.get("cost_time_minutes", 0) or 0)
-        if cost_time > LONGHAUL_MINUTES and longhual_count >= LONGHAUL_CAP and net <= LONGHAUL_PENALTY:
+        if (
+            rules.longhaul_max_orders is not None
+            and cost_time > rules.longhaul_threshold_minutes
+            and longhual_count >= rules.longhaul_max_orders
+            and net <= rules.rule_penalties.get("longhaul", LONGHAUL_PENALTY)
+        ):
             self._logger.info(
                 "[LLM] rejected take_order: over long-haul cap and net=%.0f<=penalty month=%d", net, month_idx
             )
@@ -1173,14 +1207,18 @@ class ModelDecisionService:
 
         # Category targets with progress
         cat_orders = plan.get("monthly_category_orders", {}).get(month_idx, {})
-        longhual = plan.get("monthly_longhual", {}).get(month_idx, 0)
-        if longhual >= LONGHAUL_CAP:
-            lines.append(
-                f"- 本月长途(>8h): {longhual}单 (已达{LONGHAUL_CAP}单上限; 再接每单扣{int(LONGHAUL_PENALTY)}罚分，"
-                f"仅当该单净利润>{int(LONGHAUL_PENALTY)}才值得接)"
-            )
-        else:
-            lines.append(f"- 本月长途(>8h): {longhual}/{LONGHAUL_CAP}单上限 (超限后每单扣{int(LONGHAUL_PENALTY)})")
+        if rules.longhaul_max_orders is not None:
+            longhual = plan.get("monthly_longhual", {}).get(month_idx, 0)
+            lh_cap = rules.longhaul_max_orders
+            lh_hours = rules.longhaul_threshold_minutes // 60
+            lh_penalty = int(rules.rule_penalties.get("longhaul", LONGHAUL_PENALTY))
+            if longhual >= lh_cap:
+                lines.append(
+                    f"- 本月长途(>{lh_hours}h): {longhual}单 (已达{lh_cap}单上限; 再接每单扣{lh_penalty}罚分，"
+                    f"仅当该单净利润>{lh_penalty}才值得接)"
+                )
+            else:
+                lines.append(f"- 本月长途(>{lh_hours}h): {longhual}/{lh_cap}单上限 (超限后每单扣{lh_penalty})")
         lines.append(f"- 本月品类接单: {json.dumps(cat_orders, ensure_ascii=False)}")
         targets = getattr(rules, "monthly_category_targets", {}).get(month_idx, {})
         if targets:
@@ -1190,18 +1228,20 @@ class ModelDecisionService:
             recent_failed = list(failed_reasons.items())[-3:]
             lines.append("- 近期失败货源: " + "; ".join(f"{cid}:{reason}" for cid, reason in recent_failed))
 
-        # Add raw preference texts for context
+        # Add raw preference texts for context. They are the ultimate source of
+        # truth: even if compilation missed or garbled a rule, the decision
+        # model can still ground its choice on the verbatim text.
         prefs = self._get_active_preferences(driver_id)
         if prefs:
-            lines.append("\n原始偏好文本:")
+            lines.append("\n原始偏好文本(完整、以此为准):")
             for p in prefs:
                 lines.append(f"  「{p}」")
 
         return "\n".join(lines)
 
     def _get_active_preferences(self, driver_id: str) -> list[str]:
-        """Get the active preference texts for the current day (from seen_prefs)."""
-        return list(self._seen_prefs.get(driver_id, set()))[:4]
+        """All preference texts seen so far, in first-seen order."""
+        return list(self._pref_texts.get(driver_id, []))[:8]
 
     # --------------------------------------------------------------- scheduler
     def _schedule(self, driver_id, status, rules, plan, now, lat, lng) -> dict[str, Any]:
@@ -1572,16 +1612,22 @@ class ModelDecisionService:
             if rules.monthly_deadhead_max_km is not None:
                 if month_deadhead + pkm > rules.monthly_deadhead_max_km:
                     return
-            # [OPT] Long-haul cap is a *soft* limit. Exceeding 5 >8h orders in a
-            # month costs LONGHAUL_PENALTY of net each, so instead of hard-rejecting
-            # we subtract the penalty from the order's value: it is still picked
-            # when its net beats the penalty (net maximization), and is correctly
-            # deprioritised otherwise. Threshold uses cost_time (the haul time the
-            # scorer counts), not the full occupied time.
+            # [OPT] The (parsed, preference-driven) long-haul cap is a *soft*
+            # limit. Exceeding it costs the per-violation penalty of net each,
+            # so instead of hard-rejecting we subtract the penalty from the
+            # order's value: it is still picked when its net beats the penalty
+            # (net maximization), and is correctly deprioritised otherwise.
+            # Threshold uses cost_time (the haul time the scorer counts), not
+            # the full occupied time. Drivers without such a preference have no
+            # cap at all.
             cost_time = int(cargo.get("cost_time_minutes", 0))
             eff_net = net
-            if cost_time > LONGHAUL_MINUTES and longhual_count >= LONGHAUL_CAP:
-                eff_net = net - LONGHAUL_PENALTY
+            if (
+                rules.longhaul_max_orders is not None
+                and cost_time > rules.longhaul_threshold_minutes
+                and longhual_count >= rules.longhaul_max_orders
+            ):
+                eff_net = net - rules.rule_penalties.get("longhaul", LONGHAUL_PENALTY)
                 if eff_net <= 0:
                     return
             score = eff_net / occupied
@@ -1659,13 +1705,14 @@ class ModelDecisionService:
             )
             return None
         latest_net, _latest_required, latest_occupied, latest_pickup_km = latest_ev
-        # Soft long-haul cap: keep an over-cap >8h order only if its net beats the
-        # penalty (consistent with _score_item / _validate_llm_take_order).
+        # Soft long-haul cap: keep an over-cap long-haul order only if its net
+        # beats the penalty (consistent with _score_item / _validate_llm_take_order).
         latest_cost_time = int(best.get("cost_time_minutes", 0) or 0)
         if (
-            latest_cost_time > LONGHAUL_MINUTES
-            and longhual_count >= LONGHAUL_CAP
-            and latest_net - LONGHAUL_PENALTY <= 0
+            rules.longhaul_max_orders is not None
+            and latest_cost_time > rules.longhaul_threshold_minutes
+            and longhual_count >= rules.longhaul_max_orders
+            and latest_net - rules.rule_penalties.get("longhaul", LONGHAUL_PENALTY) <= 0
         ):
             return None
         if rules.monthly_deadhead_max_km is not None:
@@ -2094,6 +2141,8 @@ class ModelDecisionService:
         new_texts = [t for t in texts if t not in seen]
         if not new_texts:
             return rules
+        ordered = self._pref_texts.setdefault(driver_id, [])
+        ordered.extend(new_texts)
 
         before = self._rules_fingerprint(rules)
         coord_map = self._collect_coords(prefs)
@@ -2111,16 +2160,12 @@ class ModelDecisionService:
             for text in texts:
                 self._supplement_dated_events(text, rules, coord_map)
         else:
-            # LLM succeeded: supplement with safe, high-confidence regex patterns
-            # for basic scalar rules that are easy to verify and unlikely to
-            # false-match (rest hours, rest window, off days, pickup cap,
-            # forbidden categories/regions with very specific trigger patterns).
-            for text in texts:
-                self._supplement_basic_rules(text, rules)
-            # Supplement dated events: detect date+coordinate patterns the LLM may
-            # have missed (e.g. wrong coords, missed events entirely).
-            for text in texts:
-                self._supplement_dated_events(text, rules, coord_map)
+            # LLM compile (extract + review) succeeded. Deliberately DO NOT run
+            # the regex supplement layer here: its patterns are tuned to the
+            # sample drivers' phrasing and can mis-fire on unknown drivers'
+            # wording (adding spurious blackouts/limits/events the deterministic
+            # engine would then faithfully execute). It remains available only
+            # as the offline fallback above when the model is unreachable.
             # Cross-check LLM dated event coords against text-extracted coords.
             # If an LLM coord doesn't match any known coord, snap it to the
             # nearest known one (LLM often inverts or rounds coordinates).
@@ -2165,7 +2210,8 @@ class ModelDecisionService:
                 "parsed rules driver_id=%s rest=%s window=%s off=%s forbid_cat=%s avoid_cat=%s "
                 "forbid_reg=%s allowed_reg=%s required=%s pickup_max=%s haul_max=%s blackout=%s "
                 "dated_single=%s dated_route=%s no_drive=%s order_limit=%s home=%s "
-                "forbidden_zones=%d bounded=%s must_visit=%d first_order=%s category_targets=%s carryover=%s",
+                "forbidden_zones=%d bounded=%s must_visit=%d first_order=%s category_targets=%s carryover=%s "
+                "longhaul_cap=%s/%smin",
                 driver_id,
                 rules.daily_rest_minutes,
                 rules.rest_window,
@@ -2189,6 +2235,8 @@ class ModelDecisionService:
                 rules.first_order_before_minute,
                 rules.monthly_category_targets,
                 rules.category_carryover_months,
+                rules.longhaul_max_orders,
+                rules.longhaul_threshold_minutes,
             )
         return rules
 
@@ -2241,7 +2289,9 @@ class ModelDecisionService:
         '- daily_order_limit: 每天最多接几单（整数或 null）\n'
         '- first_order_before_hour: 每天首单不得晚于几点（整数或 null）\n'
         '- monthly_category_targets: 月度品类接单指标数组 [{"month":3-5整数,"category":"货物品类","min_orders":整数,"carryover":布尔}]。\n'
-        '  适用于"四月水果必须接满十二单""本月建材至少12单""欠的单数下月补"。\n'
+        '  适用于"某月某品类必须接满N单""本月某类货至少N单""欠的单数下月补"。\n'
+        '- monthly_longhaul_cap: 每月长途单数上限 {"max_orders":整数,"min_hours":小时数}（或 null）。\n'
+        '  适用于"每个月超过X小时的长途最多只能接N单，多一单扣一次"之类约束。\n'
         '- home_rule: 回家规则 {"lat":纬度,"lng":经度,"radius_km":半径,"home_by_hour":几点前到家,"no_drive_until_hour":次日几点前不接单}（或 null）\n'
         '  适用于"每天X点前须在自家位置Y公里内，到次日Z点前不接单不空跑"之类约束。\n'
         '- blackout: 指定日期不去某地 [{"region":"纯地名","dates":[日期...]}]\n'
@@ -2251,7 +2301,7 @@ class ModelDecisionService:
         '  触发词：赴宴/做寿/先到…再到/先去…再去/先过…赶到/接人/送人/喝喜酒/吃饭/接上配偶/接家人\n'
         '- rule_penalties: 各类规则的单次违约扣款金额对象（仅当输入含 penalty_amounts 时填写，否则 null）。'
         '把每条偏好的金额归因到其抽出的规则类别，键限：'
-        '"allowed_regions"/"forbidden_regions"/"forbidden_categories"/"night_window"/"category_targets"/"dated_events"。'
+        '"allowed_regions"/"forbidden_regions"/"forbidden_categories"/"night_window"/"category_targets"/"dated_events"/"longhaul"。'
         '一条偏好含多种规则时金额填到每个对应键；无法确定归因的键省略。\n\n'
         "关键规则：\n"
         "1) 日期用该月日数 1-31。中文数字要转换（十二号→12，二十号→20，三十一号→31）。\n"
@@ -2321,12 +2371,75 @@ class ModelDecisionService:
         '"blackout":[],"dated_single":[{"date":20,"lat":23.25,"lng":113.40,"wait_minutes":120,"before_hour":null}],"dated_route":[]}'
     )
 
+    # Stage-2 of the preference compiler: a single audit-and-repair call that
+    # replaces both the old per-rule "semantic confirm" calls (one LLM call per
+    # extracted item) and the hard-coded keyword-whitelist grounding gates.
+    _REVIEW_SYSTEM = (
+        "你是货运司机偏好「抽取结果」的审计修复器。输入 JSON 含：\n"
+        "- preferences: 司机偏好原文数组（可能是口语/方言/乱序缺字的中文）\n"
+        "- penalty_amounts: 各偏好违约扣款金额（可选，与 preferences 一一对应）\n"
+        "- extracted: 待审计的抽取结果（字段定义与抽取器一致）\n"
+        "任务：对照原文逐条核对 extracted，输出【修正后的完整结果 JSON】"
+        "（schema 与 extracted 完全相同，所有字段必须输出，未提及的字段用 null 或空数组）。"
+        "只输出一个 JSON 对象，禁止 markdown / 解释 / think标签。\n\n"
+        "审计要点（按错误代价从高到低）：\n"
+        "1) 找漏——【每日生效】的时段约束漏抽代价最高（每天违规重复扣钱）："
+        "原文中任何表达「某时段不出车/不接单/不空驶/收车/熄火/落锁/归家不动/睡觉/歇着/宵禁」含义的，"
+        "无论措辞多口语，都必须出现在 no_drive_windows（跨夜时 end_hour<start_hour）；"
+        "若同时含休息/睡觉含义则 rest_window 也要填。宁可多保留一个时段，绝不可漏。\n"
+        "2) 找漏——月度品类指标与欠额结转（少一单扣一次）：必须体现在 monthly_category_targets；"
+        "「欠的下月补」类表述对应 carryover=true。\n"
+        "3) 找漏——整月完全不出车天数(off_days_min)、每月长途单数上限(monthly_longhaul_cap)、"
+        "日期事件(dated_single/dated_route，坐标按原文「地名（纬度,经度）」取)、回家规则(home_rule)。\n"
+        "4) 删多——删除原文并未施加的臆造约束。重点检查 forbidden_zones/bounded_area/must_visit/"
+        "home_rule/allowed_regions/daily_order_limit/blackout：原文没有明确说就置 null/空数组。"
+        "注意「尽量不/最好别」是 avoid_categories（软性），不要放进 forbidden_categories。\n"
+        "5) 纠错——校对数字与单位、时刻（中午十二点→12，下午两点→14，半点用0.5）、"
+        "日期（三十一号→31）、坐标（纬度在前 18-55，经度在后 70-140）；"
+        "区分货物品类名与地名（「在惠州的货」是区域约束不是品类）。\n"
+        "6) rule_penalties 按规则类别归因（键限 allowed_regions/forbidden_regions/"
+        "forbidden_categories/night_window/category_targets/dated_events/longhaul），"
+        "金额越高的偏好越要逐字推敲确保其约束被完整保留。"
+    )
+
+    def _llm_review_rules(
+        self, driver_id: str, texts: list[str], data: dict[str, Any],
+        penalties: list[Any] | None = None,
+    ) -> dict[str, Any] | None:
+        """Stage-2 audit-and-repair of the stage-1 extraction (one LLM call).
+
+        Returns the corrected full-schema dict, or None when the model is
+        unavailable / output unusable (the caller then keeps the stage-1 data
+        unchanged -- fail-safe in the "never silently lose a rule" direction).
+        """
+        payload: dict[str, Any] = {"preferences": texts, "extracted": data}
+        if penalties and len(penalties) == len(texts) and any(p for p in penalties):
+            payload["penalty_amounts"] = penalties
+        msgs = [
+            {"role": "system", "content": self._REVIEW_SYSTEM},
+            {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+        ]
+        for attempt in range(2):
+            req: dict[str, Any] = {"messages": msgs, "temperature": 0}
+            if attempt == 0:
+                req["response_format"] = {"type": "json_object"}
+            try:
+                resp = self._api.model_chat_completion(req)
+            except Exception as exc:
+                self._logger.info("llm review attempt %d unavailable driver_id=%s err=%s", attempt, driver_id, exc)
+                continue
+            reviewed = self._extract_json(resp)
+            if isinstance(reviewed, dict) and any(k in reviewed for k in data):
+                return reviewed
+            self._logger.warning("llm review attempt %d: unusable output driver_id=%s", attempt, driver_id)
+        return None
+
     def _llm_parse_preferences(
         self, driver_id: str, texts: list[str], rules: DriverRules,
         coord_map: dict[str, tuple[float, float]] | None = None,
         penalties: list[Any] | None = None,
     ) -> bool:
-        """用大模型把全部可见偏好解析成结构化规则并合并进 rules。
+        """偏好编译器：两遍 LLM（抽取 → 审计修复）后合并进 rules。
 
         返回 True 表示 LLM 成功产出结构化结果；False 表示模型不可用/解析失败
         （此时调用方会退回正则解析）。
@@ -2359,6 +2472,21 @@ class ModelDecisionService:
             data = self._extract_json(resp)
             if data is not None:
                 self._logger.info("llm raw output driver_id=%s data=%s", driver_id, json.dumps(data, ensure_ascii=False)[:800])
+                reviewed = self._llm_review_rules(driver_id, texts, data, penalties)
+                if reviewed is not None:
+                    # Fail-safe: the review pass may correct daily time windows
+                    # but must never delete them outright -- a missed daily
+                    # window compounds into the largest penalty class, while a
+                    # spurious one only costs a few idle hours.
+                    if (data.get("no_drive_windows") or []) and not (reviewed.get("no_drive_windows") or []):
+                        reviewed["no_drive_windows"] = data["no_drive_windows"]
+                    if data.get("rest_window") and not reviewed.get("rest_window"):
+                        reviewed["rest_window"] = data["rest_window"]
+                    self._logger.info(
+                        "llm reviewed output driver_id=%s data=%s",
+                        driver_id, json.dumps(reviewed, ensure_ascii=False)[:800],
+                    )
+                    data = reviewed
                 try:
                     self._merge_llm_rules(rules, data, texts)
                 except Exception as exc:
@@ -2489,56 +2617,6 @@ class ModelDecisionService:
             self._logger.info("overnight rest_window %d-%d -> rest_window=(0,%d) no_drive=%s",
                               sm, em, em, overnight)
 
-    def _confirm_rule_holds(self, rule_desc: str, all_text: str, default: bool = True) -> bool:
-        """Semantic grounding: ask the model whether ``all_text`` actually
-        imposes the constraint ``rule_desc``.
-
-        This replaces brittle substring/keyword grounding, which silently
-        dropped correctly-extracted rules whenever a finals driver phrased the
-        same constraint with words not on a hard-coded whitelist. The model
-        decides by meaning, so paraphrases / dialect / idioms all generalise.
-
-        Fail-safe: returns ``default`` (keep the rule) on any error, empty
-        text, or unparseable response. We only drop a rule when the model
-        clearly says it does not hold, so a flaky verifier never silently
-        discards a real constraint.
-        """
-        if not all_text.strip():
-            return default
-        cache = getattr(self, "_rule_confirm_cache", None)
-        if cache is None:
-            cache = {}
-            self._rule_confirm_cache = cache
-        key = (rule_desc, all_text)
-        if key in cache:
-            return cache[key]
-        verdict = default
-        try:
-            msgs = [
-                {"role": "system", "content": (
-                    "你判断一段司机偏好原文是否确实包含某条约束。"
-                    "只输出JSON {\"holds\": true/false}。"
-                    "只有当原文明显不支持该约束时才返回false；含义相符或不确定一律返回true。"
-                )},
-                {"role": "user", "content": json.dumps(
-                    {"原文": all_text, "约束": rule_desc}, ensure_ascii=False)},
-            ]
-            req: dict[str, Any] = {"messages": msgs, "temperature": 0, "max_tokens": 30}
-            try:
-                req["response_format"] = {"type": "json_object"}
-                resp = self._api.model_chat_completion(req)
-            except Exception:
-                req.pop("response_format", None)
-                resp = self._api.model_chat_completion(req)
-            data = self._extract_json(resp)
-            if isinstance(data, dict) and data.get("holds") is False:
-                verdict = False
-        except Exception as exc:
-            self._logger.info("rule-confirm unavailable (keep rule) desc=%s err=%s", rule_desc, exc)
-            verdict = default
-        cache[key] = verdict
-        return verdict
-
     def _llm_semantic_yes_no(self, question: str, default: bool) -> bool:
         """通用 LLM 是/否语义判定（缓存 + fail-safe 降级到 default）。
 
@@ -2633,20 +2711,16 @@ class ModelDecisionService:
             stripped = re.sub(r"^(?:凡是|所有|一切|任何)", "", c).strip()
             clean_cats.append(stripped if stripped else c)
 
+        # The reviewed compile is trusted as-is (the audit pass already removed
+        # hallucinations and restored missed rules); only deterministic
+        # structural cleaning remains here.
         for c in clean_cats:
-            if self._confirm_rule_holds(f"司机禁运（一律不接）货物品类「{c}」", all_text):
-                rules.forbidden_categories.add(c)
-            else:
-                self._logger.info("llm semantic-confirm: dropped forbidden_category '%s'", c)
+            rules.forbidden_categories.add(c)
 
         for reg in raw_regs:
             r = self._clean_region_name(reg)
-            if not r:
-                continue
-            if self._confirm_rule_holds(f"司机禁接装货地或卸货地在「{r}」的货", all_text):
+            if r:
                 rules.forbidden_regions.add(r)
-            else:
-                self._logger.info("llm semantic-confirm: dropped forbidden_region '%s'", r)
         rr = data.get("required_region")
         if isinstance(rr, dict):
             reg, md = rr.get("region"), rr.get("min_days")
@@ -2666,12 +2740,8 @@ class ModelDecisionService:
                     days.add(dv - 1)
             if isinstance(reg, str) and reg.strip() and days and not any(r == self._clean_region_name(reg) for r, _ in rules.blackout):
                 r = self._clean_region_name(reg)
-                if not r:
-                    continue
-                if self._confirm_rule_holds(f"司机在指定日期不去「{r}」", all_text):
+                if r:
                     rules.blackout.append((r, days))
-                else:
-                    self._logger.info("llm semantic-confirm: dropped blackout region '%s'", r)
         for ev in data.get("dated_single") or []:
             single = self._coerce_single(ev)
             if single is not None and not any(e["day"] == single["day"] for e in rules.dated_single):
@@ -2681,43 +2751,18 @@ class ModelDecisionService:
             if route is not None and not any(e["day"] == route["day"] for e in rules.dated_route):
                 rules.dated_route.append(route)
 
-        # --- new rule types from old 10-driver version ---
-        # Text-grounding: only accept a new rule if the preference text contains
-        # matching keywords.  This prevents LLM hallucinations on unseen drivers.
-        # Compound grounding: require BOTH a time indicator AND an action keyword
-        # to reduce false positives from common words like "休息" or "不接"
-        _NDW_TIME_KW = ("点", "时", "小时", "上午", "下午", "中午", "凌晨", "晚上", "早上", ":", "：")
-        _NDW_ACTION_KW = ("不出车", "不接单", "不开车", "不跑车", "不空跑", "不空驶", "不运营", "不工作", "不干活", "不接活", "不赶路", "不许出", "不允许出", "别派活", "别赶路", "停车熄火", "禁止出车", "不准出车", "别开车", "别跑车", "收工", "停运", "收车", "封车", "落锁", "熄火", "歇着", "休息", "睡觉", "不动弹", "不动车", "别动车", "不跑", "不接")
-        _NDW_KW = _NDW_ACTION_KW  # for logging compatibility
-        _AVOID_KW = ("少接", "尽量不", "尽量少", "避免", "避开", "绕开", "不太想", "不愿意", "不喜欢", "最好别", "别给我", "尽量别", "能不接", "嫌麻烦", "犯怵", "不是绝对", "除非价钱", "能换就换", "不太愿意", "能不碰")
-        _FZ_KW = ("不进", "不去", "禁止进入", "不要去", "不要进", "别去", "远离", "不往", "不到", "不可进", "不得进", "禁入", "不允许进", "严禁", "禁驶入", "禁止驶入", "避开", "绕开", "堵", "修路", "不想跑", "不做")
-        _ALLOW_REGION_KW = ("只跑", "只接", "只在", "仅在", "限定", "不出", "不离开", "不离", "固定在", "范围内", "区域内")
-        _BA_KW = ("范围", "区域内", "不超出", "只在", "仅在", "限定", "活动区域", "纬度", "经度", "运营区域", "只做", "只跑")
-        _MV_KW = ("必须去", "一定要到", "每月去", "至少去", "必须到", "必访", "定期去", "经过", "起码", "至少", "接够")
-        _HOME_KW = ("回家", "到家", "家里", "返回住所", "回住处", "回去", "回到家", "归家", "在家", "家附近", "停在家")
-        _DOL_KW = ("不超过", "上限", "最多", "不得超过", "不得多于", "顶多", "封顶", "单以内", "趟以内")
-        _DOL_SCOPE_KW = ("同一天", "每天", "每日", "单日", "当天", "一天", "每个自然日", "自然日")
-        _HAUL_KW = ("装货", "卸货", "干线", "运距", "里程", "运输距离", "运输", "提货", "交货", "运货", "距离", "公里", "不超", "单趟")
-        _FOB_KW = ("首单", "第一单", "第一趟", "最早", "点前出发", "点前接", "点前开", "点之前", "出第一", "还没接单", "还不接单", "前要出", "前必须接", "前得接")
+        # --- remaining rule types -------------------------------------------
+        # No keyword-whitelist grounding here any more: the old gates silently
+        # dropped correctly-extracted rules whenever an unknown driver phrased
+        # a constraint off-vocabulary (exactly the finals scenario), which for
+        # daily-effective rules compounds into the largest penalty class. The
+        # review pass (_llm_review_rules) is now responsible for both recall
+        # (restoring missed rules) and precision (deleting hallucinated ones);
+        # this merge layer only performs deterministic structural validation
+        # (numeric ranges, lat/lng sanity, radius clamping).
 
-        def _text_has_any(keywords: tuple[str, ...]) -> bool:
-            return any(kw in all_text for kw in keywords)
-
-        def _ndw_grounded() -> bool:
-            """no_drive_windows requires BOTH time + action keywords."""
-            has_time = any(kw in all_text for kw in _NDW_TIME_KW)
-            has_action = any(kw in all_text for kw in _NDW_ACTION_KW)
-            return has_time and has_action
-
-        # no_drive_windows — FAIL-SAFE (no keyword gate).
-        # A daily "don't drive in this window" rule (esp. night rest) that we
-        # miss is catastrophic: it is violated EVERY day and compounds into a
-        # six-figure penalty over the season, whereas a spurious window only
-        # costs a few idle hours. The old `_ndw_grounded()` keyword whitelist
-        # silently dropped these whenever a driver phrased it off-vocabulary,
-        # which is exactly the finals scenario. We now trust the temperature-0
-        # extraction and only drop a window if the semantic verifier clearly
-        # says it does not hold (verifier failure keeps the window).
+        # no_drive_windows — fail-safe: a missed daily window is catastrophic
+        # (violated EVERY day), a spurious one only costs a few idle hours.
         for ndw in data.get("no_drive_windows") or []:
             if not isinstance(ndw, dict):
                 continue
@@ -2733,64 +2778,53 @@ class ModelDecisionService:
                 em += 24 * 60  # cross-midnight (e.g. 23:00->05:00)
             else:
                 continue
-            desc = f"司机每天 {sm // 60:02d}:{sm % 60:02d}-{(em % DAY_MINUTES) // 60:02d}:{(em % DAY_MINUTES) % 60:02d} 不接单、不出车/不空驶（禁驶时段）"
-            if not self._confirm_rule_holds(desc, all_text):
-                self._logger.info("llm semantic-confirm: dropped no_drive_window %d-%d", sm, em)
-                continue
             if not any(ws == sm and we == em for ws, we in rules.no_drive_windows):
                 rules.no_drive_windows.append((sm, em))
 
-        # avoid_categories — semantic confirm (replaces keyword/substring gate)
+        # avoid_categories — soft constraint; structural cleaning only.
         for ac in data.get("avoid_categories") or []:
             if isinstance(ac, str) and ac.strip():
                 s = re.sub(r"^(?:凡是|所有|一切|任何)", "", ac.strip()).strip()
-                if not s:
-                    continue
-                if self._confirm_rule_holds(f"司机尽量避免/少接货物品类「{s}」", all_text):
+                if s:
                     rules.avoid_categories.add(s)
-                else:
-                    self._logger.info("llm semantic-confirm: dropped avoid_category '%s'", s)
 
-        # NOTE: avoid/forbidden dedup moved to _dedup_avoid_forbidden (runs after supplement)
+        # NOTE: avoid/forbidden dedup moved to _dedup_avoid_forbidden (runs after merge)
 
-        # allowed_regions — only strong "operate within X" wording becomes a hard constraint.
-        if _text_has_any(_ALLOW_REGION_KW):
-            for ar in data.get("allowed_regions") or []:
-                if isinstance(ar, str) and ar.strip():
-                    self._add_allowed_region(rules, ar, all_text)
-        elif data.get("allowed_regions"):
-            self._logger.info("llm grounding: rejected allowed_regions (no strong region-limit keywords)")
+        # allowed_regions — high-risk field (a wrong hard "operate within X"
+        # rule can starve the driver). _add_allowed_region keeps its generic,
+        # phrasing-independent safety checks: junk-name detection (LLM yes/no)
+        # plus character-coverage grounding against the noisy original text.
+        for ar in data.get("allowed_regions") or []:
+            if isinstance(ar, str) and ar.strip():
+                self._add_allowed_region(rules, ar, all_text)
 
-        # forbidden_zones — grounded + coordinate validation
-        if _text_has_any(_FZ_KW):
-            for fz in data.get("forbidden_zones") or []:
-                if not isinstance(fz, dict):
-                    continue
-                try:
-                    flat, flng, fr = float(fz["lat"]), float(fz["lng"]), float(fz.get("radius_km", 10))
-                except (TypeError, ValueError, KeyError):
-                    continue
-                if flat > 90 and flng < 90:
-                    flat, flng = flng, flat
-                # Validate coordinates are in China range
-                if not (18 <= flat <= 55 and 70 <= flng <= 140):
-                    self._logger.info("llm grounding: rejected forbidden_zone (%.2f,%.2f) out of range", flat, flng)
-                    continue
-                # Validate radius is reasonable (not too large)
-                if fr > 100:
-                    self._logger.info("llm grounding: clamped forbidden_zone radius %.0f→100 km", fr)
-                    fr = 100
-                rules.forbidden_zones.append((flat, flng, fr))
-        elif data.get("forbidden_zones"):
-            self._logger.info("llm grounding: rejected forbidden_zones (no keywords in text)")
+        # forbidden_zones — coordinate validation only
+        for fz in data.get("forbidden_zones") or []:
+            if not isinstance(fz, dict):
+                continue
+            try:
+                flat, flng, fr = float(fz["lat"]), float(fz["lng"]), float(fz.get("radius_km", 10))
+            except (TypeError, ValueError, KeyError):
+                continue
+            if flat > 90 and flng < 90:
+                flat, flng = flng, flat
+            # Validate coordinates are in China range
+            if not (18 <= flat <= 55 and 70 <= flng <= 140):
+                self._logger.info("validation: rejected forbidden_zone (%.2f,%.2f) out of range", flat, flng)
+                continue
+            # Validate radius is reasonable (not too large)
+            if fr > 100:
+                self._logger.info("validation: clamped forbidden_zone radius %.0f→100 km", fr)
+                fr = 100
+            rules.forbidden_zones.append((flat, flng, fr))
 
-        # bounded_area — grounded + coordinate validation
+        # bounded_area — requires explicit coordinate-like numbers in the text
+        # (phrasing-independent signal: an operating bbox can only come from
+        # numbers the driver actually wrote) + range validation.
         ba = data.get("bounded_area")
         if isinstance(ba, dict) and rules.bounded_area is None:
-            # Require BOTH keyword AND explicit lat/lng numbers in the text
-            has_kw = _text_has_any(_BA_KW)
             has_coords = bool(re.search(r'(?:纬度|经度|[纬经]\s*[0-9]|\d{2,3}\.\d)', all_text))
-            if has_kw and has_coords:
+            if has_coords:
                 try:
                     la_min = float(ba["lat_min"])
                     la_max = float(ba["lat_max"])
@@ -2800,94 +2834,85 @@ class ModelDecisionService:
                     if la_max - la_min >= _MIN_BOUNDED_AREA_SPAN and ln_max - ln_min >= _MIN_BOUNDED_AREA_SPAN and 18 <= la_min and la_max <= 55 and 70 <= ln_min and ln_max <= 140:
                         rules.bounded_area = (la_min, la_max, ln_min, ln_max)
                     else:
-                        self._logger.info("llm grounding: rejected bounded_area (unreasonable range)")
+                        self._logger.info("validation: rejected bounded_area (unreasonable range)")
                 except (TypeError, ValueError, KeyError):
                     pass
-            elif has_kw:
-                self._logger.info("llm grounding: rejected bounded_area (keywords found but no explicit coordinates)")
             else:
-                self._logger.info("llm grounding: rejected bounded_area (no keywords in text)")
+                self._logger.info("validation: rejected bounded_area (no explicit coordinates in text)")
 
-        # must_visit — grounded + coordinate validation
-        if _text_has_any(_MV_KW):
-            has_coords = bool(re.search(r'\d{2,3}\.\d{1,}', all_text))
-            for mv in data.get("must_visit") or []:
-                if not isinstance(mv, dict):
-                    continue
-                try:
-                    mlat, mlng = float(mv["lat"]), float(mv["lng"])
-                    mrd = int(mv.get("required_days", 1))
-                    mr = float(mv.get("radius_km", 1.0))
-                except (TypeError, ValueError, KeyError):
-                    continue
-                if mlat > 90 and mlng < 90:
-                    mlat, mlng = mlng, mlat
-                # Validate coordinates
-                if not (18 <= mlat <= 55 and 70 <= mlng <= 140):
-                    self._logger.info("llm grounding: rejected must_visit (coords out of range: %.2f,%.2f)", mlat, mlng)
-                    continue
-                if not has_coords:
-                    self._logger.info("llm grounding: rejected must_visit (no explicit coords in text)")
-                    continue
-                rules.must_visit.append({"lat": mlat, "lng": mlng, "radius_km": mr, "required_days": mrd})
-        elif data.get("must_visit"):
-            self._logger.info("llm grounding: rejected must_visit (no keywords in text)")
+        # must_visit — requires explicit coordinates in text + validation
+        has_coords = bool(re.search(r'\d{2,3}\.\d{1,}', all_text))
+        for mv in data.get("must_visit") or []:
+            if not isinstance(mv, dict):
+                continue
+            try:
+                mlat, mlng = float(mv["lat"]), float(mv["lng"])
+                mrd = int(mv.get("required_days", 1))
+                mr = float(mv.get("radius_km", 1.0))
+            except (TypeError, ValueError, KeyError):
+                continue
+            if mlat > 90 and mlng < 90:
+                mlat, mlng = mlng, mlat
+            # Validate coordinates
+            if not (18 <= mlat <= 55 and 70 <= mlng <= 140):
+                self._logger.info("validation: rejected must_visit (coords out of range: %.2f,%.2f)", mlat, mlng)
+                continue
+            if not has_coords:
+                self._logger.info("validation: rejected must_visit (no explicit coords in text)")
+                continue
+            rules.must_visit.append({"lat": mlat, "lng": mlng, "radius_km": mr, "required_days": mrd})
 
-        # haul_max_km — grounded
+        # haul_max_km
         hm = data.get("haul_max_km")
         if isinstance(hm, (int, float)) and hm > 0:
-            if _text_has_any(_HAUL_KW):
-                rules.haul_max_km = float(hm)
-            else:
-                self._logger.info("llm grounding: rejected haul_max_km=%s (no keywords in text)", hm)
+            rules.haul_max_km = float(hm)
 
-        # monthly_deadhead_max_km (keep as before — low risk, rarely hallucinated)
+        # monthly_deadhead_max_km
         mdh = data.get("monthly_deadhead_max_km")
         if isinstance(mdh, (int, float)) and mdh > 0:
             rules.monthly_deadhead_max_km = float(mdh)
 
-        # daily_order_limit — grounded
+        # daily_order_limit
         dol = data.get("daily_order_limit")
-        if _text_has_any(_DOL_KW) and _text_has_any(_DOL_SCOPE_KW):
-            if isinstance(dol, (int, float)) and dol > 0:
-                rules.daily_order_limit = int(dol)
-            elif isinstance(dol, str):
-                dm = re.search(r'(\d+)', dol)
-                if dm:
-                    rules.daily_order_limit = int(dm.group(1))
-        elif dol is not None:
-            self._logger.info("llm grounding: rejected daily_order_limit=%s (no keywords in text)", dol)
+        if isinstance(dol, (int, float)) and dol > 0:
+            rules.daily_order_limit = int(dol)
+        elif isinstance(dol, str):
+            dm = re.search(r'(\d+)', dol)
+            if dm:
+                rules.daily_order_limit = int(dm.group(1))
 
-        # first_order_before_hour — grounded
+        # first_order_before_hour — soft, non-blocking marker (see _pick_order),
+        # so a false positive costs nothing.
         fob = data.get("first_order_before_hour")
-        # first_order_before_minute is a soft, non-blocking marker (see _pick_order),
-        # so a false positive costs nothing. The action keywords (头单/第一单…) are
-        # frequently scrambled in the noisy texts, so we ground only on a garble-robust
-        # time signal (点/时) to keep recall high.
-        if fob is not None and (_text_has_any(_FOB_KW) or _text_has_any(_NDW_TIME_KW)):
-            if isinstance(fob, (int, float)) and 0 < fob <= 24:
-                rules.first_order_before_minute = int(fob) * 60
-            elif isinstance(fob, str):
-                fm = re.search(r'(\d+)', fob)
-                if fm:
-                    h = int(fm.group(1))
-                    if 0 < h <= 24:
-                        rules.first_order_before_minute = h * 60
-        elif fob is not None:
-            self._logger.info("llm grounding: rejected first_order_before_hour=%s (no time signal in text)", fob)
+        if isinstance(fob, (int, float)) and 0 < fob <= 24:
+            rules.first_order_before_minute = int(fob) * 60
+        elif isinstance(fob, str):
+            fm = re.search(r'(\d+)', fob)
+            if fm:
+                h = int(fm.group(1))
+                if 0 < h <= 24:
+                    rules.first_order_before_minute = h * 60
 
-        # monthly_category_targets — grounded by category/target wording.
+        # monthly_category_targets
         self._merge_category_targets_from_llm(data, rules, all_text)
 
-        # home_rule — grounded + coordinate validation
-        # Require both home keywords AND explicit coordinates in text to reduce
-        # hallucination risk (home_rule with wrong coordinates is very costly).
+        # monthly_longhaul_cap — preference-driven long-haul order cap.
+        lhc = data.get("monthly_longhaul_cap")
+        if isinstance(lhc, dict):
+            mo = lhc.get("max_orders")
+            if isinstance(mo, (int, float)) and mo > 0:
+                rules.longhaul_max_orders = int(mo)
+                mh = lhc.get("min_hours")
+                if isinstance(mh, (int, float)) and 0 < mh <= 24:
+                    rules.longhaul_threshold_minutes = int(round(mh * 60))
+
+        # home_rule — requires explicit coordinates in the text (a home rule
+        # with hallucinated coordinates is very costly) + range validation.
         hr = data.get("home_rule")
         if isinstance(hr, dict) and rules.home_lat is None:
-            has_home_kw = _text_has_any(_HOME_KW)
             # Check if text contains explicit coordinate-like numbers (e.g., "23.10" or "(23.10,113.50)")
             has_coords_in_text = bool(re.search(r'\d{2,3}\.\d{1,}', all_text))
-            if has_home_kw and has_coords_in_text:
+            if has_coords_in_text:
                 try:
                     hlat, hlng = float(hr["lat"]), float(hr["lng"])
                 except (TypeError, ValueError, KeyError):
@@ -2907,11 +2932,18 @@ class ModelDecisionService:
                         if isinstance(nduh, (int, float)) and 0 < nduh <= 24:
                             rules.no_drive_until_minute = int(nduh) * 60
                     else:
-                        self._logger.info("llm grounding: rejected home_rule (coordinates out of range: %.2f,%.2f)", hlat, hlng)
-            elif has_home_kw:
-                self._logger.info("llm grounding: rejected home_rule (keywords found but no explicit coordinates in text)")
+                        self._logger.info("validation: rejected home_rule (coordinates out of range: %.2f,%.2f)", hlat, hlng)
             else:
-                self._logger.info("llm grounding: rejected home_rule (no keywords in text)")
+                self._logger.info("validation: rejected home_rule (no explicit coordinates in text)")
+        # The home rule often implies an overnight no-drive window
+        # (home_by_hour -> next-day no_drive_until_hour); register it so the
+        # scheduler blocks late-evening dispatch even before reaching home.
+        if rules.home_by_minute is not None and rules.no_drive_until_minute:
+            hb, nd = rules.home_by_minute, rules.no_drive_until_minute
+            if nd < hb:
+                overnight = (hb, nd + DAY_MINUTES)
+                if not any(ws == overnight[0] and we == overnight[1] for ws, we in rules.no_drive_windows):
+                    rules.no_drive_windows.append(overnight)
 
     @staticmethod
     def _month_to_idx(value: Any, default_idx: int | None = None) -> int | None:
@@ -2948,10 +2980,6 @@ class ModelDecisionService:
             req = item.get("min_orders")
             month_idx = self._month_to_idx(item.get("month"))
             if not cat or month_idx is None or not isinstance(req, (int, float)) or req <= 0:
-                continue
-            desc = f"司机要求{_month_name(month_idx)}品类「{cat}」当月至少接{int(req)}单（月度品类指标）"
-            if not self._confirm_rule_holds(desc, all_text):
-                self._logger.info("llm semantic-confirm: dropped category_target '%s'", cat)
                 continue
             rules.monthly_category_targets.setdefault(month_idx, {})[cat] = max(
                 int(req),
@@ -3186,6 +3214,8 @@ class ModelDecisionService:
                 sorted(rules.avoid_categories),
                 {m: dict(sorted(v.items())) for m, v in sorted(rules.monthly_category_targets.items())},
                 sorted(rules.category_carryover_months),
+                rules.longhaul_max_orders,
+                rules.longhaul_threshold_minutes,
             )
         )
 
@@ -3439,6 +3469,20 @@ class ModelDecisionService:
                     rules.first_order_before_minute = hour * 60
             if rules.first_order_before_minute is None and ("中午12点" in text or "中午十二点" in text):
                 rules.first_order_before_minute = 12 * 60
+        # monthly long-haul cap: "每个月超过八小时的长途只能接最多5单"
+        if rules.longhaul_max_orders is None and ("长途" in text or "远活" in text) and "小时" in text:
+            lh_m = re.search(
+                r"超过\s*([零一二两三四五六七八九十\d]+)\s*(?:个)?\s*小时.*?"
+                r"(?:最多|只能|不超过|不得超过|顶多).*?([零一二两三四五六七八九十\d]+)\s*单",
+                text,
+            )
+            if lh_m:
+                hours = _cn_to_int(lh_m.group(1))
+                cap = _cn_to_int(lh_m.group(2))
+                if cap > 0:
+                    rules.longhaul_max_orders = cap
+                    if 0 < hours <= 24:
+                        rules.longhaul_threshold_minutes = hours * 60
         mv_m = re.search(
             r"至少\s*([零一二两三四五六七八九十\d]+)\s*个?不同.*?日.*?到过"
             r"[（(]\s*([0-9]+\.?[0-9]*)\s*[，,]\s*([0-9]+\.?[0-9]*)\s*[)）]"
