@@ -162,11 +162,18 @@ cd demo && python calc_monthly_income.py
    禁驶窗内的 take_order/reposition 一律转为覆盖到窗口结束的 wait；
    wait 落点在窗内则延长。等待永不扣分，该变换只可能省罚分。
 
-4. **调度器优先 + LLM 顾问化（decide() 流程反转）**
+4. **双提案比较择优（decide() 仲裁流程，`_arbitrate` + `_order_score`）**
    旧流程 LLM 每 3 步先行决策、调度器兜底——LLM 会把强净值订单改成 wait（坏样本来源，见 §6.2）。
-   新流程**确定性调度器先行**；仅当调度器给出"非强制的闲置 wait"时才咨询 LLM
-   （并复用本步已付费的货源扫描，省 query 时间），LLM 建议过不了确定性校验仍不生效。
-   方差更小、下限更高、token 显著减少。
+   新流程是**双提案 + 确定性裁判**：调度器每步先给出提案；非强制合规时段内，LLM 看到
+   「调度器推荐 + 裁判评分 + 全部可行候选」后给出自己的提案（复用本步已付费的货源扫描），
+   由确定性裁判 `_order_score`（与 `_pick_order` 同一把尺：net/h + 品类加权 + 长途软罚）裁决：
+   - 双方都接单：LLM 候选评分 ≥ 调度器候选的 95% 即采纳——**近平局时让 LLM 的长期判断
+     （卸货后位置、品类进度、明日货源密度）拍板**，明显更差的候选换不动；
+   - 调度器闲置（wait）而 LLM 给出可行的接单/空驶：采纳 LLM；
+   - LLM 想用空驶替换已选订单：仅当该订单弱于 60 元/h 才放行；
+   - LLM 想把已选订单改成 wait：**永不采纳**（实测坏样本来源）。
+   LLM 的接单建议仍要过 `_validate_llm_take_order` 确定性校验。结果：LLM 在每个有意义的
+   步骤都参与决策且有真实决定权，但可度量的下限由裁判保证；方差更小、下限更高。
 
 5. **Token 预算治理（`_chat` + 预算闸门）**
    所有模型调用经 `_chat` 单一漏斗按司机计量（读网关 usage）。预算（5M/司机）压力分级：
@@ -174,8 +181,9 @@ cd demo && python calc_monthly_income.py
    保留到 480 万。**罚分防护永远不会被 token 压力饿死**，token 指标也有了硬上界。
 
 ### 验证
-`demo/tests/test_compliance_loop.py`（13 例，无 pytest 依赖）：护栏拦截/放行与等待延长、
+`demo/tests/test_compliance_loop.py`（19 例，无 pytest 依赖）：护栏拦截/放行与等待延长、
 审计自愈与防幻觉拒收、覆盖率闭环的补抽与 custom_directive 兜底、token 计量与闸门、
+仲裁规则（近平局换单/明显更差拒换/永不降级为 wait/弱单可被空驶替换/裁判评分经济学）、
 decide() 在硬窗口内零 LLM 调用且动作合规。原有 `test_overnight_rest_window.py`、
 `test_longhaul_cap_history.py` 全部保持通过。
 

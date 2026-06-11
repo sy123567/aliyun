@@ -50,6 +50,15 @@ _TOKEN_FALLBACK_PER_CALL = 1_500
 # longer "no drive" windows are almost certainly hallucinated.
 _AUDIT_MAX_WINDOW_MINUTES = 14 * 60
 _MAX_CUSTOM_DIRECTIVES = 6
+# Arbitration: both the scheduler and the LLM propose an action; a deterministic
+# referee (same net/h scoring as _pick_order) decides. The LLM's alternative
+# order is accepted when it scores at least this fraction of the scheduler's
+# pick — i.e. the LLM may exercise strategic judgment (drop-off region, category
+# progress, tomorrow's cargo density) in near-ties, but can never select a
+# clearly inferior order. It may override an order with a strategic reposition
+# only when that order is weaker than the net/h floor below.
+_ARBITRATION_SWAP_MARGIN = 0.95
+_WEAK_ORDER_NET_PER_H = 60.0  # 元/h
 
 SHENZHEN_BBOX = (22.42, 22.89, 113.74, 114.66)  # lat_min, lat_max, lng_min, lng_max
 _MONTH_START_DAYS = (0, 31, 61, 92)
@@ -715,26 +724,33 @@ class ModelDecisionService:
         # (computed BEFORE _schedule mutates rest_done etc.).
         locked = self._is_compliance_locked(rules, plan, now, day)
 
-        # Scheduler-first: the deterministic, compliance-vetted scheduler picks
-        # the action. The LLM is an *advisor*, consulted only when the scheduler
-        # has nothing better than idling outside mandatory windows — it can no
-        # longer override a strong deterministic order into a wait (variance
-        # reduction) and is skipped entirely when busy (token reduction).
+        # Dual-proposal arbitration: the deterministic, compliance-vetted
+        # scheduler always produces a proposal; outside mandatory compliance
+        # blocks the LLM produces a counter-proposal (seeing the scheduler's
+        # recommendation), and a deterministic referee (_arbitrate) picks the
+        # better one. The LLM thus contributes strategic judgment on every
+        # meaningful step — choosing between near-tied orders by drop-off
+        # region / category progress / tomorrow's positioning, upgrading idle
+        # waits into repositions, overriding weak orders — while the referee
+        # guarantees it can never idle away or clearly downgrade a strong order.
         action = self._schedule(driver_id, status, rules, plan, now, lat, lng)
-        if (
-            action.get("action") == "wait"
-            and not locked
-            and consecutive_waits < 3
-            and self._llm_advice_allowed(driver_id, step)
-        ):
+        kind = action.get("action")
+        consult = False
+        if not locked and self._llm_advice_allowed(driver_id, step):
+            if kind == "wait":
+                consult = consecutive_waits < 3
+            elif kind == "take_order":
+                scan = plan.get("_scan_items")
+                consult = bool(scan and len(scan[1]) >= 2)
+        if consult:
             now2 = int(self._api.get_driver_status(driver_id)["simulation_progress_minutes"])
             day2, tod2 = divmod(now2, DAY_MINUTES)
             if day2 == day and not self._is_compliance_locked(rules, plan, now2, day2):
                 llm_action = self._llm_decide_with_history(
-                    driver_id, status, rules, plan, history, now2, lat, lng, day2, tod2
+                    driver_id, status, rules, plan, history, now2, lat, lng, day2, tod2,
+                    sched_action=action,
                 )
-                if llm_action is not None and llm_action.get("action") != "wait":
-                    action = llm_action
+                action = self._arbitrate(rules, plan, now2, lat, lng, day, action, llm_action)
 
         # Last-resort shield: no code path may emit an action that drives inside
         # a hard no-drive window.
@@ -809,9 +825,13 @@ class ModelDecisionService:
         self._track_category_order(plan, self._rules.get(driver_id), month_idx, str(cargo_info.get("cargo_name", "")))
 
     def _llm_decide_with_history(self, driver_id, status, rules, plan, history,
-                                  now, lat, lng, day, tod) -> dict[str, Any] | None:
+                                  now, lat, lng, day, tod,
+                                  sched_action: dict[str, Any] | None = None) -> dict[str, Any] | None:
         """Use LLM with decision history context to make strategic decisions.
 
+        ``sched_action`` is the deterministic scheduler's own proposal for this
+        step; it is shown to the model so it can either endorse it or argue for
+        a better alternative (the caller arbitrates between the two).
         Returns a valid action dict or None (to fall back to rule engine).
         """
         import time
@@ -839,18 +859,25 @@ class ModelDecisionService:
         failed_ids = plan.get("failed_cargo_ids", set())
 
         # Build a compact list of locally feasible cargo. LLM may express preference,
-        # but execution safety stays deterministic.
+        # but execution safety stays deterministic. The scheduler's own pick (if
+        # any) is always included so the model can endorse or argue against it.
+        sched_cargo_id = ""
+        if sched_action is not None and sched_action.get("action") == "take_order":
+            sched_cargo_id = str((sched_action.get("params") or {}).get("cargo_id", ""))
         cargo_summary = []
-        for item in items:
+        seen_ids: set[str] = set()
+
+        def _summarise(item: dict[str, Any]) -> dict[str, Any] | None:
             cargo = item.get("cargo", {})
             cargo_id = str(cargo.get("cargo_id", ""))
-            if cargo_id in failed_ids:
-                continue
+            if not cargo_id or cargo_id in seen_ids or cargo_id in failed_ids:
+                return None
             ev = self._evaluate_cargo(cargo, item, rules, blackout_regions, now, hard_end, lat, lng)
             if ev is None:
-                continue
+                return None
             net, _touches_required, occupied, pickup_km = ev
-            cargo_summary.append({
+            seen_ids.add(cargo_id)
+            return {
                 "cargo_id": cargo_id,
                 "name": cargo.get("cargo_name", ""),
                 "price": round(float(cargo.get("price", 0) or 0), 2),
@@ -859,7 +886,21 @@ class ModelDecisionService:
                 "net_per_h": round(float(net) / max(1, int(occupied)) * 60, 1),
                 "from": cargo.get("start", {}).get("city", ""),
                 "to": cargo.get("end", {}).get("city", ""),
-            })
+            }
+
+        if sched_cargo_id:
+            for item in items:
+                if str(item.get("cargo", {}).get("cargo_id", "")) == sched_cargo_id:
+                    entry = _summarise(item)
+                    if entry is not None:
+                        entry["scheduler_pick"] = True
+                        cargo_summary.append(entry)
+                    break
+        for item in items:
+            entry = _summarise(item)
+            if entry is None:
+                continue
+            cargo_summary.append(entry)
             if len(cargo_summary) >= _LLM_CARGO_SUMMARY_LIMIT:
                 break
 
@@ -892,6 +933,10 @@ class ModelDecisionService:
             "- 不要连续wait超过2次！如果当前货源不合适，应该reposition到新区域寻找更好货源\n"
             "- 品类指标很重要：未达标会有高额罚款。优先接指标品类的货\n"
             "- 只能从候选货源列表里选 cargo_id；候选为空或都不合适就 wait/reposition\n"
+            "- 下方可能给出【本地调度器推荐】(按 net_per_h 择优的确定性推荐)。同意就照它输出；"
+            "只有当另一个候选在长期因素上明显更优时才更换：卸货城市后续货源更密/更利于明日接单、"
+            "品类指标进度、避免被甩到货源荒漠。net_per_h 明显更低且无长期优势的候选不要换；"
+            "调度器已推荐接单时绝不要改成 wait\n"
             "- 只输出一个JSON对象: {\"action\": \"...\", \"params\": {...}, \"reason\": \"20字内\"}\n"
         )
 
@@ -908,6 +953,30 @@ class ModelDecisionService:
         audit_text = self._compliance_self_audit(rules, history, day)
         audit_block = f"## 合规自检\n{audit_text}\n\n" if audit_text else ""
 
+        # Show the deterministic scheduler's own proposal (with its referee
+        # score for orders) so the model arbitrates instead of deciding blind.
+        sched_block = ""
+        if sched_action is not None:
+            s_kind = sched_action.get("action")
+            if s_kind == "take_order":
+                s_id = str((sched_action.get("params") or {}).get("cargo_id", ""))
+                s_score = self._order_score(rules, plan, now, lat, lng, day, s_id)
+                score_txt = f"，裁判评分 net≈{s_score * 60:.0f}元/h" if s_score is not None else ""
+                sched_block = (
+                    f"## 本地调度器推荐\n接单 cargo_id={s_id}{score_txt}。"
+                    "同意则原样输出；仅当另一候选有明显长期优势时才更换。\n\n"
+                )
+            elif s_kind == "reposition":
+                sp = sched_action.get("params") or {}
+                sched_block = (
+                    f"## 本地调度器推荐\n空驶至({sp.get('latitude', 0):.2f},{sp.get('longitude', 0):.2f})。\n\n"
+                )
+            elif s_kind == "wait":
+                sched_block = (
+                    "## 本地调度器推荐\n当前无合适货源，建议等待。"
+                    "若你能找到可行接单或更有希望的区域，请给出 take_order/reposition。\n\n"
+                )
+
         user_prompt = (
             f"## 当前状态\n"
             f"司机: {driver_id}, 位置: ({lat:.2f}, {lng:.2f})\n"
@@ -915,6 +984,7 @@ class ModelDecisionService:
             f"仿真进度: 第{day}天/{MONTH_DAYS}天\n"
             f"{cat_warning}\n"
             f"{audit_block}"
+            f"{sched_block}"
             f"## 偏好规则与合规进度\n{pref_summary}\n\n"
             f"## 决策历史\n{history_text}\n\n"
             f"## 已通过本地可行性检查的候选货源({len(cargo_summary)}条)\n"
@@ -1293,6 +1363,101 @@ class ModelDecisionService:
                         )
                         return self._safe_wait(rules, now, wait_min)
         return action
+
+    # ------------------------------------------------- proposal arbitration
+    def _order_score(self, rules: DriverRules, plan: dict, now: int, lat: float,
+                     lng: float, day: int, cargo_id: str) -> float | None:
+        """Deterministic referee score for a candidate order: effective net per
+        minute, with the same category boost and soft long-haul penalty that
+        ``_pick_order`` uses. Looks the cargo up in this step's paid scan.
+        Returns None when the cargo is not visible / not feasible right now."""
+        scan = plan.get("_scan_items")
+        if not scan:
+            return None
+        match = None
+        for item in scan[1]:
+            cargo = item.get("cargo", {}) if isinstance(item, dict) else {}
+            if str(cargo.get("cargo_id", "")) == str(cargo_id):
+                match = item
+                break
+        if match is None:
+            return None
+        cargo = match.get("cargo", {})
+        day_end = min((day + 1) * DAY_MINUTES, self._hard_order_deadline(rules, plan, now, day))
+        blackout_regions = {r for r, days in rules.blackout if day in days}
+        ev = self._evaluate_cargo(cargo, match, rules, blackout_regions, now, day_end, lat, lng)
+        if ev is None:
+            return None
+        net, _touches_required, occupied, _pkm = ev
+        month_idx = _month_index_for_day(day)
+        eff_net = float(net)
+        cost_time = int(cargo.get("cost_time_minutes", 0) or 0)
+        if cost_time > LONGHAUL_MINUTES and plan.get("monthly_longhual", {}).get(month_idx, 0) >= LONGHAUL_CAP:
+            eff_net -= LONGHAUL_PENALTY
+            if eff_net <= 0:
+                return None
+        score = eff_net / max(1, int(occupied))
+        cat_target, cat_needed = self._get_category_target(rules, plan, day)
+        if cat_target and cat_needed > 0 and self._category_matches_sem(cat_target, str(cargo.get("cargo_name", ""))):
+            score *= 5.0
+        return score
+
+    def _arbitrate(self, rules: DriverRules, plan: dict, now: int, lat: float, lng: float,
+                   day: int, sched: dict[str, Any], llm: dict[str, Any] | None) -> dict[str, Any]:
+        """Pick the better of the scheduler's and the LLM's proposals.
+
+        The referee is deterministic, so the LLM contributes judgment (strategic
+        positioning, category progress, drop-off region quality) while the
+        measurable floor — never trade a strong order for a clearly weaker one,
+        never idle instead of earning — stays guaranteed:
+
+        - scheduler idle (wait/reposition) + LLM drives → take the LLM's action
+          (it already passed deterministic validation upstream);
+        - both pick orders → LLM's choice wins if it scores ≥ 95% of the
+          scheduler's (near-tie: strategic judgment is allowed to break it);
+        - LLM wants to reposition instead of a picked order → allowed only when
+          that order is weak (< _WEAK_ORDER_NET_PER_H 元/h);
+        - LLM wants to wait instead of a picked order → never (the documented
+          bad-sample source: idling away a strong order).
+        """
+        if llm is None or llm.get("action") == sched.get("action") == "wait":
+            return sched
+        s_kind = sched.get("action")
+        l_kind = llm.get("action")
+        if s_kind != "take_order":
+            # Scheduler had nothing better than idling/relocating: any validated
+            # driving proposal from the LLM is an upgrade; a wait is not.
+            return llm if l_kind != "wait" else sched
+        s_id = str((sched.get("params") or {}).get("cargo_id", ""))
+        s_score = self._order_score(rules, plan, now, lat, lng, day, s_id)
+        if l_kind == "take_order":
+            l_id = str((llm.get("params") or {}).get("cargo_id", ""))
+            if l_id == s_id:
+                return sched
+            l_score = self._order_score(rules, plan, now, lat, lng, day, l_id)
+            if l_score is None:
+                return sched
+            if s_score is None or l_score >= s_score * _ARBITRATION_SWAP_MARGIN:
+                self._logger.info(
+                    "[arbitrate] LLM swap accepted %s(%.2f) → %s(%.2f)",
+                    s_id, -1.0 if s_score is None else s_score, l_id, l_score,
+                )
+                return llm
+            self._logger.info(
+                "[arbitrate] LLM swap rejected %s(%.2f) vs sched %s(%.2f)",
+                l_id, l_score, s_id, -1.0 if s_score is None else s_score,
+            )
+            return sched
+        if l_kind == "reposition":
+            if s_score is not None and s_score * 60.0 < _WEAK_ORDER_NET_PER_H:
+                self._logger.info(
+                    "[arbitrate] weak order %s (%.0f 元/h) overridden by LLM reposition",
+                    s_id, s_score * 60.0,
+                )
+                return llm
+            return sched
+        # l_kind == "wait" (or unknown): never downgrade a picked order.
+        return sched
 
     def _daily_compliance_audit(self, driver_id: str, rules: DriverRules, plan: dict, day: int) -> None:
         """Runtime closed loop (1 small LLM call per simulated day).

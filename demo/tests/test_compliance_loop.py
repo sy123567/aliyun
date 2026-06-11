@@ -254,6 +254,97 @@ def test_budget_gates_throttle_and_stop_advisory_llm() -> None:
     assert svc._audit_allowed("D") is False
 
 
+# --------------------------------------------------------- proposal arbitration
+def _arb_svc(scores: dict[str, float | None]) -> ModelDecisionService:
+    """Service whose deterministic referee returns scripted per-cargo scores."""
+    svc = ModelDecisionService(_ScriptedApi())
+    svc._order_score = (  # type: ignore[assignment]
+        lambda rules, plan, now, lat, lng, day, cid: scores.get(str(cid))
+    )
+    return svc
+
+
+def _take(cid: str) -> dict:
+    return {"action": "take_order", "params": {"cargo_id": cid}}
+
+
+_REPO = {"action": "reposition", "params": {"latitude": 23.0, "longitude": 113.0}}
+_WAIT = {"action": "wait", "params": {"duration_minutes": 120}}
+
+
+def test_arbitrate_llm_wins_near_tie_loses_clearly_worse() -> None:
+    rules, plan = DriverRules(), {}
+    # near-tie (within 5%): LLM's strategic choice wins
+    svc = _arb_svc({"A": 10.0, "B": 9.7})
+    out = svc._arbitrate(rules, plan, 0, 0.0, 0.0, 0, _take("A"), _take("B"))
+    assert out["params"]["cargo_id"] == "B", out
+    # clearly worse: scheduler's pick is kept
+    svc = _arb_svc({"A": 10.0, "B": 6.0})
+    out = svc._arbitrate(rules, plan, 0, 0.0, 0.0, 0, _take("A"), _take("B"))
+    assert out["params"]["cargo_id"] == "A", out
+    # clearly better: LLM wins
+    svc = _arb_svc({"A": 10.0, "B": 14.0})
+    out = svc._arbitrate(rules, plan, 0, 0.0, 0.0, 0, _take("A"), _take("B"))
+    assert out["params"]["cargo_id"] == "B", out
+
+
+def test_arbitrate_never_downgrades_order_to_wait() -> None:
+    svc = _arb_svc({"A": 0.5})  # even a weak order beats idling
+    out = svc._arbitrate(DriverRules(), {}, 0, 0.0, 0.0, 0, _take("A"), dict(_WAIT))
+    assert out["action"] == "take_order", out
+
+
+def test_arbitrate_reposition_overrides_only_weak_orders() -> None:
+    rules, plan = DriverRules(), {}
+    # strong order (600 元/h): reposition rejected
+    svc = _arb_svc({"A": 10.0})
+    out = svc._arbitrate(rules, plan, 0, 0.0, 0.0, 0, _take("A"), dict(_REPO))
+    assert out["action"] == "take_order", out
+    # weak order (30 元/h < 60): strategic reposition allowed
+    svc = _arb_svc({"A": 0.5})
+    out = svc._arbitrate(rules, plan, 0, 0.0, 0.0, 0, _take("A"), dict(_REPO))
+    assert out["action"] == "reposition", out
+
+
+def test_arbitrate_idle_scheduler_accepts_llm_driving() -> None:
+    svc = _arb_svc({})
+    out = svc._arbitrate(DriverRules(), {}, 0, 0.0, 0.0, 0, dict(_WAIT), _take("B"))
+    assert out["action"] == "take_order", out
+    out = svc._arbitrate(DriverRules(), {}, 0, 0.0, 0.0, 0, dict(_WAIT), None)
+    assert out["action"] == "wait", out
+
+
+def test_arbitrate_unscorable_llm_pick_is_rejected() -> None:
+    # LLM names a cargo the referee cannot score (gone from scan): keep sched.
+    svc = _arb_svc({"A": 10.0, "B": None})
+    out = svc._arbitrate(DriverRules(), {}, 0, 0.0, 0.0, 0, _take("A"), _take("B"))
+    assert out["params"]["cargo_id"] == "A", out
+
+
+def test_order_score_uses_referee_economics() -> None:
+    """_order_score must mirror _pick_order: net/occupied with category boost."""
+    items = [{
+        "cargo": {
+            "cargo_id": "C1", "cargo_name": "水果", "price": 600.0,
+            "cost_time_minutes": 120,
+            "start": {"lat": 0.0, "lng": 0.0, "city": ""},
+            "end": {"lat": 0.5, "lng": 0.0, "city": ""},
+        },
+    }]
+    svc = ModelDecisionService(_ScriptedApi())
+    rules = DriverRules()
+    plan = {"_scan_items": (0, items), "monthly_longhual": {}, "monthly_category_orders": {}}
+    svc._evaluate_cargo = lambda *a, **k: (300.0, False, 150, 0.0)  # type: ignore[assignment]
+    base = svc._order_score(rules, plan, 0, 0.0, 0.0, 0, "C1")
+    assert base is not None and abs(base - 2.0) < 1e-9, base
+    # with an open category target matching the cargo name the score is boosted
+    rules.monthly_category_targets = {0: {"水果": 12}}
+    boosted = svc._order_score(rules, plan, 0, 0.0, 0.0, 0, "C1")
+    assert boosted is not None and abs(boosted - 10.0) < 1e-9, boosted
+    # unknown cargo id is unscorable
+    assert svc._order_score(rules, plan, 0, 0.0, 0.0, 0, "missing") is None
+
+
 # ------------------------------------------------------------- decide() wiring
 def test_decide_is_scheduler_first_and_always_guarded() -> None:
     """During a no-drive window decide() must emit a compliant wait and must not
