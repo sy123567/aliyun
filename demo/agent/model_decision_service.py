@@ -15,10 +15,14 @@
    今日必须做/避免的事、品类缺口提醒）。任意措辞、任意条件式偏好（周末
    不同时段、特定日期事件、月度结转）都在这一层被按天具象化，不依赖固定
    schema 能否表达。计划层失效时自动退化为纯静态规则（fail-safe）。
-5. 确定性执行：调度器与各动作守卫使用"静态窗 ∪ 当日计划窗"的**有效禁驶窗**
+5. LLM 主决策（每步）：除"被迫动作"（整休日 / 强制晨休 / 已处于禁驶窗内只能
+   等待）外，每一步都由 LLM 结合**决策历史**（权威月度进度、近几日成交/等待/
+   空驶趋势、各装货城市实际净收益、昨日违规自检）在候选货源中做出决策；动作
+   未通过确定性校验时把拒绝原因回喂给模型重试一次，让模型自我纠正。
+6. 确定性守卫与兜底：各动作守卫使用"静态窗 ∪ 当日计划窗"的**有效禁驶窗**
    硬性拦截违规动作（每日休息 / 夜间休息窗 / 整月整休天数 / 禁接货类 /
-   禁接区域 / 必接区域 / 赴装空驶上限 / 特定日期到点事件），并在合规候选中
-   按净收益择单。
+   禁接区域 / 必接区域 / 赴装空驶上限 / 特定日期到点事件）；模型不可用、
+   输出无效或陷入等待循环时退回规则引擎按净收益择单。
 """
 
 from __future__ import annotations
@@ -407,6 +411,10 @@ class DecisionHistory:
         self._total_penalty_violations = 0
         self._category_counts: dict[int, dict[str, int]] = {}  # month → {cat: count}
         self._longhual_counts: dict[int, int] = {}  # month → count of >8h orders
+        # Per-day activity rollups (kept for the whole season, tiny): lets the
+        # LLM see multi-day trends (idle days, wait-heavy days) beyond the
+        # rolling window of individual steps.
+        self._day_stats: dict[int, dict[str, int]] = {}
 
     def record(self, step: int, day: int, tod: int, action: str, params: dict,
                result: dict | None = None, cargo_info: dict | None = None) -> None:
@@ -419,6 +427,17 @@ class DecisionHistory:
             "action": action,
             "params": params,
         }
+        ds = self._day_stats.setdefault(day, {"takes": 0, "waits": 0, "wait_min": 0, "repos": 0})
+        if action == "take_order":
+            ds["takes"] += 1
+        elif action == "wait":
+            ds["waits"] += 1
+            try:
+                ds["wait_min"] += max(0, int((params or {}).get("duration_minutes", 0) or 0))
+            except (TypeError, ValueError):
+                pass
+        elif action == "reposition":
+            ds["repos"] += 1
         if cargo_info:
             entry["cargo_name"] = cargo_info.get("cargo_name", "")
             entry["cargo_price"] = cargo_info.get("price", 0)
@@ -462,6 +481,11 @@ class DecisionHistory:
     def recent_actions(self) -> list[dict[str, Any]]:
         """Rolling window of recent decision entries (for the daily self-audit)."""
         return self._history
+
+    def day_stats(self, day: int) -> dict[str, int] | None:
+        """Activity rollup for one day (takes/waits/wait_min/repos), or None."""
+        ds = self._day_stats.get(int(day))
+        return dict(ds) if ds else None
 
     def get_summary(self, current_day: int, plan: dict[str, Any] | None = None) -> str:
         """Concise history summary for LLM context.
@@ -509,6 +533,18 @@ class DecisionHistory:
         s = self._monthly_stats.get(month_idx)
         if s:
             lines.append(f"{month_name}活动: 等待{s['waits']}次, 重定位{s['repositions']}次")
+
+        # Multi-day trend rollup: lets the model judge from its own recent days
+        # (e.g. wait-heavy idle days → reposition earlier today).
+        recent_days = sorted(d for d in self._day_stats if d < current_day)[-5:]
+        if recent_days:
+            orders_by_day = (plan or {}).get("orders_today", {}) or {}
+            roll = []
+            for d in recent_days:
+                ds = self._day_stats[d]
+                od = int(orders_by_day.get(d, 0))
+                roll.append(f"D{d}:成交{od}单/等待{ds['wait_min'] / 60:.1f}h/空驶{ds['repos']}次")
+            lines.append("近几日概况: " + "; ".join(roll))
 
         # Recent action trace. Outcomes are annotated from the authoritative
         # plan (failed_cargo_reasons rebuilt from the server-side history), so
@@ -744,18 +780,22 @@ class ModelDecisionService:
         lng = float(status["current_lng"])
         day, tod = divmod(now, DAY_MINUTES)
 
-        # Daily compliance planning: concretize the raw NL preferences for
-        # *today* (calendar-aware) before any action is chosen. Fail-safe: on
-        # any failure the static parse stays in charge.
-        self._ensure_daily_directive(driver_id, rules, plan, day)
+        # Daily compliance + strategy planning: concretize the raw NL
+        # preferences for *today* (calendar-aware) and distill a strategy from
+        # the decision history before any action is chosen. Fail-safe: on any
+        # failure the static parse stays in charge.
+        self._ensure_daily_directive(driver_id, rules, plan, day, history)
 
-        # Try LLM-driven decision with history context
+        # LLM-PRIMARY architecture: the LLM (grounded in decision history) makes
+        # the call on EVERY step where a real choice exists. Forced moves (off
+        # day / mandatory rest / inside a no-drive window) are short-circuited
+        # inside _llm_decide_with_history without burning tokens, and the
+        # deterministic engine remains only as fallback for model failures and
+        # as a hard stop for pathological wait loops.
         action = None
         step = self._step_count[driver_id]
         consecutive_waits = plan.get("_consecutive_waits", 0)
-        # Call LLM every 3 steps (or when idle), but skip if stuck in wait loop (>2 consecutive)
-        use_llm = (step % 3 == 0 or plan.get("_last_action") == "wait") and consecutive_waits < 3
-        if use_llm:
+        if consecutive_waits < 4:
             action = self._llm_decide_with_history(
                 driver_id, status, rules, plan, history, now, lat, lng, day, tod
             )
@@ -833,19 +873,27 @@ class ModelDecisionService:
 
     def _llm_decide_with_history(self, driver_id, status, rules, plan, history,
                                   now, lat, lng, day, tod) -> dict[str, Any] | None:
-        """Use LLM with decision history context to make strategic decisions.
+        """LLM-primary decision step, grounded in the decision history.
 
-        Returns a valid action dict or None (to fall back to rule engine).
+        Called on EVERY step. Forced moves return None → deterministic engine
+        without burning an LLM call: full off days, the mandatory start-of-day
+        rest block, and time already inside a no-drive window (the only legal
+        action there is waiting the window out). When the model's action fails
+        deterministic validation, the rejection reason is fed back to the
+        model once before falling back to the rule engine.
         """
         import time
         start_time = time.time()
 
-        # Skip LLM for mandatory actions (rest, off-day, dated events)
+        # Forced moves: no judgment needed, save the tokens.
         if day in plan.get("off_days", set()):
-            return None  # let rule engine handle
+            return None  # let rule engine idle the day
         block = rules.day_rest_block
         if block > 0 and day not in plan.get("rest_done", set()):
             return None  # let rule engine handle rest
+        for ws, we in rules.no_drive_windows_for(day):
+            if self._tod_in_window(tod, ws, we):
+                return None  # inside a no-drive window: scheduler waits it out
 
         # Query available cargo for context
         cargo_resp = self._query_cargo(driver_id=driver_id, latitude=lat, longitude=lng, k=30)
@@ -925,12 +973,22 @@ class ModelDecisionService:
         audit_text = self._compliance_self_audit(rules, history, day)
         audit_block = f"## 合规自检\n{audit_text}\n\n" if audit_text else ""
 
+        # Anti-stall: surface the wait streak so the model corrects itself from
+        # its own history instead of being overridden by the rule engine.
+        consec_waits = int(plan.get("_consecutive_waits", 0) or 0)
+        wait_warning = ""
+        if consec_waits >= 2:
+            wait_warning = (
+                f"\n⚠️ 你已连续等待{consec_waits}次仍无进展。除非处于休息/禁驶时段，"
+                "本步不要再wait：从候选接单，或reposition到历史净收益更高的装货城市。\n"
+            )
+
         user_prompt = (
             f"## 当前状态\n"
             f"司机: {driver_id}, 位置: ({lat:.2f}, {lng:.2f})\n"
             f"时间: {month_name}{day_in_month}日 {hour:02d}:{minute:02d}\n"
             f"仿真进度: 第{day}天/{MONTH_DAYS}天\n"
-            f"{cat_warning}\n"
+            f"{cat_warning}{wait_warning}\n"
             f"{audit_block}"
             f"## 偏好规则与合规进度\n{pref_summary}\n\n"
             f"## 决策历史\n{history_text}\n\n"
@@ -939,70 +997,97 @@ class ModelDecisionService:
             f"请做出决策（只输出JSON）:"
         )
 
-        try:
-            req = {
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-                # Greedy decoding (0, like the other LLM calls here) for
-                # run-to-run stability: at 0.1 the per-step picks drift enough to
-                # swing monthly net income by 10k+, which makes the one-shot
-                # finals score a coin flip. We want a high, reproducible floor.
-                "temperature": 0,
-                "response_format": {"type": "json_object"},
-                "max_tokens": 180,
-            }
-            resp = self._api.model_chat_completion(req)
+        msgs: list[dict[str, str]] = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+        # Up to 2 attempts: when the first action fails deterministic
+        # validation, the model is re-asked once WITH the rejection reason —
+        # it sees why and self-corrects (history-grounded judgment) instead of
+        # being silently overridden by the rule engine.
+        for attempt in range(2):
+            try:
+                req = {
+                    "messages": msgs,
+                    # Greedy decoding (0, like the other LLM calls here) for
+                    # run-to-run stability: at 0.1 the per-step picks drift
+                    # enough to swing monthly net income by 10k+. We want a
+                    # high, reproducible floor.
+                    "temperature": 0,
+                    "response_format": {"type": "json_object"},
+                    "max_tokens": 200,
+                }
+                resp = self._api.model_chat_completion(req)
+            except Exception as exc:
+                self._logger.warning("[LLM] decision failed driver_id=%s: %s", driver_id, exc)
+                return None
             elapsed = time.time() - start_time
-
-            # Timeout check: if >60s, log warning (for next iteration consider disabling thinking)
             if elapsed > 60:
                 self._logger.warning(
-                    "[LLM] decision took %.1fs (>60s threshold) driver_id=%s",
-                    elapsed, driver_id
+                    "[LLM] decision took %.1fs (>60s threshold) driver_id=%s", elapsed, driver_id
                 )
+            content = ""
+            try:
+                content = resp.get("choices", [{}])[0].get("message", {}).get("content", "") or ""
+                data = json.loads(content) if content.strip() else None
+            except (json.JSONDecodeError, AttributeError, IndexError, TypeError):
+                data = None
 
-            # Parse LLM response
-            content = resp.get("choices", [{}])[0].get("message", {}).get("content", "")
-            data = json.loads(content) if content else None
-            if data and "action" in data:
+            feedback = None
+            if not isinstance(data, dict) or "action" not in data:
+                feedback = "输出不是合法的决策JSON对象"
+            else:
                 action_type = data["action"]
-                params = data.get("params", {})
+                params = data.get("params", {}) or {}
                 reason = data.get("reason", "")
                 self._logger.info(
-                    "[LLM] decision driver_id=%s action=%s reason=%s elapsed=%.1fs",
-                    driver_id, action_type, reason, elapsed
+                    "[LLM] decision driver_id=%s attempt=%d action=%s reason=%s elapsed=%.1fs",
+                    driver_id, attempt, action_type, reason, elapsed
                 )
                 # Validate against hard constraints before accepting
                 if action_type == "take_order" and "cargo_id" in params:
                     cargo_id = str(params["cargo_id"])
-                    if not self._validate_llm_take_order(cargo_id, items, rules, plan, now, lat, lng, day, hard_end):
-                        return None
-                    return self._take_order(cargo_id)
+                    reject = self._take_order_reject_reason(
+                        cargo_id, items, rules, plan, now, lat, lng, day, hard_end
+                    )
+                    if reject is None:
+                        return self._take_order(cargo_id)
+                    feedback = f"货源{cargo_id}不可行：{reject}"
                 elif action_type == "wait" and "duration_minutes" in params:
-                    dur = int(params["duration_minutes"])
-                    for ws, we in rules.no_drive_windows_for(day):
-                        if self._tod_in_window(tod, ws, we):
-                            wait_until_window_end = self._minutes_until_window_end(tod, ws, we)
-                            if wait_until_window_end > 0:
-                                return self._safe_wait(rules, now, max(dur, wait_until_window_end))
+                    try:
+                        dur = max(1, int(params["duration_minutes"]))
+                    except (TypeError, ValueError):
+                        dur = 60
+                    # tod is outside any no-drive window here (forced moves are
+                    # short-circuited above); _safe_wait still extends waits
+                    # that would touch an upcoming window.
                     return self._safe_wait(rules, now, dur)
                 elif action_type == "reposition" and "latitude" in params and "longitude" in params:
-                    return self._safe_reposition(
-                        rules,
-                        now,
-                        lat,
-                        lng,
-                        float(params["latitude"]),
-                        float(params["longitude"]),
-                        deadline=(day + 1) * DAY_MINUTES,
-                        tag="LLM",
-                    )
-        except json.JSONDecodeError as exc:
-            self._logger.warning("[LLM] JSON parse failed driver_id=%s: %s", driver_id, exc)
-        except Exception as exc:
-            self._logger.warning("[LLM] decision failed driver_id=%s: %s", driver_id, exc)
+                    try:
+                        tgt_lat, tgt_lng = float(params["latitude"]), float(params["longitude"])
+                    except (TypeError, ValueError):
+                        tgt_lat = tgt_lng = float("nan")
+                    act = None
+                    if tgt_lat == tgt_lat and tgt_lng == tgt_lng:  # not NaN
+                        act = self._safe_reposition(
+                            rules, now, lat, lng, tgt_lat, tgt_lng,
+                            deadline=(day + 1) * DAY_MINUTES, tag="LLM",
+                        )
+                    if act is not None:
+                        return act
+                    feedback = "该空驶目标被拒绝（不合规区域/会撞上禁驶时段/今日时间不够），换近一点的目标或选择其他动作"
+                else:
+                    feedback = "action/params 不完整或不是 take_order/wait/reposition"
+
+            if attempt == 0:
+                msgs.append({"role": "assistant", "content": content})
+                msgs.append({
+                    "role": "user",
+                    "content": f"上一个决策被拒绝：{feedback}。请重新输出一个可执行的决策JSON"
+                               "（候选货源都不合适就 wait 或 reposition）。",
+                })
+                continue
+            self._logger.info("[LLM] no valid action after retry driver_id=%s: %s", driver_id, feedback)
 
         return None  # fallback to rule engine
 
@@ -1173,15 +1258,34 @@ class ModelDecisionService:
         day: int,
         hard_end: int,
     ) -> bool:
+        return self._take_order_reject_reason(
+            cargo_id, items, rules, plan, now, lat, lng, day, hard_end
+        ) is None
+
+    def _take_order_reject_reason(
+        self,
+        cargo_id: str,
+        items: list[dict[str, Any]],
+        rules: DriverRules,
+        plan: dict,
+        now: int,
+        lat: float,
+        lng: float,
+        day: int,
+        hard_end: int,
+    ) -> str | None:
+        """None when the LLM-picked order passes deterministic validation;
+        otherwise a short human-readable rejection reason that is fed back to
+        the model so it can self-correct on the retry."""
         if cargo_id in plan.get("failed_cargo_ids", set()):
             self._logger.info("[LLM] rejected take_order: cargo_id=%s failed earlier", cargo_id)
-            return False
+            return "该货源此前执行失败过"
         if any(
             self._tod_in_window(now % DAY_MINUTES, ws, we)
             for ws, we in rules.no_drive_windows_for(day)
         ):
             self._logger.info("[LLM] rejected take_order: in no_drive_window tod=%d", now % DAY_MINUTES)
-            return False
+            return "当前处于禁驶/休息时段，只能wait"
         match = None
         for item in items:
             cargo = item.get("cargo", {})
@@ -1190,7 +1294,7 @@ class ModelDecisionService:
                 break
         if match is None:
             self._logger.info("[LLM] rejected take_order: cargo_id=%s not in visible candidates", cargo_id)
-            return False
+            return "cargo_id 不在候选货源列表里"
         cargo = match.get("cargo", {})
         month_idx = _month_index_for_day(day)
         longhual_count = plan.get("monthly_longhual", {}).get(month_idx, 0)
@@ -1198,7 +1302,7 @@ class ModelDecisionService:
         ev = self._evaluate_cargo(cargo, match, rules, blackout_regions, now, hard_end, lat, lng)
         if ev is None:
             self._logger.info("[LLM] rejected take_order: cargo_id=%s failed deterministic feasibility", cargo_id)
-            return False
+            return "未通过可行性检查（区域/品类/装货时间窗/完成时间或净值不合规）"
         net, _touches_required, _occupied, _pickup_km = ev
         # Long-haul cap is preference-driven AND soft (net maximization): it only
         # exists when this driver's preferences impose one, and even then an
@@ -1211,8 +1315,8 @@ class ModelDecisionService:
             self._logger.info(
                 "[LLM] rejected take_order: over long-haul cap and net=%.0f<=penalty month=%d", net, month_idx
             )
-            return False
-        return True
+            return "本月长途已达上限且该单净值不足以覆盖罚款"
+        return None
 
     # ------------------------------------------------ daily compliance planner
     _DIRECTIVE_SYSTEM = (
@@ -1223,7 +1327,8 @@ class ModelDecisionService:
         '{"no_drive_today":[{"start_hour":数字,"end_hour":数字}],'
         '"replaces_default":true或false,'
         '"today_plan":"100字内的今日执行要点",'
-        '"category_focus":"今天应优先承接的货物品类名或null"}\n'
+        '"category_focus":"今天应优先承接的货物品类名或null",'
+        '"strategy_today":"60字内基于历史表现的经营策略或null"}\n'
         "字段说明：\n"
         '- no_drive_today: 今天（含跨入明晨）不得接单/空驶、只能停车等待的时段。'
         '跨午夜用 end_hour<start_hour（如21点到次日6点→start_hour 21, end_hour 6）。半小时用0.5。'
@@ -1234,11 +1339,14 @@ class ModelDecisionService:
         "不确定时一律 false。\n"
         "- today_plan: 简述今天必须做/必须避免的事（品类缺口与欠额、特定日期事项、区域或长途限制等）。\n"
         "- category_focus: 若有月度品类指标且尚有缺口（含上月欠额需本月同品类补）则给出应优先的品类名，否则 null。\n"
+        "- strategy_today: 若输入含「历史概况」（昨日成交/等待、各装货城市历史净收益），据此给出今天的经营策略"
+        "（如优先去净收益高的城市装货、昨日空等过多今天应尽早空驶找货）；没有历史数据则 null。\n"
         "规则：宁可保守，绝不编造偏好中不存在的约束；时段必须严格按偏好原文给出的时刻推算。"
     )
 
     def _ensure_daily_directive(
-        self, driver_id: str, rules: DriverRules, plan: dict[str, Any], day: int
+        self, driver_id: str, rules: DriverRules, plan: dict[str, Any], day: int,
+        history: "DecisionHistory | None" = None,
     ) -> None:
         """每日一次：把偏好原文按"今天"的日历具象化为可执行约束。
 
@@ -1286,6 +1394,24 @@ class ModelDecisionService:
                 payload["上月品类指标"] = prev_targets
                 payload["上月品类实接"] = plan.get("monthly_category_orders", {}).get(month_idx - 1, {}) or {}
 
+        # History grounding for strategy_today: yesterday's activity rollup and
+        # the realised per-pickup-city yield from the authoritative history.
+        hist_lines: list[str] = []
+        if history is not None and day > 0:
+            ds = history.day_stats(day - 1)
+            if ds:
+                od = int((plan.get("orders_today", {}) or {}).get(day - 1, 0))
+                hist_lines.append(
+                    f"昨日: 成交{od}单, 等待{ds['wait_min'] / 60:.1f}小时, 空驶{ds['repos']}次"
+                )
+        city_yield = plan.get("city_yield") or {}
+        if city_yield:
+            ranked = sorted(city_yield.items(), key=lambda kv: -(kv[1][1] / max(1, kv[1][2])))[:4]
+            hist_lines.append("各装货城市历史净收益: " + ", ".join(
+                f"{c}:{v[1] / max(1, v[2]) * 60:.0f}元/h({v[0]}单)" for c, v in ranked))
+        if hist_lines:
+            payload["历史概况"] = hist_lines
+
         try:
             req: dict[str, Any] = {
                 "messages": [
@@ -1323,6 +1449,9 @@ class ModelDecisionService:
         focus = data.get("category_focus")
         if isinstance(focus, str) and focus.strip() and focus.strip().lower() != "null":
             notes_parts.append(f"今日优先品类：{focus.strip()}")
+        strategy = data.get("strategy_today")
+        if isinstance(strategy, str) and strategy.strip() and strategy.strip().lower() != "null":
+            notes_parts.append(f"今日策略：{strategy.strip()[:100]}")
         rules.daily_directives[int(day)] = {
             "windows": windows,
             "replace": bool(data.get("replaces_default")),
