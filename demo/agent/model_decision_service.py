@@ -52,17 +52,35 @@ LONGHAUL_PENALTY = 1000.0
 # below this there is no time to relocate and still complete an order before day end.
 _STRAND_MIN_BUDGET = 240
 _ORDER_DEADLINE_BUFFER_MIN = 10
-_LLM_CARGO_SUMMARY_LIMIT = 12
+# Candidate list / market table sizes shown to the decision LLM. The finals
+# token budget (5M/driver) is barely 21% used at submission, so widening the
+# context the thinking model reasons over is "free" value-side spend. Tunable
+# via env for platform sweeps.
+_LLM_CARGO_SUMMARY_LIMIT = int(os.environ.get("AGENT_LLM_CARGO_SUMMARY_LIMIT", "18"))
 _MIN_BOUNDED_AREA_SPAN = 0.1
+# Fixed non-earning overhead (minutes) amortised per order when RANKING
+# candidates. Pure net-per-minute ranking systematically under-ranks big/long
+# hauls: a 1h/¥600 order (10/min) outranks a 10h/¥5000 one (8.3/min), yet the
+# big haul earns ~8x more and the working day has limited slots. Every order
+# also carries fixed non-earning overhead (cargo scan + pickup deadhead +
+# inter-order idle), so amortising a constant into the time denominator favours
+# consolidating into fewer, larger orders — directly attacking the documented
+# gross-income gap — WITHOUT ever accepting an unprofitable order (the net>0
+# filter is unchanged; this only re-ranks already-feasible candidates). Tune on
+# the official platform (multi-run, see notes §2); env AGENT_ORDER_TIME_OVERHEAD_MIN.
+_ORDER_TIME_OVERHEAD_MIN = float(os.environ.get("AGENT_ORDER_TIME_OVERHEAD_MIN", "60"))
 # Market-liquidity view built from the scan cache (zero extra sim cost):
 # how many cargo were seen departing each city recently and at what value.
 # Feeds chain-aware order choice (an order into a dead city strands the truck).
 _LIQ_WINDOW_MIN = 3 * DAY_MINUTES
-_LIQ_TOP_N = 6
+_LIQ_TOP_N = int(os.environ.get("AGENT_LIQ_TOP_N", "8"))
 # If the LLM asks for a long strategic wait while a compliant candidate at or
 # above this net-per-hour is on the table, take the order instead (the known
-# failure mode of LLM-in-the-loop runs was idling away strong orders).
-_LLM_WAIT_OVERRIDE_NET_PER_H = 80.0
+# failure mode of LLM-in-the-loop runs was idling away strong orders). Lowered
+# from 80 → 60: the submission was too conservative (lowest gross income on the
+# board), so idling a compliant >=60元/h order for "something better" is itself
+# a net-income leak. Env-tunable for platform sweeps.
+_LLM_WAIT_OVERRIDE_NET_PER_H = float(os.environ.get("AGENT_LLM_WAIT_OVERRIDE_NET_PER_H", "60"))
 # Thinking mode for the per-step decision call. Default ON (submission runs
 # with thinking); set AGENT_DECISION_THINKING=0 to disable. Measured on the
 # finals gateway (qwen3.7-plus) with real decision prompts: ~22s avg latency
@@ -749,6 +767,17 @@ class ModelDecisionService:
                 return row
         return None
 
+    @staticmethod
+    def _amortized_rate(net: float, occupied: int) -> float:
+        """Ranking score: net amortised over (occupied + fixed per-order overhead).
+
+        Adding a constant overhead to the time denominator stops pure efficiency
+        (net-per-minute) ranking from burying high-absolute-net long hauls behind
+        marginally-faster small orders — the documented gross-income leak. Scaled
+        to per-hour purely for readability; only the relative ordering matters.
+        Never changes feasibility (callers still apply the net>0 filter)."""
+        return float(net) / (max(1, int(occupied)) + _ORDER_TIME_OVERHEAD_MIN) * 60.0
+
     def _sync_monthly_counts_from_history(self, driver_id: str, plan: dict[str, Any]) -> None:
         """Rebuild accepted-order accumulators from the authoritative history.
 
@@ -1015,6 +1044,10 @@ class ModelDecisionService:
                 "price": round(float(cargo.get("price", 0) or 0), 2),
                 "minutes": int(occupied),
                 "pickup_km": round(float(pickup_km), 1),
+                # Both signals: absolute net (a big haul fills the slot and earns
+                # more total) AND efficiency (net_per_h). Pure net_per_h buried
+                # the big hauls that the leaderboard gap is made of.
+                "net": round(float(net)),
                 "net_per_h": round(float(net) / max(1, int(occupied)) * 60, 1),
                 "from": cargo.get("start", {}).get("city", ""),
                 "to": dest_city,
@@ -1024,7 +1057,10 @@ class ModelDecisionService:
                 # follow-up market at the destination: recent departures + value
                 row["to_liq"] = f"{dest_liq['n']}单/{dest_liq['net_per_h']:.0f}元h"
             cargo_summary.append(row)
-        cargo_summary.sort(key=lambda r: -r["net_per_h"])
+        # Rank by overhead-amortised net (consistent with the deterministic
+        # _score_item), so the biggest-value orders surface at the top of the
+        # list the model reads first, instead of the fastest tiny ones.
+        cargo_summary.sort(key=lambda r: -self._amortized_rate(r["net"], r["minutes"]))
         cargo_summary = cargo_summary[:_LLM_CARGO_SUMMARY_LIMIT]
 
         # Build preference rules summary
@@ -1045,10 +1081,13 @@ class ModelDecisionService:
             "做出最优决策。首要目标是最大化净收益(net=毛收入−成本−偏好罚款)；"
             "罚款只是净收益里的一项成本，毛收入足够高时带点罚款也值得。完成品类指标同样重要(欠单罚款高)。\n\n"
             "可用动作：\n"
-            '- take_order: 接单。参数: {"cargo_id": "ID"}。综合两点选货：①net_per_h(每小时净收益)越高越好，'
-            '不要只图短途，长途只要 net_per_h 高就值得接；②**接力价值**：to_liq 表示卸货城市近期出发货源的'
-            '「数量/均价(元/h)」——卸到货多价高的城市，下一单立刻有得接；卸到没有 to_liq 的冷门地方会空趟返程，'
-            'net_per_h 略低但 to_liq 旺的单往往全天总收益更高。若有未达标的品类指标则优先该品类\n'
+            '- take_order: 接单。参数: {"cargo_id": "ID"}。月度目标是净收益总额最大，按以下顺序权衡选货：'
+            '①**绝对净收益 net**：net 高的大单/长途占住时段却赚得多，一天时段有限，'
+            '一笔 net=5000 的长途通常胜过好几笔 net=600 的小单——不要只图短途快单；'
+            '②**效率 net_per_h**：净收益相近时，每小时净收益高的更优；'
+            '③**接力价值 to_liq**：卸货城市近期出发货源的「数量/均价(元/h)」——卸到货多价高的城市下一单立刻有得接，'
+            '卸到没有 to_liq 的冷门地会空趟返程；net_per_h 略低但 net 大且 to_liq 旺的单，全天总收益往往更高。'
+            '你有充足的思考预算，可据 to_liq 预判接力后续 1-2 单再定。若有未达标品类指标则优先该品类\n'
             '- wait: 等待。参数: {"duration_minutes": 分钟数}。仅用于休息/禁驶时段(见下方硬约束)；'
             '有正净值候选时等待=白白烧时间，不要因为"等更好的货"而wait\n'
             '- reposition: 空驶到新位置。参数: {"latitude": 纬度, "longitude": 经度}。'
@@ -2222,7 +2261,9 @@ class ModelDecisionService:
                 eff_net = net - rules.longhaul_penalty
                 if eff_net <= 0:
                     return
-            score = eff_net / occupied
+            # Amortise a fixed per-order overhead so a high-absolute-net long haul
+            # is not buried behind a marginally-faster small order (gross-income leak).
+            score = self._amortized_rate(eff_net, occupied)
             # [OPT] Category preference: exact name match with strong boost
             cargo_name = str(cargo.get("cargo_name", ""))
             is_cat_target = False
