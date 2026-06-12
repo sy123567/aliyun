@@ -331,15 +331,23 @@ class DriverRules:
         directive window AND the directive's total coverage must be at least
         half of the static coverage. A directive that silently drops or
         trivializes a static window falls back to the additive union.
+
+        Replacement is additionally restricted to actual weekend days
+        (Saturday/Sunday): the only legitimate relaxations we have seen are
+        weekend-conditional ("周末可以晚两个小时"), while a planner that
+        believes Friday night already counts as the weekend would otherwise
+        shrink a weekday window and eat the daily penalty every Friday. On
+        weekdays a directive can only ADD windows (fail-safe union).
         """
         directive = self.daily_directives.get(int(day))
         if not directive:
             return list(self.no_drive_windows)
         extra = [tuple(w) for w in (directive.get("windows") or [])]
         if directive.get("replace") and extra:
+            _date, _weekday, is_weekend = _calendar_for_day(int(day))
             static_cov = sum(e - s for s, e in self.no_drive_windows)
             extra_cov = sum(e - s for s, e in extra)
-            if extra_cov * 2 >= static_cov and all(
+            if is_weekend and extra_cov * 2 >= static_cov and all(
                 any(_windows_intersect(sw, dw) for dw in extra)
                 for sw in self.no_drive_windows
             ):
@@ -688,6 +696,19 @@ class ModelDecisionService:
 
     # ------------------------------------------------------------------ decide
     def decide(self, driver_id: str) -> dict[str, Any]:
+        """Top-level fail-safe: a raised exception here aborts the driver's
+        ENTIRE month in the orchestrator (end_reason="error"), which is the
+        worst possible outcome — zero further gross income plus every daily
+        preference penalty for the rest of the season. Unknown finals drivers
+        exercise code paths the local D001 data never does, so any unexpected
+        bug degrades to a safe one-hour wait instead of killing the run."""
+        try:
+            return self._decide_impl(driver_id)
+        except Exception:
+            self._logger.exception("decide() failed driver_id=%s — fail-safe wait", driver_id)
+            return self._wait(60)
+
+    def _decide_impl(self, driver_id: str) -> dict[str, Any]:
         status = self._api.get_driver_status(driver_id)
         rules = self._ensure_rules(driver_id, status)
         plan = self._plan.setdefault(
@@ -834,7 +855,7 @@ class ModelDecisionService:
         cargo_resp = self._query_cargo(driver_id=driver_id, latitude=lat, longitude=lng, k=30)
         items = cargo_resp.get("items", [])
         now = int(self._api.get_driver_status(driver_id)["simulation_progress_minutes"])
-        hard_end = self._hard_order_deadline(rules, plan, now, day)
+        hard_end = self._order_finish_deadline(rules, plan, now, day)
         blackout_regions = {r for r, days in rules.blackout if day in days}
         failed_ids = plan.get("failed_cargo_ids", set())
 
@@ -897,7 +918,6 @@ class ModelDecisionService:
 
         # Add category target warning
         cat_target, cat_needed = self._get_category_target(rules, plan, day)
-        month_deadhead = plan.setdefault("monthly_deadhead_km", {}).get(month_idx, 0.0)
         cat_warning = ""
         if cat_target and cat_needed > 0:
             cat_warning = f"\n⚠️ 品类指标警告: 本月需要'{cat_target}'至少12单，还差{cat_needed}单！优先接此品类。\n"
@@ -1056,6 +1076,29 @@ class ModelDecisionService:
                 hard_end = min(hard_end, cutoff)
         return hard_end
 
+    def _order_finish_deadline(self, rules: DriverRules, plan: dict, now: int, day: int) -> int:
+        """Latest order finish time, allowing the day's last order to run past
+        midnight when nothing constrains the night.
+
+        Applies to BOTH the flexible-rest driver ("N continuous hours anywhere",
+        rest_window is None) and the fully unconstrained driver (no rest rules
+        at all). The earlier build required ``daily_rest_minutes > 0``, so a
+        finals driver with no night/rest preference had every order that would
+        finish after 24:00 rejected — evenings went idle and gross income was
+        silently capped at the midnight boundary every single day.
+
+        Never extends past a no-drive window (today's or tomorrow's), a home
+        cutoff, an off/blackout/event day (via _next_day_is_ordinary): those
+        drivers keep the conservative within-day deadline.
+        """
+        hard_end = self._hard_order_deadline(rules, plan, now, day)
+        day_end = (day + 1) * DAY_MINUTES
+        if (rules.rest_window is None and not rules.has_no_drive(day)
+                and not rules.has_no_drive(day + 1) and rules.home_by_minute is None
+                and self._next_day_is_ordinary(rules, plan, day)):
+            hard_end = max(hard_end, day_end + (DAY_MINUTES - rules.day_rest_block))
+        return hard_end
+
     def _interval_overlaps_no_drive(self, rules: DriverRules, start: int, end: int) -> bool:
         """Whether an absolute minute interval touches a repeated no-drive window."""
         if end <= start or not rules.has_any_no_drive():
@@ -1197,7 +1240,9 @@ class ModelDecisionService:
     _DIRECTIVE_SYSTEM = (
         "你是货运司机的每日合规计划助手。司机有若干自然语言偏好（违反会扣钱），"
         "你的任务是把这些偏好换算成【今天】的具体执行约束。偏好可能与日历有关"
-        "（如周末时段不同、特定日期有事、月度指标与上月欠额结转），必须结合今天的日期/星期推算。\n"
+        "（如周末时段不同、特定日期有事、月度指标与上月欠额结转），必须结合今天的日期/星期推算。"
+        "偏好原文可能是粤语、吴语等方言或口语（如「唔出车」「返屋企」「夜里向勿接单」「困觉」），按含义理解。"
+        "注意：是否周末严格以输入给出的星期为准——周末只指星期六和星期日，星期五晚上属于工作日晚间。\n"
         "只输出一个JSON对象：\n"
         '{"no_drive_today":[{"start_hour":数字,"end_hour":数字}],'
         '"replaces_default":true或false,'
@@ -1575,15 +1620,25 @@ class ModelDecisionService:
         # visits have been accumulated.  Only navigate when urgency is very high
         # (remaining days == still_needed) AND coordinates are explicitly from text
         # (to avoid LLM-hallucinated must_visit wasting entire days).
+        # "每月至少N天到达某点" is judged per CALENDAR month, so both the visit
+        # count and the urgency window are scoped to the current month (the old
+        # season-wide count satisfied only one month and the urgency trigger
+        # fired only in the final days of MAY — March and April always failed).
+        mv_month_idx = _month_index_for_day(day)
+        mv_m_start = _MONTH_START_DAYS[mv_month_idx]
+        mv_m_end = _month_end_day_exclusive(mv_month_idx)
         for i, mv in enumerate(rules.must_visit):
             visited = plan["must_visit_days"].setdefault(i, set())
-            remaining_days = MONTH_DAYS - day
-            still_needed = mv["required_days"] - len(visited)
+            dist = _haversine_km(lat, lng, mv["lat"], mv["lng"])
+            if dist <= mv.get("radius_km", 1.0):
+                # Record organic visits on every step (not only during the
+                # urgency window) so days when a haul already passed through
+                # the spot count toward the quota and no make-up trip is wasted.
+                visited.add(day)
+            remaining_days = mv_m_end - day
+            still_needed = mv["required_days"] - sum(1 for d in visited if mv_m_start <= d < mv_m_end)
             if still_needed > 0 and remaining_days <= still_needed:
-                dist = _haversine_km(lat, lng, mv["lat"], mv["lng"])
-                if dist <= mv.get("radius_km", 1.0):
-                    visited.add(day)
-                elif dist < 150 and now + _travel_minutes(dist) <= day_end:
+                if dist > mv.get("radius_km", 1.0) and dist < 150 and now + _travel_minutes(dist) <= day_end:
                     return self._safe_reposition(
                         rules, now, lat, lng, mv["lat"], mv["lng"], deadline=day_end, tag="must_visit"
                     )
@@ -1653,15 +1708,11 @@ class ModelDecisionService:
                     )
 
         # (E) take the best compliant order, else idle to day end. A flexible-rest
-        # driver may let the day's *last* order finish past midnight (up to a cap that
-        # still leaves room for a full rest block inside the next day), but only when
-        # the next day is an ordinary working day — never crossing into an off day,
-        # blackout day or a dated-event day.
-        hard_end = self._hard_order_deadline(rules, plan, now, day)
-        if (rules.rest_window is None and not rules.has_no_drive(day)
-                and not rules.has_no_drive(day + 1) and rules.daily_rest_minutes > 0):
-            if self._next_day_is_ordinary(rules, plan, day):
-                hard_end = max(hard_end, day_end + (DAY_MINUTES - rules.day_rest_block))
+        # or fully unconstrained driver may let the day's *last* order finish past
+        # midnight (up to a cap that still leaves room for a full rest block inside
+        # the next day), but only when the next day is an ordinary working day —
+        # never crossing into an off day, blackout day or a dated-event day.
+        hard_end = self._order_finish_deadline(rules, plan, now, day)
         order = self._pick_order(driver_id, status, rules, plan, now, lat, lng, day, hard_end)
         if order is not None:
             return order
@@ -1685,15 +1736,19 @@ class ModelDecisionService:
         strand = self._anti_strand(driver_id, rules, plan, now, lat, lng, day, hard_end)
         if strand is not None:
             return strand
-        # (E'') Instead of idling until day end, wait 2 hours and retry.
+        # (E'') Instead of idling until day end, wait 1 hour and retry: the
+        # cargo pool is dynamic (new postings appear over time), so re-scanning
+        # hourly instead of every 2h roughly doubles the chance of catching a
+        # fresh profitable order on an otherwise dead afternoon. Scan cost is a
+        # few simulated minutes and the token budget has large headroom.
         remaining = day_end - now
         if remaining > 240:
-            return self._safe_wait(rules, now, 120)
+            return self._safe_wait(rules, now, 60)
         return self._safe_wait(rules, now, max(remaining, 1))
 
     def _next_day_is_ordinary(self, rules, plan, day) -> bool:
         nxt = day + 1
-        if nxt >= MONTH_DAYS or nxt in plan["off_days"]:
+        if nxt >= MONTH_DAYS or nxt in plan.get("off_days", set()):
             return False
         if any(nxt in days for _, days in rules.blackout):
             return False
@@ -1812,6 +1867,12 @@ class ModelDecisionService:
         # [OPT] Determine current month index and category targets
         month_idx = _month_index_for_day(day)
         longhual_count = plan["monthly_longhual"].get(month_idx, 0)
+        # Accumulated pickup deadhead this calendar month, for the monthly
+        # deadhead cap. This MUST be defined here: an earlier build referenced
+        # an undefined name inside _score_item, so any driver with a
+        # monthly-deadhead-cap preference raised NameError on every order pick
+        # and the orchestrator aborted that driver's whole month.
+        month_deadhead = plan.setdefault("monthly_deadhead_km", {}).get(month_idx, 0.0)
         cat_target, cat_needed = self._get_category_target(rules, plan, day)
 
         # [OPT] When a monthly category target is at risk, widen earlier.  The
@@ -1827,10 +1888,15 @@ class ModelDecisionService:
         plan["_scan_items"] = (entry_now, items)
         now = int(self._api.get_driver_status(driver_id)["simulation_progress_minutes"])
         blackout_regions = {r for r, days in rules.blackout if day in days}
-        need_zeng = (
-            rules.required_region is not None
-            and len(plan["zeng_order_days"]) < rules.required_region[1]
-        )
+        # "每月至少N天接「X」的货" is judged per CALENDAR month: count only this
+        # month's qualifying days (a season-total count stopped prioritising the
+        # region after month one and ate the penalty in the remaining months).
+        need_zeng = False
+        if rules.required_region is not None:
+            m_start = _MONTH_START_DAYS[month_idx]
+            m_end = _month_end_day_exclusive(month_idx)
+            zeng_this_month = sum(1 for d in plan["zeng_order_days"] if m_start <= d < m_end)
+            need_zeng = zeng_this_month < rules.required_region[1]
 
         best = None
         best_item = None
@@ -1927,7 +1993,13 @@ class ModelDecisionService:
             )
             return None
         latest_now = int(self._api.get_driver_status(driver_id)["simulation_progress_minutes"])
-        latest_deadline = min(day_end, self._hard_order_deadline(rules, plan, latest_now, day))
+        # Re-validate with the same past-midnight-capable deadline the initial
+        # scoring used. The earlier build clamped this to _hard_order_deadline
+        # (≤ midnight), which silently rejected every already-chosen order that
+        # finished past 24:00 — the extension above never actually fired, and
+        # because the crossing order had already won the scoring, the whole
+        # step returned None instead of falling back to the second-best pick.
+        latest_deadline = min(day_end, self._order_finish_deadline(rules, plan, latest_now, day))
         latest_ev = self._evaluate_cargo(best, best_item or {}, rules, blackout_regions, latest_now, latest_deadline, lat, lng)
         if latest_ev is None:
             self._logger.info(
@@ -2320,7 +2392,12 @@ class ModelDecisionService:
     # ----------------------------------------------------------------- planning
     @staticmethod
     def _plan_off_days(rules: DriverRules) -> set[int]:
-        """整月整休日：均匀铺在月中，避开特定日期事件及其前置布置日。
+        """整休日：在**每个自然月**内均匀铺 N 天，避开特定日期事件及其前置布置日。
+
+        「每月至少 N 天完全不出车」类偏好是按自然月判定、整月不满足一次性扣钱的
+        （评测口径见 docs/03-评测规则.md 的 D008 类规则）。旧实现把 N 天摊到整个
+        92 天赛季——只有铺到天的那个月达标，另外两个月每月吃一次整额罚款。现在按
+        月铺点：宁可多休几天（少量收入），也不吃按月的一次性罚款。
 
         采用确定性铺点而非"挑最晚的几天"，这样即便事件偏好要到临近其日期窗才可见、
         导致 reserved 集合后期才补全，也不会出现"已铺的整休日被事后挪走"的问题。
@@ -2335,19 +2412,23 @@ class ModelDecisionService:
             reserved.add(ev["day"])
             reserved.add(ev["day"] - 1)  # keep the day-before free for staging
         off: set[int] = set()
-        for i in range(n):
-            target = int(round((i + 0.5) * MONTH_DAYS / n))
-            target = min(MONTH_DAYS - 1, max(0, target))
-            chosen = None
-            for delta in range(MONTH_DAYS):
-                for cand in (target + delta, target - delta):
-                    if 0 <= cand < MONTH_DAYS and cand not in reserved and cand not in off:
-                        chosen = cand
+        for month_idx in range(len(_MONTH_START_DAYS) - 1):
+            m_start = _MONTH_START_DAYS[month_idx]
+            m_end = _MONTH_START_DAYS[month_idx + 1]
+            m_len = m_end - m_start
+            for i in range(min(n, m_len)):
+                target = m_start + int(round((i + 0.5) * m_len / n))
+                target = min(m_end - 1, max(m_start, target))
+                chosen = None
+                for delta in range(m_len):
+                    for cand in (target + delta, target - delta):
+                        if m_start <= cand < m_end and cand not in reserved and cand not in off:
+                            chosen = cand
+                            break
+                    if chosen is not None:
                         break
                 if chosen is not None:
-                    break
-            if chosen is not None:
-                off.add(chosen)
+                    off.add(chosen)
         return off
 
     # ------------------------------------------------------------- preferences
@@ -2510,7 +2591,12 @@ class ModelDecisionService:
     # ----------------------------------------------------------- LLM preference parsing
     _PARSE_SYSTEM = (
         "你是货运司机偏好抽取器。把司机的自然语言偏好转成严格 JSON。\n"
-        "只输出一个 JSON 对象，禁止 markdown / 解释 / think标签。未提及的字段用 null 或空数组。\n\n"
+        "只输出一个 JSON 对象，禁止 markdown / 解释 / think标签。未提及的字段用 null 或空数组。\n"
+        "偏好原文可能是**方言或口语**（粤语、客家话、吴语/江浙沪话等），也可能乱序缺字，必须按**含义**抽取，"
+        "绝不能因措辞陌生而漏抽。常见方言对照：粤语「唔/咪」=不、「冇」=没有、「瞓觉」=睡觉、"
+        "「返屋企/翻屋企」=回家、「收工/收车/收档」=结束运营、「朝早」=早上、「晏昼」=下午、「夜晚/夜麻麻」=晚上、"
+        "「成晚」=整晚、「揾食」=干活、「唔好/咪搞」=不要；吴语「勿/弗/覅」=不/不要、「夜里向/夜到」=晚上、"
+        "「屋里厢」=家里、「困觉」=睡觉、「礼拜六礼拜天」=周末、「莫去」=不去。\n\n"
         "字段定义（宁缺毋错）：\n"
         '- daily_rest_hours: 每天连续休息最少小时数（数字或 null）\n'
         '- rest_window: 每天固定停车时段 {"start_hour":数字,"end_hour":数字}（或 null）。半小时用0.5，如11点半→11.5\n'
@@ -2518,7 +2604,7 @@ class ModelDecisionService:
         '  适用于任何"某时段不出车/不接单/不空驶/收车/熄火/落锁/归家不动/歇业/宵禁"。跨午夜时 end_hour<start_hour，如23→5。\n'
         '  **极重要（夜休按天扣分，漏抽代价极高，务必抽出）**：凡表达"夜里/入夜/天黑后/后半夜/晚上X点后/到次日X点 不出车·不揽货·收车·归家·熄火·睡觉·歇着"等含义的，'
         '无论用词多口语/方言，都必须填 no_drive_windows（跨夜用 start>end）；若同时有"休息/睡觉/停车熄火"含义，则 rest_window 也一并填。宁可多抽一个夜休窗口，也不要漏掉。\n'
-        '- off_days_min: 整月完全不出车天数（整数，默认 0）\n'
+        '- off_days_min: 每个自然月完全不出车的最少天数（整数，默认 0）。"每月至少歇N天/每月N天不出车"→N\n'
         '- forbidden_categories: 禁运货物**品类名**数组（仅货物名称如"蔬菜""机械设备""生鲜"，'
         '绝不放城市/区域名！"在惠州的货"是区域禁令不是品类禁令）\n'
         '- avoid_categories: 尽量避免的货物品类名数组（"尽量不拉""尽量不接"→放这里）\n'
@@ -2692,7 +2778,8 @@ class ModelDecisionService:
     # ------------------------------------------------- coverage audit & repair
     _PREF_AUDIT_SYSTEM = (
         "你是货运司机偏好「覆盖审计器」。调度引擎已把司机的自然语言偏好编译成结构化规则；"
-        "你逐条审计：每条偏好原文里的**全部约束**是否都已体现在 structured_rules 里。\n"
+        "你逐条审计：每条偏好原文里的**全部约束**是否都已体现在 structured_rules 里。"
+        "偏好原文可能是粤语、吴语等方言或口语，按含义审计，不要因措辞陌生而误判。\n"
         '输入 JSON: {"preferences":[原文...], "penalty_amounts":[违约扣款金额或null...], '
         '"structured_rules":"已结构化规则清单"}\n'
         "只输出一个 JSON 对象，禁止 markdown/解释：\n"
@@ -2732,7 +2819,7 @@ class ModelDecisionService:
             we_d = we % DAY_MINUTES
             lines.append(f"每日禁驶(不接单不空驶) {ws // 60:02d}:{ws % 60:02d}-{we_d // 60:02d}:{we_d % 60:02d}")
         if rules.off_days_min:
-            lines.append(f"整月完全不出车≥{rules.off_days_min}天")
+            lines.append(f"每个自然月完全不出车≥{rules.off_days_min}天")
         if rules.forbidden_categories:
             lines.append("禁运品类: " + "、".join(sorted(rules.forbidden_categories)))
         if rules.avoid_categories:
@@ -3010,6 +3097,8 @@ class ModelDecisionService:
             msgs = [
                 {"role": "system", "content": (
                     "你判断一段司机偏好原文是否确实包含某条约束。"
+                    "原文可能是方言或口语（粤语「唔/冇/瞓觉/返屋企/收工」、"
+                    "吴语「勿/弗/覅/夜里向/屋里厢/困觉」等），也可能乱序缺字，一律按含义判断。"
                     "只输出JSON {\"holds\": true/false}。"
                     "只有当原文明显不支持该约束时才返回false；含义相符或不确定一律返回true。"
                 )},
@@ -3047,7 +3136,8 @@ class ModelDecisionService:
         try:
             msgs = [
                 {"role": "system", "content": (
-                    "你是货运领域的语义判定助手。输入文本可能是乱序/缺字的中文。"
+                    "你是货运领域的语义判定助手。输入文本可能是乱序/缺字的中文，"
+                    "也可能是粤语、吴语等方言或口语表达，按含义判断。"
                     "只输出JSON {\"answer\": true/false}。"
                 )},
                 {"role": "user", "content": question},
@@ -3179,15 +3269,17 @@ class ModelDecisionService:
         # matching keywords.  This prevents LLM hallucinations on unseen drivers.
         # Compound grounding: require BOTH a time indicator AND an action keyword
         # to reduce false positives from common words like "休息" or "不接"
-        _NDW_TIME_KW = ("点", "时", "小时", "上午", "下午", "中午", "凌晨", "晚上", "早上", ":", "：")
-        _NDW_ACTION_KW = ("不出车", "不接单", "不开车", "不跑车", "不空跑", "不空驶", "不运营", "不工作", "不干活", "不接活", "不赶路", "不许出", "不允许出", "别派活", "别赶路", "停车熄火", "禁止出车", "不准出车", "别开车", "别跑车", "收工", "停运", "收车", "封车", "落锁", "熄火", "歇着", "休息", "睡觉", "不动弹", "不动车", "别动车", "不跑", "不接")
+        _NDW_TIME_KW = ("点", "时", "小时", "上午", "下午", "中午", "凌晨", "晚上", "早上", "朝早", "晏昼", "夜里", "夜到", ":", "：")
+        _NDW_ACTION_KW = ("不出车", "不接单", "不开车", "不跑车", "不空跑", "不空驶", "不运营", "不工作", "不干活", "不接活", "不赶路", "不许出", "不允许出", "别派活", "别赶路", "停车熄火", "禁止出车", "不准出车", "别开车", "别跑车", "收工", "停运", "收车", "封车", "落锁", "熄火", "歇着", "休息", "睡觉", "不动弹", "不动车", "别动车", "不跑", "不接",
+                          # 方言（粤语/吴语）：复赛司机为广东、江浙沪，措辞可能带方言
+                          "唔出车", "唔接", "唔开工", "唔揽", "咪接", "咪出", "收档", "返屋企", "翻屋企", "瞓觉", "唔郁", "勿接", "勿出车", "勿跑", "弗接", "弗出", "覅接", "覅出", "困觉", "莫出", "莫接")
         _NDW_KW = _NDW_ACTION_KW  # for logging compatibility
-        _AVOID_KW = ("少接", "尽量不", "尽量少", "避免", "避开", "绕开", "不太想", "不愿意", "不喜欢", "最好别", "别给我", "尽量别", "能不接", "嫌麻烦", "犯怵", "不是绝对", "除非价钱", "能换就换", "不太愿意", "能不碰")
+        _AVOID_KW = ("少接", "尽量不", "尽量少", "避免", "避开", "绕开", "不太想", "不愿意", "不喜欢", "最好别", "别给我", "尽量别", "能不接", "嫌麻烦", "犯怵", "不是绝对", "除非价钱", "能换就换", "不太愿意", "能不碰", "唔想", "唔愿", "唔中意", "覅", "懒得")
         _FZ_KW = ("不进", "不去", "禁止进入", "不要去", "不要进", "别去", "远离", "不往", "不到", "不可进", "不得进", "禁入", "不允许进", "严禁", "禁驶入", "禁止驶入", "避开", "绕开", "堵", "修路", "不想跑", "不做")
         _ALLOW_REGION_KW = ("只跑", "只接", "只在", "仅在", "限定", "不出", "不离开", "不离", "固定在", "范围内", "区域内")
         _BA_KW = ("范围", "区域内", "不超出", "只在", "仅在", "限定", "活动区域", "纬度", "经度", "运营区域", "只做", "只跑")
         _MV_KW = ("必须去", "一定要到", "每月去", "至少去", "必须到", "必访", "定期去", "经过", "起码", "至少", "接够")
-        _HOME_KW = ("回家", "到家", "家里", "返回住所", "回住处", "回去", "回到家", "归家", "在家", "家附近", "停在家")
+        _HOME_KW = ("回家", "到家", "家里", "返回住所", "回住处", "回去", "回到家", "归家", "在家", "家附近", "停在家", "屋企", "返屋", "翻屋", "屋里厢", "回屋")
         _DOL_KW = ("不超过", "上限", "最多", "不得超过", "不得多于", "顶多", "封顶", "单以内", "趟以内")
         _DOL_SCOPE_KW = ("同一天", "每天", "每日", "单日", "当天", "一天", "每个自然日", "自然日")
         _HAUL_KW = ("装货", "卸货", "干线", "运距", "里程", "运输距离", "运输", "提货", "交货", "运货", "距离", "公里", "不超", "单趟")
@@ -3545,8 +3637,10 @@ class ModelDecisionService:
                     raw = raw.rsplit("在", 1)[-1]
                 self._add_allowed_region(rules, raw, text)
 
-    _NIGHT_KW = ("夜", "晚", "宵", "黑")
-    _REST_KW = ("停", "休", "熄", "睡", "眠", "收", "歇", "锁", "不出", "不接", "不动", "归家")
+    _NIGHT_KW = ("夜", "晚", "宵", "黑", "更")
+    _REST_KW = ("停", "休", "熄", "睡", "眠", "收", "歇", "锁", "不出", "不接", "不动", "归家",
+                # 方言（粤语/吴语）：瞓觉、返屋企、屋里厢、困觉、唔出车、勿出车…
+                "瞓", "困", "屋企", "屋里", "唔出", "唔接", "唔郁", "勿出", "勿接", "弗出", "弗接", "覅")
     _CLOCK_RE = re.compile(r"([01]?\d|2[0-4])(?:[：:]([0-5]\d)|点(半)?|时)")
 
     def _supplement_night_failsafe(self, texts: list[str], rules: DriverRules) -> None:
