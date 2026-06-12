@@ -145,14 +145,63 @@ def test_crossing_rejected_when_penalty_unknown_failsafe() -> None:
     assert _eval(svc, rules, cargo, item, now=1080, day_end=1260) is None
 
 
-def test_haul_running_past_window_end_is_rejected() -> None:
-    """A haul that would run past the window end (06:00) into the next day's
-    driving is rejected — only finishing *within* the window is allowed."""
+def _eval_with_max_days(max_days, svc, rules, cargo, item, now, day_end):
+    original = mds._NIGHT_CROSS_MAX_DAYS
+    mds._NIGHT_CROSS_MAX_DAYS = max_days
+    try:
+        return _eval(svc, rules, cargo, item, now, day_end)
+    finally:
+        mds._NIGHT_CROSS_MAX_DAYS = original
+
+
+def test_big_haul_crossing_one_window_past_end_accepted() -> None:
+    """[A2] A huge haul may now run PAST the window end (06:00) into the next
+    morning, priced at one per-day rest penalty — the previously hard-rejected
+    most-profitable ultra-long-hauls."""
     svc = _svc()
     rules = _rules()
-    # depart 18:00, 13h haul -> finish 07:00 next day (1080 + 780 = 1860 > 1800)
-    cargo, item = _cargo(price=20000.0, cost_time=780)
-    assert _eval(svc, rules, cargo, item, now=1080, day_end=1260) is None
+    # depart 18:00 (1080), 23.7h haul -> finish 17:40 next day (2500): crosses 1 window
+    cargo, item = _cargo(price=30000.0, cost_time=1420, haul_dst=(GZ_LAT, GZ_LNG))
+    ev = _eval_with_max_days(2, svc, rules, cargo, item, now=1080, day_end=1260)
+    assert ev is not None
+    net, _req, occupied, _pk = ev
+    assert abs(net - (30000.0 - NIGHT_PENALTY)) < 1.0, net  # one penalty charged
+    assert occupied == 1420
+
+
+def test_haul_crossing_two_windows_charges_double_penalty() -> None:
+    """[A2] A haul that drives through TWO nightly windows is charged TWO per-day
+    rest penalties (one per crossed window)."""
+    svc = _svc()
+    rules = _rules()
+    # depart 18:00 (1080), finish 3000 -> crosses day0 (1260) and day1 (2700)
+    cargo, item = _cargo(price=30000.0, cost_time=1920, haul_dst=(GZ_LAT, GZ_LNG))
+    ev = _eval_with_max_days(2, svc, rules, cargo, item, now=1080, day_end=1260)
+    assert ev is not None
+    net, _req, _occ, _pk = ev
+    assert abs(net - (30000.0 - 2 * NIGHT_PENALTY)) < 1.0, net
+
+
+def test_haul_crossing_more_than_max_days_rejected() -> None:
+    """[A2] Crossing more windows than _NIGHT_CROSS_MAX_DAYS is rejected no
+    matter how profitable — a bound on how long the truck drives unrested."""
+    svc = _svc()
+    rules = _rules()
+    # finish 4200 -> crosses day0/day1/day2 windows (3 > max_days=2)
+    cargo, item = _cargo(price=999999.0, cost_time=3120, haul_dst=(GZ_LAT, GZ_LNG))
+    assert _eval_with_max_days(2, svc, rules, cargo, item, now=1080, day_end=1260) is None
+
+
+def test_max_days_one_allows_single_window_blocks_two() -> None:
+    """[A2] _NIGHT_CROSS_MAX_DAYS bounds how many nights a haul may drive
+    through: at 1, a single-window crossing is allowed but a two-window one is
+    rejected."""
+    svc = _svc()
+    rules = _rules()
+    cargo, item = _cargo(price=30000.0, cost_time=1420, haul_dst=(GZ_LAT, GZ_LNG))
+    assert _eval_with_max_days(1, svc, rules, cargo, item, now=1080, day_end=1260) is not None
+    cargo2, item2 = _cargo(price=30000.0, cost_time=1920, haul_dst=(GZ_LAT, GZ_LNG))
+    assert _eval_with_max_days(1, svc, rules, cargo2, item2, now=1080, day_end=1260) is None
 
 
 def test_cannot_start_order_inside_window() -> None:

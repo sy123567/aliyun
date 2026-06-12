@@ -109,7 +109,36 @@ _DECISION_THINKING = os.environ.get("AGENT_DECISION_THINKING", "1").strip() not 
 # driver therefore gets a wall-clock budget; when the run is projected to
 # exceed it (pro-rated by simulation progress), thinking switches off for the
 # rest of that driver's season and decisions fall back to fast mode.
-_THINKING_WALL_BUDGET_SECONDS = float(os.environ.get("AGENT_THINKING_WALL_BUDGET_SECONDS", "6000"))
+_THINKING_WALL_BUDGET_SECONDS = float(os.environ.get("AGENT_THINKING_WALL_BUDGET_SECONDS", "6600"))
+# --- value-layer "balanced" optimisation knobs (plan A/B/C; all env-tunable so
+#     the optimum can be swept on the official platform, see notes §2) -------
+# A1 — chain value: an order whose drop-off city has a liquid follow-up market
+# is worth more than its standalone net (the truck immediately re-loads instead
+# of dead-heading out). Multiplies the candidate ranking score by
+# (1 + weight * f(to_liq)); 0 == off (pure standalone ranking). Re-ranks only,
+# never changes feasibility (net>0 filter unchanged).
+_CHAIN_VALUE_WEIGHT = max(0.0, float(os.environ.get("AGENT_CHAIN_VALUE_WEIGHT", "0.3")))
+# A1 — absolute-net emphasis: extra log-boost on big absolute net on top of the
+# overhead-amortised rate. 0 == off (rely on _ORDER_TIME_OVERHEAD_MIN only).
+_ABS_NET_ALPHA = max(0.0, float(os.environ.get("AGENT_ABS_NET_ALPHA", "0.0")))
+# A2 — multi-day night crossing: allow a very large haul to run PAST the end of
+# the nightly rest window into the next day(s), pricing one rest penalty PER
+# crossed window instead of hard-rejecting. 1 == legacy (finish must stay inside
+# the same window). Bounded by the month horizon and the per-crossing margin.
+_NIGHT_CROSS_MAX_DAYS = max(1, int(os.environ.get("AGENT_NIGHT_CROSS_MAX_DAYS", "2")))
+# A3 — weak-local reposition: when the best locally-pickable order's efficiency
+# is below this net-per-hour, prefer an anti-strand reposition toward a richer
+# observed market instead of locking the day into the weak order. 0 == off
+# (only reposition when NO order is reachable — the legacy trigger).
+_WEAK_LOCAL_REPOSITION_NET_PER_H = max(0.0, float(os.environ.get("AGENT_WEAK_LOCAL_REPOSITION_NET_PER_H", "0")))
+# B1 — penalty_cap credit: once a soft rule's monthly cumulative penalty has hit
+# its cap, further violations of that rule are free (the scorer caps the total),
+# so stop pricing them and unlock the orders they were blocking. 1 == on.
+_PENALTY_CAP_CREDIT = os.environ.get("AGENT_PENALTY_CAP_CREDIT", "1").strip() not in ("0", "false", "False")
+# B2 — category-urgency softening: in the urgent-quota window, a non-category
+# order is no longer hard-skipped; it is taken when its net beats the marginal
+# category-shortfall penalty it would displace. 1 == on.
+_CATEGORY_SOFT = os.environ.get("AGENT_CATEGORY_SOFT", "1").strip() not in ("0", "false", "False")
 
 SHENZHEN_BBOX = (22.42, 22.89, 113.74, 114.66)  # lat_min, lat_max, lng_min, lng_max
 _MONTH_START_DAYS = (0, 31, 61, 92)
@@ -790,10 +819,33 @@ class ModelDecisionService:
 
         Adding a constant overhead to the time denominator stops pure efficiency
         (net-per-minute) ranking from burying high-absolute-net long hauls behind
-        marginally-faster small orders — the documented gross-income leak. Scaled
+        marginally-faster small orders — the documented gross-income leak.         Scaled
         to per-hour purely for readability; only the relative ordering matters.
         Never changes feasibility (callers still apply the net>0 filter)."""
         return float(net) / (max(1, int(occupied)) + _ORDER_TIME_OVERHEAD_MIN) * 60.0
+
+    @staticmethod
+    def _candidate_rank_score(net: float, occupied: int, chain_liq: float = 0.0) -> float:
+        """[A1] Ranking score = overhead-amortised rate, optionally boosted by
+
+        - absolute net (log term, ``_ABS_NET_ALPHA``): emphasises big hauls even
+          more than the overhead term alone; and
+        - destination chain liquidity (``_CHAIN_VALUE_WEIGHT``): an order whose
+          drop-off city has a liquid follow-up market is worth more because the
+          truck re-loads immediately instead of dead-heading out.
+
+        Pure re-ranking of already-feasible candidates — never affects the net>0
+        feasibility filter. With both weights 0 it equals ``_amortized_rate`` so
+        existing behaviour/tests are preserved; the chain term is also neutral
+        whenever the destination has no observed liquidity (``chain_liq<=0``)."""
+        base = ModelDecisionService._amortized_rate(net, occupied)
+        if _ABS_NET_ALPHA > 0.0 and net > 0:
+            base *= 1.0 + _ABS_NET_ALPHA * math.log1p(float(net))
+        if _CHAIN_VALUE_WEIGHT > 0.0 and chain_liq > 0.0:
+            # bounded: a destination market of ~100元/h or richer gives the full
+            # weight; weaker markets scale down linearly. Never reduces the score.
+            base *= 1.0 + _CHAIN_VALUE_WEIGHT * min(1.0, float(chain_liq) / 100.0)
+        return base
 
     def _sync_monthly_counts_from_history(self, driver_id: str, plan: dict[str, Any]) -> None:
         """Rebuild accepted-order accumulators from the authoritative history.
@@ -1070,15 +1122,21 @@ class ModelDecisionService:
                 "to": dest_city,
             }
             dest_liq = self._dest_liquidity(liq_rows, dest_city)
+            chain_liq = 0.0
             if dest_liq is not None:
                 # follow-up market at the destination: recent departures + value
                 row["to_liq"] = f"{dest_liq['n']}单/{dest_liq['net_per_h']:.0f}元h"
+                chain_liq = float(dest_liq.get("net_per_h", 0.0) or 0.0)
+            # [A1] rank by overhead-amortised net + absolute-net + destination
+            # chain liquidity (consistent with the deterministic _score_item), so
+            # the biggest *total-day-value* orders surface at the top of the list
+            # the model reads first, instead of the fastest tiny ones.
+            row["_rank"] = self._candidate_rank_score(row["net"], row["minutes"], chain_liq)
             cargo_summary.append(row)
-        # Rank by overhead-amortised net (consistent with the deterministic
-        # _score_item), so the biggest-value orders surface at the top of the
-        # list the model reads first, instead of the fastest tiny ones.
-        cargo_summary.sort(key=lambda r: -self._amortized_rate(r["net"], r["minutes"]))
+        cargo_summary.sort(key=lambda r: -r["_rank"])
         cargo_summary = cargo_summary[:_LLM_CARGO_SUMMARY_LIMIT]
+        for _r in cargo_summary:
+            _r.pop("_rank", None)  # internal ranking key, never shown to the model
 
         # Build preference rules summary
         pref_summary = self._format_rules_for_llm(driver_id, rules, plan, day)
@@ -1401,6 +1459,33 @@ class ModelDecisionService:
                     if best is None or win_start < best[0]:
                         best = (win_start, win_end)
         return best
+
+    def _count_nodrive_crossings(self, rules: DriverRules, start: int, finish: int) -> int:
+        """[A2] Number of distinct nightly no-drive windows a haul ``[start,
+        finish)`` drives *through* (departed before each window begins).
+
+        Each crossed window is one per-day rest violation the scorer charges, so
+        this is the multiplier on the per-day penalty for a haul that runs past a
+        window end into the next day(s). At most one window per calendar day is
+        counted (the night-rest rule is charged once per day)."""
+        if finish <= start or not rules.has_any_no_drive():
+            return 0
+        first_day = start // DAY_MINUTES - 1
+        last_day = (finish - 1) // DAY_MINUTES + 1
+        count = 0
+        for day_idx in range(first_day, last_day + 1):
+            day_base = day_idx * DAY_MINUTES
+            for ws, we in rules.no_drive_windows_for(day_idx):
+                win_start = day_base + int(ws)
+                win_end = day_base + int(we)
+                if win_end <= win_start:
+                    win_end += DAY_MINUTES
+                # truck is actively driving across this window's start (it left
+                # before the window began): one per-day penalty for this day.
+                if start < win_start < finish:
+                    count += 1
+                    break
+        return count
 
     def _safe_reposition(
         self,
@@ -2053,6 +2138,23 @@ class ModelDecisionService:
         hard_end = self._order_finish_deadline(rules, plan, now, day)
         order = self._pick_order(driver_id, status, rules, plan, now, lat, lng, day, hard_end)
         if order is not None:
+            # [A3] When the best locally-pickable order is weak (low net/h) and a
+            # richer observed market is reachable, prefer repositioning there
+            # rather than locking the day into the weak order. Default off
+            # (_WEAK_LOCAL_REPOSITION_NET_PER_H == 0); only diverts when the
+            # relocation anchor's net strictly beats the local order's (min_net).
+            if _WEAK_LOCAL_REPOSITION_NET_PER_H > 0.0 and order.get("action") == "take_order":
+                local = self._picked_order_value(order, rules, plan, now, lat, lng, day, hard_end)
+                if local is not None and local[1] < _WEAK_LOCAL_REPOSITION_NET_PER_H:
+                    strand = self._anti_strand(
+                        driver_id, rules, plan, now, lat, lng, day, hard_end, min_net=local[0]
+                    )
+                    if strand is not None:
+                        self._logger.info(
+                            "[A3] weak local order net/h=%.0f<%.0f -> reposition to richer market",
+                            local[1], _WEAK_LOCAL_REPOSITION_NET_PER_H,
+                        )
+                        return strand
             return order
         # [OPT] LLM-driven category reposition: when a monthly category target is
         # still open and no target cargo is available locally, look for that category
@@ -2252,6 +2354,10 @@ class ModelDecisionService:
         best_is_category_target = False
         best_pickup_km = 0.0
         best_cost_time = 0
+        # [A1] destination chain-liquidity view (zero extra sim cost: aggregates
+        # the scan cache). Lets the deterministic ranking value an order by its
+        # whole-day potential (re-load at a liquid drop-off), not just standalone.
+        liq_rows = self._cargo_liquidity_stats(now)
 
         def _score_item(cargo, item, now_t):
             nonlocal best, best_item, best_score, best_is_required, best_is_category_target, best_pickup_km, best_cost_time
@@ -2278,9 +2384,13 @@ class ModelDecisionService:
                 eff_net = net - rules.longhaul_penalty
                 if eff_net <= 0:
                     return
-            # Amortise a fixed per-order overhead so a high-absolute-net long haul
-            # is not buried behind a marginally-faster small order (gross-income leak).
-            score = self._amortized_rate(eff_net, occupied)
+            # [A1] Amortise a fixed per-order overhead AND fold in destination
+            # chain liquidity so a high-absolute-net long haul into a liquid
+            # market is not buried behind a marginally-faster small order.
+            dest_city = str((cargo.get("end") or {}).get("city", "") or "")
+            dliq = self._dest_liquidity(liq_rows, dest_city) if dest_city else None
+            chain_liq = float(dliq.get("net_per_h", 0.0) or 0.0) if dliq else 0.0
+            score = self._candidate_rank_score(eff_net, occupied, chain_liq)
             # [OPT] Category preference: exact name match with strong boost
             cargo_name = str(cargo.get("cargo_name", ""))
             is_cat_target = False
@@ -2474,14 +2584,36 @@ class ModelDecisionService:
 
         return None
 
-    def _anti_strand(self, driver_id, rules, plan, now, lat, lng, day, day_end):
+    def _picked_order_value(self, order, rules, plan, now, lat, lng, day, hard_end):
+        """[A3] (net, net_per_h) of a just-picked take_order action, re-evaluated
+        from the step's cargo scan, or None if it cannot be recovered."""
+        cargo_id = str((order.get("params") or {}).get("cargo_id", ""))
+        scan = plan.get("_scan_items")
+        if not cargo_id or not scan:
+            return None
+        blackout_regions = {r for r, days in rules.blackout if day in days}
+        for item in scan[1]:
+            cargo = item.get("cargo", {})
+            if str(cargo.get("cargo_id", "")) == cargo_id:
+                ev = self._evaluate_cargo(cargo, item, rules, blackout_regions, now, hard_end, lat, lng)
+                if ev is None:
+                    return None
+                net, _r, occupied, _pk = ev
+                return float(net), float(net) / max(1, int(occupied)) * 60.0
+        return None
+
+    def _anti_strand(self, driver_id, rules, plan, now, lat, lng, day, day_end, *, min_net: float = 0.0):
         """When no compliant order is reachable from the current spot, the driver is
         stranded (e.g. a previous haul left it far from any cargo cluster) and would
         idle the whole day. Scan a wide radius for the best order that becomes workable
         *after a single reposition to its pickup*, and move toward it. The reposition
         deadhead is already folded into `net`, and the post-reposition pickup is ~0 km,
         so the deadhead cap is never tripped (penalty stays 0). Allow up to 2 repositions
-        per day to avoid wasting entire days when first target has no cargo."""
+        per day to avoid wasting entire days when first target has no cargo.
+
+        ``min_net`` (>0 only on the [A3] weak-local-order path): only divert when the
+        best relocation anchor's net strictly beats this — so we never trade a sure
+        local order for a worse one."""
         now = int(self._api.get_driver_status(driver_id)["simulation_progress_minutes"])
         day_end = min(day_end, self._hard_order_deadline(rules, plan, now, day))
         strand_count = plan.get("strand_count", {}).get(day, 0)
@@ -2517,6 +2649,8 @@ class ModelDecisionService:
             best_target, best_net = _best_target(cargo_resp.get("items", []))
         if best_target is None:
             return None
+        if min_net > 0.0 and (best_net is None or best_net <= min_net):
+            return None  # [A3] richer market not actually richer — keep local order
         action = self._safe_reposition(
             rules,
             now,
@@ -2735,18 +2869,23 @@ class ModelDecisionService:
             #     pickup-overlap reject above + ``_nodrive_window_covering``), so
             #     at most one penalised crossing per day; the scheduler rests for
             #     the remainder of the window afterwards.
+            # [A2] Multi-day crossing: a very large haul may run PAST the window
+            # end into the next day(s), priced at ONE per-day rest penalty per
+            # crossed window (the scorer charges the night rule per day). Bounded
+            # by _NIGHT_CROSS_MAX_DAYS and the month horizon; still fail-safe
+            # (unknown penalty → hard reject, the every-night blow-up guard).
             night_pen = rules.rule_penalties.get("night_window")
-            nd_window = self._nodrive_window_covering(rules, now, finish)
+            crossings = self._count_nodrive_crossings(rules, now, finish)
             if (
                 not isinstance(night_pen, (int, float))
                 or night_pen <= 0
-                or nd_window is None
-                or finish > nd_window[1]
+                or crossings <= 0
+                or crossings > _NIGHT_CROSS_MAX_DAYS
                 or finish > MONTH_DAYS * DAY_MINUTES
             ):
                 return None
-            violation_cost += float(night_pen)
-            crossed_night_pen = float(night_pen)
+            crossed_night_pen = float(night_pen) * crossings
+            violation_cost += crossed_night_pen
         elif finish > day_end:
             return None  # don't cross midnight (keeps rest windows clean)
         haul_km = _haversine_km(slat, slng, elat, elng)
