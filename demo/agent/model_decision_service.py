@@ -408,6 +408,11 @@ class DriverRules:
         # attributed by the parse LLM). Lets execution treat constraints economically:
         # an order violating a rule is still worth taking when net > penalty.
         self.rule_penalties: dict[str, float] = {}
+        # [B1] rule kind -> monthly cumulative penalty CAP (from preference
+        # penalty_caps). Once a rule's accumulated penalty hits its cap the
+        # marginal violation is free (the scorer caps the total), so execution
+        # stops pricing further violations of that rule. Absent == uncapped.
+        self.rule_caps: dict[str, float] = {}
         # Monthly long-haul cap — ONLY when this driver's preferences impose one
         # (e.g. D001 "每月超过八小时的长途最多5单"). None == no cap: a driver with
         # the opposite preference (long-haul focused) must not be throttled.
@@ -847,6 +852,37 @@ class ModelDecisionService:
             base *= 1.0 + _CHAIN_VALUE_WEIGHT * min(1.0, float(chain_liq) / 100.0)
         return base
 
+    def _night_window_capped(self, rules: DriverRules, plan: dict, day: int) -> bool:
+        """[B1] True when this month's night-rest penalty has already hit its cap,
+        so a further crossing is free (the scorer caps the rule's total).
+
+        Conservative: the reconstructed crossing count is a *subset* of the
+        scorer's violation conditions (we only see in-window driving, not missed
+        rest), so it cannot over-credit. Needs both a known penalty AND a cap."""
+        if not _PENALTY_CAP_CREDIT:
+            return False
+        cap = rules.rule_caps.get("night_window")
+        pen = rules.rule_penalties.get("night_window")
+        if not cap or not pen or cap <= 0 or pen <= 0:
+            return False
+        month_idx = _month_index_for_day(day)
+        used = int(plan.get("monthly_night_violations", {}).get(month_idx, 0))
+        return used * float(pen) >= float(cap)
+
+    def _longhaul_cap_credit(self, rules: DriverRules, plan: dict, day: int) -> bool:
+        """[B1] True when this month's long-haul over-cap penalty has hit its cap,
+        so further over-cap long hauls are free."""
+        if not _PENALTY_CAP_CREDIT:
+            return False
+        cap = rules.rule_caps.get("longhaul_cap")
+        pen = rules.longhaul_penalty
+        if rules.longhaul_cap_orders is None or not cap or cap <= 0 or pen <= 0:
+            return False
+        month_idx = _month_index_for_day(day)
+        cnt = int(plan.get("monthly_longhual", {}).get(month_idx, 0))
+        over = max(0, cnt - int(rules.longhaul_cap_orders))
+        return over * float(pen) >= float(cap)
+
     def _sync_monthly_counts_from_history(self, driver_id: str, plan: dict[str, Any]) -> None:
         """Rebuild accepted-order accumulators from the authoritative history.
 
@@ -924,6 +960,40 @@ class ModelDecisionService:
                 region = rules.required_region[0]
                 if _region_in_city(region, meta.get("start_city", "")) or _region_in_city(region, meta.get("end_city", "")):
                     plan["zeng_order_days"].add(day)
+
+        # [B1] Reconstruct monthly night-window crossing counts (distinct days
+        # with any in-window driving) so _night_window_capped can free further
+        # crossings once the rule's monthly cap is exhausted. Only computed when
+        # the night rule actually has a known penalty AND cap (otherwise no-op,
+        # and D001-style uncapped drivers are entirely unaffected). The count is
+        # a *subset* of the scorer's violation conditions (in-window driving
+        # only, not missed-rest), so it can never over-credit.
+        plan["monthly_night_violations"] = {}
+        if (rules is not None and rules.rule_caps.get("night_window")
+                and rules.rule_penalties.get("night_window")):
+            violated_days: set[int] = set()
+            for rec in records:
+                action = rec.get("action") or {}
+                aname = str(action.get("action") or "").strip().lower()
+                if aname not in ("take_order", "reposition"):
+                    continue
+                result = rec.get("result") or {}
+                if aname == "take_order" and not result.get("accepted"):
+                    continue
+                end_min = int(result.get("simulation_progress_minutes", 0) or 0)
+                step_elapsed = int(rec.get("step_elapsed_minutes", 0) or 0)
+                query_scan = int(rec.get("query_scan_cost_minutes", 0) or 0)
+                a_start = max(0, end_min - step_elapsed + query_scan)
+                if end_min <= a_start:
+                    continue
+                d = max(0, min(MONTH_DAYS - 1, a_start // DAY_MINUTES))
+                if d in violated_days:
+                    continue
+                if self._interval_overlaps_no_drive(rules, a_start, end_min):
+                    violated_days.add(d)
+            for d in violated_days:
+                m = _month_index_for_day(d)
+                plan["monthly_night_violations"][m] = plan["monthly_night_violations"].get(m, 0) + 1
 
     # ------------------------------------------------------------------ decide
     def decide(self, driver_id: str) -> dict[str, Any]:
@@ -1097,12 +1167,13 @@ class ModelDecisionService:
         # (was: first-N in distance order, which buried the best candidates).
         # LLM may express preference, but execution safety stays deterministic.
         cargo_summary = []
+        night_capped = self._night_window_capped(rules, plan, day)
         for item in items:
             cargo = item.get("cargo", {})
             cargo_id = str(cargo.get("cargo_id", ""))
             if cargo_id in failed_ids:
                 continue
-            ev = self._evaluate_cargo(cargo, item, rules, blackout_regions, now, hard_end, lat, lng)
+            ev = self._evaluate_cargo(cargo, item, rules, blackout_regions, now, hard_end, lat, lng, night_capped=night_capped)
             if ev is None:
                 continue
             net, _touches_required, occupied, pickup_km = ev
@@ -1590,7 +1661,10 @@ class ModelDecisionService:
         month_idx = _month_index_for_day(day)
         longhual_count = plan.get("monthly_longhual", {}).get(month_idx, 0)
         blackout_regions = {r for r, days in rules.blackout if day in days}
-        ev = self._evaluate_cargo(cargo, match, rules, blackout_regions, now, hard_end, lat, lng)
+        ev = self._evaluate_cargo(
+            cargo, match, rules, blackout_regions, now, hard_end, lat, lng,
+            night_capped=self._night_window_capped(rules, plan, day),
+        )
         if ev is None:
             self._logger.info("[LLM] rejected take_order: cargo_id=%s failed deterministic feasibility", cargo_id)
             return False
@@ -1602,6 +1676,7 @@ class ModelDecisionService:
         if (rules.longhaul_cap_orders is not None
                 and cost_time > rules.longhaul_min_minutes
                 and longhual_count >= rules.longhaul_cap_orders
+                and not self._longhaul_cap_credit(rules, plan, day)
                 and net <= rules.longhaul_penalty):
             self._logger.info(
                 "[LLM] rejected take_order: over long-haul cap and net=%.0f<=penalty month=%d", net, month_idx
@@ -2358,12 +2433,16 @@ class ModelDecisionService:
         # the scan cache). Lets the deterministic ranking value an order by its
         # whole-day potential (re-load at a liquid drop-off), not just standalone.
         liq_rows = self._cargo_liquidity_stats(now)
+        # [B1] night-rest rule already at its monthly cap → crossings are free.
+        night_capped = self._night_window_capped(rules, plan, day)
+        # [B1] long-haul over-cap penalty already at its monthly cap → free too.
+        longhaul_free = self._longhaul_cap_credit(rules, plan, day)
 
         def _score_item(cargo, item, now_t):
             nonlocal best, best_item, best_score, best_is_required, best_is_category_target, best_pickup_km, best_cost_time
             if str(cargo.get("cargo_id", "")) in plan.get("failed_cargo_ids", set()):
                 return
-            ev = self._evaluate_cargo(cargo, item, rules, blackout_regions, now_t, day_end, lat, lng)
+            ev = self._evaluate_cargo(cargo, item, rules, blackout_regions, now_t, day_end, lat, lng, night_capped=night_capped)
             if ev is None:
                 return
             net, touches_required, occupied, pkm = ev
@@ -2380,7 +2459,8 @@ class ModelDecisionService:
             eff_net = net
             if (rules.longhaul_cap_orders is not None
                     and cost_time > rules.longhaul_min_minutes
-                    and longhual_count >= rules.longhaul_cap_orders):
+                    and longhual_count >= rules.longhaul_cap_orders
+                    and not longhaul_free):
                 eff_net = net - rules.longhaul_penalty
                 if eff_net <= 0:
                     return
@@ -2454,19 +2534,39 @@ class ModelDecisionService:
         if best is None:
             return None
         if hunt_category and urgent_category and not best_is_category_target:
-            plan["_category_miss_today"] = day
-            self._logger.info(
-                "category target urgent: skip non-category best driver_id=%s cat=%s needed=%d remaining_days=%d",
-                driver_id, cat_target, cat_needed, remaining_month_days,
-            )
-            return None
+            # [B2] Category-urgency softening: skipping the non-category best
+            # keeps the slot free to hunt the quota category, but a genuinely big
+            # non-category order can be worth MORE than the marginal shortfall
+            # penalty it might cost. Take it when its net clearly beats that
+            # per-missing-order penalty (known penalty only; unknown → stay
+            # conservative and keep hunting, the fail-safe).
+            cat_pen = rules.rule_penalties.get("category_targets")
+            take_anyway = False
+            if _CATEGORY_SOFT and isinstance(cat_pen, (int, float)) and cat_pen > 0:
+                ev = self._evaluate_cargo(
+                    best, best_item or {}, rules, blackout_regions, now, day_end, lat, lng,
+                    night_capped=night_capped,
+                )
+                if ev is not None and ev[0] > float(cat_pen):
+                    take_anyway = True
+                    self._logger.info(
+                        "[B2] urgent category but big non-cat net=%.0f > cat_penalty=%.0f -> take it",
+                        ev[0], float(cat_pen),
+                    )
+            if not take_anyway:
+                plan["_category_miss_today"] = day
+                self._logger.info(
+                    "category target urgent: skip non-category best driver_id=%s cat=%s needed=%d remaining_days=%d",
+                    driver_id, cat_target, cat_needed, remaining_month_days,
+                )
+                return None
         latest_now = int(self._api.get_driver_status(driver_id)["simulation_progress_minutes"])
         # Revalidate against the same finish deadline semantics used to select
         # the order (including the past-midnight extension); clamping back to
         # the plain same-day deadline here would silently reject every order
         # the extension had legitimately allowed.
         latest_deadline = min(day_end, self._order_finish_deadline(rules, plan, latest_now, day))
-        latest_ev = self._evaluate_cargo(best, best_item or {}, rules, blackout_regions, latest_now, latest_deadline, lat, lng)
+        latest_ev = self._evaluate_cargo(best, best_item or {}, rules, blackout_regions, latest_now, latest_deadline, lat, lng, night_capped=night_capped)
         if latest_ev is None:
             self._logger.info(
                 "rejected selected order after scan-time revalidation cargo_id=%s now=%d deadline=%d",
@@ -2483,6 +2583,7 @@ class ModelDecisionService:
             rules.longhaul_cap_orders is not None
             and latest_cost_time > rules.longhaul_min_minutes
             and longhual_count >= rules.longhaul_cap_orders
+            and not longhaul_free
             and latest_net - rules.longhaul_penalty <= 0
         ):
             return None
@@ -2595,7 +2696,10 @@ class ModelDecisionService:
         for item in scan[1]:
             cargo = item.get("cargo", {})
             if str(cargo.get("cargo_id", "")) == cargo_id:
-                ev = self._evaluate_cargo(cargo, item, rules, blackout_regions, now, hard_end, lat, lng)
+                ev = self._evaluate_cargo(
+                    cargo, item, rules, blackout_regions, now, hard_end, lat, lng,
+                    night_capped=self._night_window_capped(rules, plan, day),
+                )
                 if ev is None:
                     return None
                 net, _r, occupied, _pk = ev
@@ -2756,7 +2860,7 @@ class ModelDecisionService:
         net *= avoid_penalty
         return net, slat, slng, scity
 
-    def _evaluate_cargo(self, cargo, item, rules, blackout_regions, now, day_end, lat, lng):
+    def _evaluate_cargo(self, cargo, item, rules, blackout_regions, now, day_end, lat, lng, *, night_capped: bool = False):
         # Economic treatment of preference violations: when the parse step
         # attributed a per-violation penalty amount to a rule kind, a violating
         # order is not hard-rejected — the penalty is subtracted from its net
@@ -2885,6 +2989,10 @@ class ModelDecisionService:
             ):
                 return None
             crossed_night_pen = float(night_pen) * crossings
+            if night_capped:
+                # [B1] the night rule has already hit its monthly cap — the
+                # scorer charges no more, so further crossings are free.
+                crossed_night_pen = 0.0
             violation_cost += crossed_night_pen
         elif finish > day_end:
             return None  # don't cross midnight (keeps rest windows clean)
@@ -3185,7 +3293,9 @@ class ModelDecisionService:
         '- rule_penalties: 各类规则的单次违约扣款金额对象（仅当输入含 penalty_amounts 时填写，否则 null）。'
         '把每条偏好的金额归因到其抽出的规则类别，键限：'
         '"allowed_regions"/"forbidden_regions"/"forbidden_categories"/"allowed_categories"/"night_window"/"category_targets"/"dated_events"/"longhaul_cap"。'
-        '一条偏好含多种规则时金额填到每个对应键；无法确定归因的键省略。\n\n'
+        '一条偏好含多种规则时金额填到每个对应键；无法确定归因的键省略。\n'
+        '- rule_penalty_caps: 各类规则的累计扣款上限对象（仅当输入 penalty_caps 含非 null 值时填写，键同 rule_penalties；'
+        '某规则不封顶则省略该键）。例如「每天违规扣500，最多扣5000」→ rule_penalties 该键=500, rule_penalty_caps 该键=5000。\n\n'
         "关键规则：\n"
         "1) 日期用该月日数 1-31。中文数字要转换（十二号→12，二十号→20，三十一号→31）。\n"
         "2) 坐标：偏好中'地名（纬度,经度）'→直接取。输入若有 known_coordinates 优先使用。"
@@ -3820,6 +3930,14 @@ class ModelDecisionService:
             for k, v in rp.items():
                 if isinstance(k, str) and isinstance(v, (int, float)) and v > 0:
                     rules.rule_penalties[k] = max(rules.rule_penalties.get(k, 0.0), float(v))
+        # [B1] per-rule monthly penalty caps (parallel to rule_penalties).
+        rpc = data.get("rule_penalty_caps")
+        if isinstance(rpc, dict):
+            for k, v in rpc.items():
+                if isinstance(k, str) and isinstance(v, (int, float)) and v > 0:
+                    # keep the lowest (tightest) cap seen for a kind
+                    prev = rules.rule_caps.get(k)
+                    rules.rule_caps[k] = float(v) if prev is None else min(prev, float(v))
         rest_h = data.get("daily_rest_hours")
         if isinstance(rest_h, (int, float)) and rest_h > 0:
             rules.daily_rest_minutes = max(rules.daily_rest_minutes, int(round(rest_h * 60)))

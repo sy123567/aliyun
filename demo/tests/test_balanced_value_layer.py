@@ -137,6 +137,133 @@ def test_anti_strand_min_net_gate_blocks_worse_target() -> None:
     assert act_high is None, act_high
 
 
+# ============================================================ B1: penalty cap
+
+NIGHT = (1260, 1800)
+
+
+def _night_rules(*, pen=500.0, cap=None):
+    rules = DriverRules()
+    rules.no_drive_windows.append(NIGHT)
+    rules.rule_penalties["night_window"] = pen
+    if cap is not None:
+        rules.rule_caps["night_window"] = cap
+    return rules
+
+
+def test_night_window_capped_detects_exhausted_cap() -> None:
+    svc = _svc()
+    rules = _night_rules(pen=500.0, cap=1000.0)  # 2 crossings exhaust the cap
+    plan = {"monthly_night_violations": {0: 2}}
+    assert svc._night_window_capped(rules, plan, 0) is True
+    plan_below = {"monthly_night_violations": {0: 1}}
+    assert svc._night_window_capped(rules, plan_below, 0) is False
+    # no cap parsed -> never credited
+    assert svc._night_window_capped(_night_rules(cap=None), {"monthly_night_violations": {0: 9}}, 0) is False
+
+
+def test_capped_night_crossing_is_free_in_evaluate() -> None:
+    """Once the night cap is exhausted, a crossing order is priced with NO rest
+    penalty (the scorer charges no more)."""
+    svc = _svc()
+    rules = _night_rules(pen=500.0, cap=1000.0)
+    cargo = {
+        "cargo_id": "C", "cargo_name": "普货",
+        "start": {"lat": LAT, "lng": LNG, "city": "广州"},
+        "end": {"lat": LAT, "lng": LNG, "city": "广州"},
+        "price": 2000.0, "cost_time_minutes": 300, "load_time": None,
+    }
+    item = {"cargo": cargo, "distance_km": 0.0}
+    # not capped: net = 2000 - 500 = 1500
+    uncapped = svc._evaluate_cargo(cargo, item, rules, set(), 1080, 1260, LAT, LNG, night_capped=False)
+    assert uncapped is not None and abs(uncapped[0] - 1500.0) < 1.0, uncapped
+    # capped: penalty waived, net = 2000
+    capped = svc._evaluate_cargo(cargo, item, rules, set(), 1080, 1260, LAT, LNG, night_capped=True)
+    assert capped is not None and abs(capped[0] - 2000.0) < 1.0, capped
+
+
+def test_longhaul_cap_credit_after_cap_exhausted() -> None:
+    svc = _svc()
+    rules = DriverRules()
+    rules.longhaul_cap_orders = 5
+    rules.rule_penalties["longhaul_cap"] = 1000.0
+    rules.rule_caps["longhaul_cap"] = 2000.0  # 2 over-cap orders exhaust it
+    # 7 long hauls -> 2 over cap -> 2*1000 == cap -> credited
+    assert svc._longhaul_cap_credit(rules, {"monthly_longhual": {0: 7}}, 0) is True
+    # 6 long hauls -> 1 over cap -> 1000 < 2000 -> not yet
+    assert svc._longhaul_cap_credit(rules, {"monthly_longhual": {0: 6}}, 0) is False
+
+
+def test_penalty_cap_credit_can_be_disabled() -> None:
+    svc = _svc()
+    rules = _night_rules(pen=500.0, cap=1000.0)
+    original = mds._PENALTY_CAP_CREDIT
+    mds._PENALTY_CAP_CREDIT = False
+    try:
+        assert svc._night_window_capped(rules, {"monthly_night_violations": {0: 9}}, 0) is False
+    finally:
+        mds._PENALTY_CAP_CREDIT = original
+
+
+def test_rule_caps_parsed_from_llm_payload() -> None:
+    svc = _svc()
+    rules = DriverRules()
+    svc._merge_llm_rules(rules, {
+        "rule_penalties": {"night_window": 500},
+        "rule_penalty_caps": {"night_window": 5000},
+    })
+    assert rules.rule_penalties.get("night_window") == 500
+    assert rules.rule_caps.get("night_window") == 5000
+
+
+# ===================================================== B2: category softening
+
+def _full_plan() -> dict:
+    return {
+        "rest_done": set(), "zeng_order_days": set(), "dated_single_done": set(),
+        "dated_route_done": set(), "strand_repo": set(), "orders_today": {},
+        "total_deadhead_km": 0.0, "monthly_deadhead_km": {}, "must_visit_days": {},
+        "first_order_taken": set(), "home_done": set(), "monthly_longhual": {},
+        "monthly_category_orders": {}, "failed_cargo_ids": set(),
+        "failed_cargo_reasons": {}, "off_days": set(), "_consecutive_waits": 0,
+        "strand_count": {},
+    }
+
+
+def _urgent_category_rules():
+    rules = DriverRules()
+    rules.monthly_category_targets = {0: {"水果": 12}}  # March quota, none done
+    rules.rule_penalties["category_targets"] = 500.0
+    return rules
+
+
+def test_category_soft_takes_big_noncat_order_when_net_beats_penalty() -> None:
+    # day 20 of March: remaining 11 <= 12+10 -> urgent; only a big non-cat order
+    big = _cargo("BIG", price=3000.0, cost_time=120)  # net ~3000 > 500
+    svc = _svc([big], progress=20 * 1440)
+    status = {"simulation_progress_minutes": 20 * 1440, "current_lat": LAT, "current_lng": LNG}
+    action = svc._pick_order(
+        "D", status, _urgent_category_rules(), _full_plan(), 20 * 1440, LAT, LNG, 20, 21 * 1440
+    )
+    assert action is not None and action["action"] == "take_order", action
+    assert action["params"]["cargo_id"] == "BIG", action
+
+
+def test_category_soft_off_keeps_urgent_skip() -> None:
+    big = _cargo("BIG", price=3000.0, cost_time=120)
+    svc = _svc([big], progress=20 * 1440)
+    status = {"simulation_progress_minutes": 20 * 1440, "current_lat": LAT, "current_lng": LNG}
+    original = mds._CATEGORY_SOFT
+    mds._CATEGORY_SOFT = False
+    try:
+        action = svc._pick_order(
+            "D", status, _urgent_category_rules(), _full_plan(), 20 * 1440, LAT, LNG, 20, 21 * 1440
+        )
+        assert action is None, action  # urgent skip preserved
+    finally:
+        mds._CATEGORY_SOFT = original
+
+
 def _run() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     failures = 0
