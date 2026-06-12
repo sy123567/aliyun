@@ -103,8 +103,12 @@ def test_query_cargo_wrapper_caches_metadata() -> None:
 
 def _validate_with_net(svc, plan, *, cost_time, net):  # noqa: ANN001, ANN201
     """Drive _validate_llm_take_order with a controlled marginal net via a stub
-    _evaluate_cargo, so we test only the soft long-haul gate (not geo feasibility)."""
+    _evaluate_cargo, so we test only the soft long-haul gate (not geo feasibility).
+
+    The cap is now preference-driven: it must be set on the driver's rules
+    (here mimicking D001's parsed "每月>8h长途≤5单" preference)."""
     rules = DriverRules()
+    rules.longhaul_cap_orders = 5
     items = [{"cargo": {"cargo_id": "99", "cost_time_minutes": cost_time, "cargo_name": "",
                         "start": {"city": ""}, "end": {"city": ""}}}]
     svc._evaluate_cargo = lambda *a, **k: (float(net), False, 600, 0.0)  # type: ignore[assignment]
