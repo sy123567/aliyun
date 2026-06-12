@@ -19,6 +19,7 @@ if str(_DEMO_ROOT) not in sys.path:
 
 import agent.model_decision_service as mds  # noqa: E402
 from agent.model_decision_service import (  # noqa: E402
+    DecisionHistory,
     DriverRules,
     ModelDecisionService,
 )
@@ -262,6 +263,26 @@ def test_category_soft_off_keeps_urgent_skip() -> None:
         assert action is None, action  # urgent skip preserved
     finally:
         mds._CATEGORY_SOFT = original
+
+
+# ============================================================ C1: chain lookahead
+
+def test_decision_prompt_has_chain_lookahead_guidance() -> None:
+    """C1: the decision system prompt instructs the (thinking) model to do 2-3
+    step chain lookahead using to_liq + the active-market table."""
+    api = _StubApi(items=[], progress=480)
+    captured: list[dict] = []
+    api.model_chat_completion = lambda payload: (  # type: ignore[assignment]
+        captured.append(payload) or {"choices": [{"message": {"content": "{}"}}]}
+    )
+    svc = ModelDecisionService(api)
+    status = {"simulation_progress_minutes": 480, "current_lat": LAT, "current_lng": LNG}
+    svc._llm_decide_with_history(
+        "D", status, DriverRules(), _full_plan(), DecisionHistory(), 480, LAT, LNG, 0, 480
+    )
+    assert captured, "LLM was not called"
+    sys_msg = captured[0]["messages"][0]["content"]
+    assert "接力链路前瞻" in sys_msg, sys_msg
 
 
 def _run() -> int:

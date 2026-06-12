@@ -32,7 +32,11 @@ competition: an LLM-driven truck-driver decision agent that maximises monthly
 
 ### Behaviour knobs
 Agent behaviour is tuned via `AGENT_*` env vars read at import in
-`model_decision_service.py` (e.g. `AGENT_NIGHT_CROSS_MARGIN`,
-`AGENT_ORDER_TIME_OVERHEAD_MIN`, `AGENT_LLM_WAIT_OVERRIDE_NET_PER_H`,
-`AGENT_DECISION_THINKING`). Defaults are the submission values; sweep on the official
-platform, not via single local runs.
+`model_decision_service.py`. Defaults are the submission values; sweep on the
+official platform, not via single local runs. Current knobs include:
+`AGENT_NIGHT_CROSS_MARGIN`, `AGENT_NIGHT_CROSS_MAX_DAYS`,
+`AGENT_ORDER_TIME_OVERHEAD_MIN`, `AGENT_CHAIN_VALUE_WEIGHT`, `AGENT_ABS_NET_ALPHA`,
+`AGENT_WEAK_LOCAL_REPOSITION_NET_PER_H` (default 0 = off), `AGENT_PENALTY_CAP_CREDIT`,
+`AGENT_CATEGORY_SOFT`, `AGENT_LLM_WAIT_OVERRIDE_NET_PER_H`, `AGENT_DECISION_THINKING`,
+`AGENT_THINKING_WALL_BUDGET_SECONDS`. See `docs/agent-optimization-notes.md` §-4 for
+what each does and how to revert to prior behaviour.

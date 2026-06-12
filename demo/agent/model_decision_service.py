@@ -109,6 +109,11 @@ _DECISION_THINKING = os.environ.get("AGENT_DECISION_THINKING", "1").strip() not 
 # driver therefore gets a wall-clock budget; when the run is projected to
 # exceed it (pro-rated by simulation progress), thinking switches off for the
 # rest of that driver's season and decisions fall back to fast mode.
+# [C2] Raised 6000 → 6600s/driver (≈110min; ~3.67h for two drivers, still under
+# the 4h hard cap with margin). The submission measured avg ~3.1-3.4s/step and
+# only ~2.1M token total — far from both the 4h and the 5M-token/driver caps —
+# so more steps can afford thinking. The pro-rated guard below still hard-stops
+# before 4h, so this only spends otherwise-idle wall-clock budget.
 _THINKING_WALL_BUDGET_SECONDS = float(os.environ.get("AGENT_THINKING_WALL_BUDGET_SECONDS", "6600"))
 # --- value-layer "balanced" optimisation knobs (plan A/B/C; all env-tunable so
 #     the optimum can be swept on the official platform, see notes §2) -------
@@ -1232,8 +1237,11 @@ class ModelDecisionService:
             '一笔 net=5000 的长途通常胜过好几笔 net=600 的小单——不要只图短途快单；'
             '②**效率 net_per_h**：净收益相近时，每小时净收益高的更优；'
             '③**接力价值 to_liq**：卸货城市近期出发货源的「数量/均价(元/h)」——卸到货多价高的城市下一单立刻有得接，'
-            '卸到没有 to_liq 的冷门地会空趟返程；net_per_h 略低但 net 大且 to_liq 旺的单，全天总收益往往更高。'
-            '你有充足的思考预算，可据 to_liq 预判接力后续 1-2 单再定。若有未达标品类指标则优先该品类\n'
+            '卸到没有 to_liq 的冷门地会空趟返程；net_per_h 略低但 net 大且 to_liq 旺的单，全天总收益往往更高。\n'
+            '**接力链路前瞻（充分利用你的思考预算）**：不要只看当前这一单的 net，要把它当作链条的第一环，'
+            '结合候选的 to_liq 和下方【活跃市场】表，向前推演 2-3 单：接这单卸到 X → X 的 to_liq/活跃度说明下一单能接到什么 → '
+            '再下一步又能到哪。比较"高 net 但卸到冷门城(链条到此中断、要空驶找货)"与"net 稍低但卸到 to_liq 旺的枢纽(链条持续、全天连着接)"，'
+            '选**整条链全天净收益总和**最大的那一单。若有未达标品类指标则优先能推进该品类的链路\n'
             '- wait: 等待。参数: {"duration_minutes": 分钟数}。仅用于休息/禁驶时段(见下方硬约束)；'
             '有正净值候选时等待=白白烧时间，不要因为"等更好的货"而wait\n'
             '- reposition: 空驶到新位置。参数: {"latitude": 纬度, "longitude": 经度}。'
