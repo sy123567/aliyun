@@ -81,6 +81,20 @@ _ALLOWED_REGION_ALIASES = {
 }
 _RELATIVE_PROVINCE_REGIONS = ("上海", "江苏", "浙江", "安徽", "广东")
 
+# Finals drivers are unknown (one Guangdong, one Yangtze-delta) and their raw
+# preference texts may be written in dialect / colloquial register (Cantonese,
+# Wu, Hakka...). Every preference-understanding prompt carries this hint plus a
+# small high-frequency glossary so a dialect phrasing is never the reason a
+# daily-recurring constraint is missed.
+_DIALECT_HINT = (
+    "注意：偏好原文可能用粤语/客家话/吴语等方言或口语写成（司机可能来自广东或江浙沪），"
+    "务必按含义理解，绝不能因为措辞陌生就放过其中的约束。常见方言对照："
+    "唔/咪/勿/覅/弗=不、冇=没有、嘢=东西/货、瞓觉/瞓=睡觉、困觉=睡觉、"
+    "返屋企/转屋里/屋里厢=回家、收工/收车=结束出车、夜晚黑/夜里向/晏夜=晚上、"
+    "朝早/早晨头/晨光=早上、晏昼=下午、晌午=中午、礼拜=星期、听日/明朝=明天、"
+    "成日=整天、净系/单单=只、唔好/咪要/覅要=不要、几多=多少、廿=二十、卅=三十。"
+)
+
 
 _SIM_EPOCH = datetime(2026, 3, 1)
 _WEEKDAY_NAMES = ("一", "二", "三", "四", "五", "六", "日")
@@ -601,6 +615,17 @@ class ModelDecisionService:
         # accumulators from the authoritative decision history (see
         # _sync_monthly_counts_from_history).
         self._cargo_meta: dict[str, dict[str, Any]] = {}
+        # All cargo_name values ever scanned. When a parsed category target
+        # exists verbatim in the dataset, quota progress is counted by exact
+        # name (the scorer credits quota orders by exact cargo_name).
+        self._cargo_names: set[str] = set()
+        # (region, city) -> bool membership verdicts from the semantic
+        # fallback used when the static region table + substring matching
+        # cannot resolve an unknown region name (e.g. 苏南 / dialect names).
+        self._region_member_cache: dict[tuple[str, str], bool] = {}
+        # Per-decision-step budget of *new* semantic region lookups, so a wide
+        # cargo scan can never stack dozens of blocking model calls.
+        self._sem_region_budget: int = 0
 
     def _query_cargo(self, driver_id: str, latitude: float, longitude: float, k: int) -> dict[str, Any]:
         """query_cargo wrapper that caches cargo metadata for every scanned item.
@@ -616,13 +641,16 @@ class ModelDecisionService:
             cid = str(cargo.get("cargo_id", "") or "")
             if not cid:
                 continue
+            name = str(cargo.get("cargo_name", "") or "")
             self._cargo_meta[cid] = {
                 "cost_time_minutes": int(cargo.get("cost_time_minutes", 0) or 0),
-                "cargo_name": str(cargo.get("cargo_name", "") or ""),
+                "cargo_name": name,
                 "price": float(cargo.get("price", 0.0) or 0.0),
                 "start_city": str((cargo.get("start") or {}).get("city", "") or ""),
                 "end_city": str((cargo.get("end") or {}).get("city", "") or ""),
             }
+            if name:
+                self._cargo_names.add(name)
         return resp
 
     def _sync_monthly_counts_from_history(self, driver_id: str, plan: dict[str, Any]) -> None:
@@ -735,6 +763,8 @@ class ModelDecisionService:
         history = self._history.setdefault(driver_id, DecisionHistory())
         self._step_count.setdefault(driver_id, 0)
         self._step_count[driver_id] += 1
+        # Fresh per-step budget for semantic region-membership lookups.
+        self._sem_region_budget = 6
 
         # Preferences may only become visible inside their date window, so the off-day
         # set is recomputed each step from the rules known so far.
@@ -851,7 +881,7 @@ class ModelDecisionService:
         cargo_resp = self._query_cargo(driver_id=driver_id, latitude=lat, longitude=lng, k=30)
         items = cargo_resp.get("items", [])
         now = int(self._api.get_driver_status(driver_id)["simulation_progress_minutes"])
-        hard_end = self._hard_order_deadline(rules, plan, now, day)
+        hard_end = self._order_finish_deadline(rules, plan, now, day)
         blackout_regions = {r for r, days in rules.blackout if day in days}
         failed_ids = plan.get("failed_cargo_ids", set())
 
@@ -909,6 +939,7 @@ class ModelDecisionService:
             "- 不要连续wait超过2次！如果当前货源不合适，应该reposition到新区域寻找更好货源\n"
             "- 品类指标很重要：未达标会有高额罚款。优先接指标品类的货\n"
             "- 只能从候选货源列表里选 cargo_id；候选为空或都不合适就 wait/reposition\n"
+            "- 偏好原文可能是粤语/吴语等方言或口语（唔/咪/勿/覅=不、瞓觉=睡觉、返屋企=回家、收工=收车、晏昼=下午），按含义遵守\n"
             "- 只输出一个JSON对象: {\"action\": \"...\", \"params\": {...}, \"reason\": \"20字内\"}\n"
         )
 
@@ -1073,6 +1104,33 @@ class ModelDecisionService:
                 hard_end = min(hard_end, cutoff)
         return hard_end
 
+    def _order_finish_deadline(self, rules: DriverRules, plan: dict, now: int, day: int) -> int:
+        """Latest finish time for a new order, including the past-midnight
+        extension for drivers whose rest rules allow it.
+
+        A *flexible-rest* driver (N continuous hours anywhere, no fixed window)
+        may let the day's last order run past midnight as long as a full rest
+        block still fits inside the next day. A driver with NO rest constraints
+        at all gets the same extension — capping such a driver at midnight was
+        a pure gross-income leak (the most profitable evening long hauls were
+        rejected for a rest rule that does not exist). Both cases require the
+        next day to be an ordinary working day. Always clamped to the
+        simulation horizon: the engine refuses to credit orders predicted to
+        finish after month end."""
+        hard_end = self._hard_order_deadline(rules, plan, now, day)
+        rest_free = (
+            rules.daily_rest_minutes == 0
+            and rules.home_by_minute is None
+            and rules.no_drive_until_minute is None
+        )
+        if (rules.rest_window is None and not rules.has_no_drive(day)
+                and not rules.has_no_drive(day + 1)
+                and (rules.daily_rest_minutes > 0 or rest_free)
+                and self._next_day_is_ordinary(rules, plan, day)):
+            day_end = (day + 1) * DAY_MINUTES
+            hard_end = max(hard_end, day_end + (DAY_MINUTES - rules.day_rest_block))
+        return min(hard_end, MONTH_DAYS * DAY_MINUTES)
+
     def _interval_overlaps_no_drive(self, rules: DriverRules, start: int, end: int) -> bool:
         """Whether an absolute minute interval touches a repeated no-drive window."""
         if end <= start or not rules.has_any_no_drive():
@@ -1103,9 +1161,7 @@ class ModelDecisionService:
         tag: str = "schedule",
         target_city: str | None = None,
     ) -> dict[str, Any] | None:
-        if rules.allowed_regions and not _target_matches_allowed_regions(
-            rules.allowed_regions, target_lat, target_lng, target_city
-        ):
+        if not self._allowed_region_ok(rules, target_lat, target_lng, target_city):
             self._logger.info(
                 "[%s] rejected reposition: target outside allowed_regions=%s city=%s target=(%.4f,%.4f)",
                 tag, sorted(rules.allowed_regions), target_city, target_lat, target_lng,
@@ -1224,6 +1280,7 @@ class ModelDecisionService:
         '"replaces_default":true或false,'
         '"today_plan":"100字内的今日执行要点",'
         '"category_focus":"今天应优先承接的货物品类名或null"}\n'
+        + _DIALECT_HINT + "\n"
         "字段说明：\n"
         '- no_drive_today: 今天（含跨入明晨）不得接单/空驶、只能停车等待的时段。'
         '跨午夜用 end_hour<start_hour（如21点到次日6点→start_hour 21, end_hour 6）。半小时用0.5。'
@@ -1267,7 +1324,11 @@ class ModelDecisionService:
             "今天": f"{date_str} {weekday_str}" + ("（周末）" if is_weekend else "（工作日）"),
             "本月": _month_name(month_idx),
             "偏好": [
-                {"原文": r["content"], "单次违约扣款": r.get("penalty_amount")}
+                {
+                    "原文": r["content"],
+                    "单次违约扣款": r.get("penalty_amount"),
+                    "累计扣款上限": r.get("penalty_cap"),
+                }
                 for r in records
             ],
         }
@@ -1316,6 +1377,34 @@ class ModelDecisionService:
             win = self._coerce_directive_window(w)
             if win is not None and win not in windows:
                 windows.append(win)
+        # Hallucination gate for *new* windows: a directive window that does not
+        # reshape any statically parsed window would be enforced additively and
+        # silently cost prime working hours every day (a pure gross-income
+        # leak). Such windows must survive a semantic check against the raw
+        # preference texts; _confirm_rule_holds is fail-safe (kept on any model
+        # failure / uncertainty) and cached, so genuine calendar-conditional
+        # windows still get through at ~zero extra cost.
+        if windows:
+            all_pref_text = "\n".join(r["content"] for r in records)
+            kept: list[tuple[int, int]] = []
+            for win in windows:
+                if any(_windows_intersect(win, sw) for sw in rules.no_drive_windows):
+                    kept.append(win)
+                    continue
+                sm, em = win
+                em_d = em % DAY_MINUTES
+                desc = (
+                    f"今天是{date_str}{weekday_str}，司机今天 {sm // 60:02d}:{sm % 60:02d}-"
+                    f"{em_d // 60:02d}:{em_d % 60:02d} 不得接单、不得空驶（只能停车等待）"
+                )
+                if self._confirm_rule_holds(desc, all_pref_text):
+                    kept.append(win)
+                else:
+                    self._logger.info(
+                        "daily directive: dropped unconfirmed window %s day=%d driver_id=%s",
+                        win, day, driver_id,
+                    )
+            windows = kept
         notes_parts: list[str] = []
         today_plan = str(data.get("today_plan") or "").strip()
         if today_plan:
@@ -1494,15 +1583,29 @@ class ModelDecisionService:
             lines.append("\n【必须遵守·未结构化偏好】以下偏好未被自动调度引擎覆盖，每次决策都必须逐条核对，违反会被扣罚:")
             for rc in residuals:
                 pen = rc.get("penalty")
-                pen_txt = f"（违约每次扣{int(pen)}元）" if pen else ""
+                cap = rc.get("cap")
+                pen_txt = ""
+                if pen:
+                    cap_txt = f"，累计上限{int(cap)}元" if cap else "，扣款不封顶"
+                    pen_txt = f"（违约每次扣{int(pen)}元{cap_txt}）"
                 lines.append(f"  「{rc.get('text', '')}」{pen_txt}")
 
-        # Add raw preference texts for context (skip ones already shown above)
+        # Add raw preference texts for context (skip ones already shown above),
+        # annotated with their penalty economics: an uncapped daily rule is
+        # catastrophic, a low-capped one has bounded downside.
+        records = self._pref_records.get(driver_id) or []
+        rec_by_text = {r["content"]: r for r in records}
         prefs = [p for p in self._get_active_preferences(driver_id) if p not in residual_texts]
         if prefs:
             lines.append("\n原始偏好文本:")
             for p in prefs:
-                lines.append(f"  「{p}」")
+                rec = rec_by_text.get(p) or {}
+                pen, cap = rec.get("penalty_amount"), rec.get("penalty_cap")
+                ann = ""
+                if isinstance(pen, (int, float)) and pen > 0:
+                    cap_txt = f"，累计上限{int(cap)}" if isinstance(cap, (int, float)) and cap > 0 else "，不封顶"
+                    ann = f"（违约每次扣{int(pen)}{cap_txt}）"
+                lines.append(f"  「{p}」{ann}")
 
         return "\n".join(lines)
 
@@ -1688,12 +1791,12 @@ class ModelDecisionService:
         # driver may let the day's *last* order finish past midnight (up to a cap that
         # still leaves room for a full rest block inside the next day), but only when
         # the next day is an ordinary working day — never crossing into an off day,
-        # blackout day or a dated-event day.
-        hard_end = self._hard_order_deadline(rules, plan, now, day)
-        if (rules.rest_window is None and not rules.has_no_drive(day)
-                and not rules.has_no_drive(day + 1) and rules.daily_rest_minutes > 0):
-            if self._next_day_is_ordinary(rules, plan, day):
-                hard_end = max(hard_end, day_end + (DAY_MINUTES - rules.day_rest_block))
+        # blackout day or a dated-event day. A driver with NO rest constraints at
+        # all (no rest window / daily-rest hours / night windows / home rule) gets
+        # the same extension: capping such a driver's orders at midnight was a pure
+        # gross-income leak — the most profitable evening long hauls were rejected
+        # for a rest rule that does not exist.
+        hard_end = self._order_finish_deadline(rules, plan, now, day)
         order = self._pick_order(driver_id, status, rules, plan, now, lat, lng, day, hard_end)
         if order is not None:
             return order
@@ -1823,7 +1926,7 @@ class ModelDecisionService:
         targets = getattr(rules, "monthly_category_targets", {}).get(month_idx, {}) if rules else {}
         if targets:
             for cat in targets:
-                if self._category_matches_sem(cat, cargo_name):
+                if self._category_progress_match(cat, cargo_name):
                     cat_orders[cat] = cat_orders.get(cat, 0) + 1
         # No parsed targets -> nothing to track (was a D001-specific 水果/建材
         # fallback that does not generalize to other drivers).
@@ -1844,6 +1947,11 @@ class ModelDecisionService:
         # [OPT] Determine current month index and category targets
         month_idx = _month_index_for_day(day)
         longhual_count = plan["monthly_longhual"].get(month_idx, 0)
+        # NOTE: must be defined here — _score_item and the final deadhead-cap
+        # check below close over it; previously it was only defined in
+        # _llm_decide_with_history, so any driver with a monthly deadhead cap
+        # hit a NameError on every deterministic pick.
+        month_deadhead = plan.setdefault("monthly_deadhead_km", {}).get(month_idx, 0.0)
         cat_target, cat_needed = self._get_category_target(rules, plan, day)
 
         # [OPT] When a monthly category target is at risk, widen earlier.  The
@@ -1853,6 +1961,25 @@ class ModelDecisionService:
         remaining_month_days = max(1, _month_end_day_exclusive(month_idx) - day)
         urgent_category = bool(hunt_category and remaining_month_days <= cat_needed + 10)
         initial_k = 600 if urgent_category else (200 if hunt_category else 60)
+
+        # A k=600 scan costs ~60 *simulated* minutes (scan_minutes=ceil(n/10)).
+        # Re-running it every step from the same spot after it already found no
+        # target-category cargo burns hours of earning time per day for zero new
+        # information. Throttle: while parked near the last fruitless wide scan
+        # and within 150 sim-minutes of it, fall back to a k=200 scan.
+        def _wide_scan_fruitless_nearby() -> bool:
+            wide = plan.get("_wide_scan")
+            if wide is None:
+                return False
+            w_now, w_lat, w_lng, w_found = wide
+            return (
+                not w_found
+                and now - w_now < 150
+                and _haversine_km(lat, lng, w_lat, w_lng) < 30
+            )
+
+        if initial_k >= 600 and _wide_scan_fruitless_nearby():
+            initial_k = 200
 
         cargo_resp = self._query_cargo(driver_id=driver_id, latitude=lat, longitude=lng, k=initial_k)
         items = cargo_resp.get("items", [])
@@ -1902,7 +2029,9 @@ class ModelDecisionService:
             cargo_name = str(cargo.get("cargo_name", ""))
             is_cat_target = False
             if cat_target and cat_needed > 0:
-                if self._category_matches_sem(cat_target, cargo_name):
+                # Same predicate as quota progress counting: only boost orders
+                # that will actually be credited toward the quota.
+                if self._category_progress_match(cat_target, cargo_name):
                     score *= 8.0 if urgent_category else 5.0
                     is_cat_target = True
 
@@ -1924,14 +2053,19 @@ class ModelDecisionService:
         for item in items:
             _score_item(item.get("cargo", {}), item, now)
 
-        # [OPT] If hunting category and not found yet, do an even wider k=600 search
-        if hunt_category and not best_is_category_target:
+        # [OPT] If hunting category and not found yet, do an even wider k=600
+        # search — unless a recent wide scan from this spot already came up
+        # empty (see throttle above).
+        if hunt_category and not best_is_category_target and initial_k < 600 and not _wide_scan_fruitless_nearby():
             cargo_resp2 = self._query_cargo(driver_id=driver_id, latitude=lat, longitude=lng, k=600)
             items2 = cargo_resp2.get("items", [])
             plan["_scan_items"] = (entry_now, items2)
             now = int(self._api.get_driver_status(driver_id)["simulation_progress_minutes"])
             for item in items2:
                 _score_item(item.get("cargo", {}), item, now)
+            plan["_wide_scan"] = (now, lat, lng, best_is_category_target)
+        elif initial_k >= 600:
+            plan["_wide_scan"] = (now, lat, lng, best_is_category_target)
 
         # Widen search if nothing found at all
         if best is None and not hunt_category:
@@ -1961,7 +2095,11 @@ class ModelDecisionService:
             )
             return None
         latest_now = int(self._api.get_driver_status(driver_id)["simulation_progress_minutes"])
-        latest_deadline = min(day_end, self._hard_order_deadline(rules, plan, latest_now, day))
+        # Revalidate against the same finish deadline semantics used to select
+        # the order (including the past-midnight extension); clamping back to
+        # the plain same-day deadline here would silently reject every order
+        # the extension had legitimately allowed.
+        latest_deadline = min(day_end, self._order_finish_deadline(rules, plan, latest_now, day))
         latest_ev = self._evaluate_cargo(best, best_item or {}, rules, blackout_regions, latest_now, latest_deadline, lat, lng)
         if latest_ev is None:
             self._logger.info(
@@ -2010,7 +2148,7 @@ class ModelDecisionService:
         target_locations = []
         for item in items:
             cargo = item.get("cargo", {})
-            if self._category_matches_sem(cat_target, str(cargo.get("cargo_name", ""))):
+            if self._category_progress_match(cat_target, str(cargo.get("cargo_name", ""))):
                 start = cargo.get("start", {})
                 target_locations.append({
                     "lat": start.get("lat", 0),
@@ -2163,12 +2301,12 @@ class ModelDecisionService:
         slat, slng = float(start.get("lat", 0.0)), float(start.get("lng", 0.0))
         elat, elng = float(end.get("lat", 0.0)), float(end.get("lng", 0.0))
         if rules.allowed_regions:
-            if not _target_matches_allowed_regions(rules.allowed_regions, slat, slng, scity):
+            if not self._allowed_region_ok(rules, slat, slng, scity):
                 return None
-            if not _target_matches_allowed_regions(rules.allowed_regions, elat, elng, ecity):
+            if not self._allowed_region_ok(rules, elat, elng, ecity):
                 return None
         for region in rules.forbidden_regions:
-            if _region_in_city(region, scity) or _region_in_city(region, ecity):
+            if self._forbidden_region_hit(region, scity) or self._forbidden_region_hit(region, ecity):
                 return None
         for region in blackout_regions:
             if _region_in_city(region, scity) or _region_in_city(region, ecity):
@@ -2260,14 +2398,14 @@ class ModelDecisionService:
         slat, slng = float(start.get("lat", 0.0)), float(start.get("lng", 0.0))
         elat, elng = float(end.get("lat", 0.0)), float(end.get("lng", 0.0))
         if rules.allowed_regions:
-            if not (_target_matches_allowed_regions(rules.allowed_regions, slat, slng, scity)
-                    and _target_matches_allowed_regions(rules.allowed_regions, elat, elng, ecity)):
+            if not (self._allowed_region_ok(rules, slat, slng, scity)
+                    and self._allowed_region_ok(rules, elat, elng, ecity)):
                 ap = rules.rule_penalties.get("allowed_regions")
                 if ap is None:
                     return None
                 violation_cost += ap
         for region in rules.forbidden_regions:
-            if _region_in_city(region, scity) or _region_in_city(region, ecity):
+            if self._forbidden_region_hit(region, scity) or self._forbidden_region_hit(region, ecity):
                 rp = rules.rule_penalties.get("forbidden_regions")
                 if rp is None:
                     return None
@@ -2428,18 +2566,19 @@ class ModelDecisionService:
             (float(status.get("current_lat", 0.0)), float(status.get("current_lng", 0.0))),
         )
         prefs = status.get("preferences") or []
-        items: list[tuple[str, Any]] = []
+        items: list[tuple[str, Any, Any]] = []
         for pref in prefs:
             if isinstance(pref, dict):
                 text = str(pref.get("content", "") or "")
                 penalty = pref.get("penalty_amount")
+                cap = pref.get("penalty_cap")
             else:
-                text, penalty = str(pref), None
+                text, penalty, cap = str(pref), None, None
             if text.strip():
-                items.append((text, penalty))
-        texts = [t for t, _ in items]
+                items.append((text, penalty, cap))
+        texts = [t for t, _, _ in items]
         seen = self._seen_prefs.setdefault(driver_id, set())
-        new_items = [(t, p) for t, p in items if t not in seen]
+        new_items = [(t, p, c) for t, p, c in items if t not in seen]
         if not new_items:
             return rules
 
@@ -2455,14 +2594,15 @@ class ModelDecisionService:
             records.append({
                 "content": content,
                 "penalty_amount": (pref.get("penalty_amount") if isinstance(pref, dict) else None),
+                "penalty_cap": (pref.get("penalty_cap") if isinstance(pref, dict) else None),
             })
 
         before = self._rules_fingerprint(rules)
         coord_map = self._collect_coords(prefs)
-        compiled: list[tuple[str, Any]] = []
-        for text, penalty in new_items:
-            if self._llm_parse_preferences(driver_id, [text], rules, coord_map, [penalty]):
-                compiled.append((text, penalty))
+        compiled: list[tuple[str, Any, Any]] = []
+        for text, penalty, cap in new_items:
+            if self._llm_parse_preferences(driver_id, [text], rules, coord_map, [penalty], [cap]):
+                compiled.append((text, penalty, cap))
             else:
                 # offline / model unavailable: deterministic regex fallback for
                 # this text only.
@@ -2504,7 +2644,7 @@ class ModelDecisionService:
                 if _region_in_city(region, name):
                     rules.blackout_coords[region] = loc
                     break
-        seen.update(t for t, _ in new_items)
+        seen.update(t for t, _p, _c in new_items)
         # Dedup avoid/forbidden AFTER supplement so regex-added items are also cleaned
         init_lat, init_lng = self._initial_position[driver_id]
         self._supplement_relative_allowed_regions(texts, rules, init_lat, init_lng)
@@ -2564,7 +2704,8 @@ class ModelDecisionService:
     # ----------------------------------------------------------- LLM preference parsing
     _PARSE_SYSTEM = (
         "你是货运司机偏好抽取器。把司机的自然语言偏好转成严格 JSON。\n"
-        "只输出一个 JSON 对象，禁止 markdown / 解释 / think标签。未提及的字段用 null 或空数组。\n\n"
+        "只输出一个 JSON 对象，禁止 markdown / 解释 / think标签。未提及的字段用 null 或空数组。\n"
+        + _DIALECT_HINT + "\n\n"
         "字段定义（宁缺毋错）：\n"
         '- daily_rest_hours: 每天连续休息最少小时数（数字或 null）\n'
         '- rest_window: 每天固定停车时段 {"start_hour":数字,"end_hour":数字}（或 null）。半小时用0.5，如11点半→11.5\n'
@@ -2630,7 +2771,9 @@ class ModelDecisionService:
         '11) "只跑/只接/仅在/不出X"是 allowed_regions，不是 forbidden_regions。\n'
         '12) 输入可能含 penalty_amounts 数组（与 preferences 一一对应的违约扣款金额）。'
         '金额越高的偏好越要逐字推敲、确保其全部约束被完整抽出，绝不能漏；尤其是每日生效的夜休/禁驶窗口和月度品类指标。'
-        '同时把各金额按规则类别归因填入 rule_penalties。\n\n'
+        '同时把各金额按规则类别归因填入 rule_penalties。\n'
+        '13) 输入可能含 penalty_caps 数组（各偏好的累计扣款上限，null=不封顶）。'
+        '不封顶且每日生效的约束最危险（按天复利），其全部细节必须最优先完整抽出。\n\n'
         "示例1：\n"
         '入: {"preferences":["每天零点到六点停着熄火睡觉","凡是生鲜货源碰不得","三月四号五号不往深圳（22.55，114.05）跑"]}\n'
         '出: {"daily_rest_hours":null,"rest_window":{"start_hour":0,"end_hour":6},'
@@ -2683,6 +2826,7 @@ class ModelDecisionService:
         self, driver_id: str, texts: list[str], rules: DriverRules,
         coord_map: dict[str, tuple[float, float]] | None = None,
         penalties: list[Any] | None = None,
+        penalty_caps: list[Any] | None = None,
     ) -> bool:
         """用大模型把全部可见偏好解析成结构化规则并合并进 rules。
 
@@ -2694,6 +2838,8 @@ class ModelDecisionService:
         payload: dict[str, Any] = {"preferences": texts}
         if penalties and len(penalties) == len(texts) and any(p for p in penalties):
             payload["penalty_amounts"] = penalties
+        if penalty_caps and len(penalty_caps) == len(texts) and any(c for c in penalty_caps):
+            payload["penalty_caps"] = penalty_caps
         if coord_map:
             payload["known_coordinates"] = {
                 name: {"lat": loc[0], "lng": loc[1]} for name, loc in coord_map.items()
@@ -2753,6 +2899,7 @@ class ModelDecisionService:
     _PREF_AUDIT_SYSTEM = (
         "你是货运司机偏好「覆盖审计器」。调度引擎已把司机的自然语言偏好编译成结构化规则；"
         "你逐条审计：每条偏好原文里的**全部约束**是否都已体现在 structured_rules 里。\n"
+        + _DIALECT_HINT + "\n"
         '输入 JSON: {"preferences":[原文...], "penalty_amounts":[违约扣款金额或null...], '
         '"structured_rules":"已结构化规则清单"}\n'
         "只输出一个 JSON 对象，禁止 markdown/解释：\n"
@@ -2775,7 +2922,7 @@ class ModelDecisionService:
         "1) 漏一条「每日生效」约束（夜休/禁驶时段/回家）代价最高：重点核对时间窗是否齐全、起止时刻与原文一致。\n"
         "2) 月度品类指标、整月休息天数、日期事件（某天到某地）逐条核对数字与日期。\n"
         "3) 某约束无法用上述字段表达时：representable=false、patch 留空、missing 写明该约束原意。\n"
-        "4) penalty_amounts 金额越高的偏好越要逐字核对。\n"
+        "4) penalty_amounts 金额越高的偏好越要逐字核对；penalty_caps 为 null（扣款不封顶）的偏好最优先核对。\n"
         "5) 已完整覆盖就 covered=true 且不输出 patch；拿不准时 covered=false 并给出 patch"
         "（结构化引擎对重复规则免疫，宁可重复、不可漏掉）。"
     )
@@ -2861,7 +3008,7 @@ class ModelDecisionService:
     def _audit_preference_coverage(
         self,
         driver_id: str,
-        compiled: list[tuple[str, Any]],
+        compiled: list[tuple[str, Any, Any]],
         rules: DriverRules,
         coord_map: dict[str, tuple[float, float]] | None = None,
     ) -> None:
@@ -2874,11 +3021,13 @@ class ModelDecisionService:
         recall mechanism, so unseen drivers/wordings generalise. Fail-open: if
         the audit call is unavailable the compiled rules simply stand as-is.
         """
-        texts = [t for t, _ in compiled]
-        penalties = [p for _, p in compiled]
+        texts = [t for t, _p, _c in compiled]
+        penalties = [p for _t, p, _c in compiled]
+        caps = [c for _t, _p, c in compiled]
         payload: dict[str, Any] = {
             "preferences": texts,
             "penalty_amounts": penalties,
+            "penalty_caps": caps,
             "structured_rules": self._describe_rules_for_audit(rules),
         }
         if coord_map:
@@ -2937,7 +3086,7 @@ class ModelDecisionService:
                     )
             if entry.get("representable") is False or not patched:
                 self._add_residual_constraint(
-                    rules, text, penalties[idx], str(entry.get("missing", ""))
+                    rules, text, penalties[idx], str(entry.get("missing", "")), caps[idx]
                 )
                 self._logger.info(
                     "coverage audit: pref #%d kept as residual constraint driver_id=%s",
@@ -2945,11 +3094,16 @@ class ModelDecisionService:
                 )
 
     @staticmethod
-    def _add_residual_constraint(rules: DriverRules, text: str, penalty: Any, note: str = "") -> None:
+    def _add_residual_constraint(
+        rules: DriverRules, text: str, penalty: Any, note: str = "", cap: Any = None
+    ) -> None:
         if any(rc.get("text") == text for rc in rules.residual_constraints):
             return
         pen = float(penalty) if isinstance(penalty, (int, float)) and penalty > 0 else None
-        rules.residual_constraints.append({"text": text, "penalty": pen, "note": note[:120]})
+        cap_v = float(cap) if isinstance(cap, (int, float)) and cap > 0 else None
+        rules.residual_constraints.append(
+            {"text": text, "penalty": pen, "cap": cap_v, "note": note[:120]}
+        )
 
     # Suffixes / patterns that indicate the LLM put a *region* into forbidden_categories
     _REGION_HINT_RE = re.compile(
@@ -3081,6 +3235,7 @@ class ModelDecisionService:
                     "你判断一段司机偏好原文是否确实包含某条约束。"
                     "只输出JSON {\"holds\": true/false}。"
                     "只有当原文明显不支持该约束时才返回false；含义相符或不确定一律返回true。"
+                    + _DIALECT_HINT
                 )},
                 {"role": "user", "content": json.dumps(
                     {"原文": all_text, "约束": rule_desc}, ensure_ascii=False)},
@@ -3116,7 +3271,8 @@ class ModelDecisionService:
         try:
             msgs = [
                 {"role": "system", "content": (
-                    "你是货运领域的语义判定助手。输入文本可能是乱序/缺字的中文。"
+                    "你是货运领域的语义判定助手。输入文本可能是乱序/缺字的中文，"
+                    "也可能是粤语/吴语等方言表达，按含义判断。"
                     "只输出JSON {\"answer\": true/false}。"
                 )},
                 {"role": "user", "content": question},
@@ -3151,6 +3307,77 @@ class ModelDecisionService:
             "但『水泥』不属于『水果』）"
         )
         return self._llm_semantic_yes_no(question, default=self._category_matches(cat, cargo_name))
+
+    def _category_progress_match(self, cat: str, cargo_name: str) -> bool:
+        """品类指标的计数/选单判定。
+
+        评分器按 cargo_name 与品类名**精确相等**给配额记账。若解析出的目标
+        品类名在数据集中**原样存在**（说明它就是规范品类名），则只有同名货
+        才计入进度——把「鲜果」记成「水果」的进度会虚高，月底兑现成真实的
+        欠额罚款。只有当目标名是数据集里不存在的（噪声/方言）写法时，才退
+        回语义匹配。选单与计数共用本判定，确保「以为算数的单」真的算数。"""
+        cat, cargo_name = cat.strip(), cargo_name.strip()
+        if not cat or not cargo_name:
+            return False
+        if cargo_name == cat:
+            return True
+        if cat in self._cargo_names:
+            return False
+        return self._category_matches_sem(cat, cargo_name)
+
+    def _city_in_region_sem(self, region: str, city: str) -> bool:
+        """LLM 地理归属兜底：静态区域表 + 子串匹配都解析不了的区域名
+        （如「苏南」「浙北」或方言叫法）交给模型按地理常识判定。
+
+        命中缓存直接返回；缓存未命中时受每步预算限制（防止一次宽扫描堆出
+        几十个阻塞调用）。预算耗尽时返回 False 且**不写缓存**，下一步再试
+        ——行为下限与旧版（仅子串+bbox）完全一致，语义判定只会增加召回。"""
+        region = region.strip()
+        city = _norm_region(city.strip())
+        if not region or not city:
+            return False
+        key = (region, city)
+        cached = self._region_member_cache.get(key)
+        if cached is not None:
+            return cached
+        if self._sem_region_budget <= 0:
+            return False
+        self._sem_region_budget -= 1
+        verdict = self._llm_semantic_yes_no(
+            f"城市/地点『{city}』是否位于区域『{region}』范围内？"
+            "（区域可能是省份/城市群/俗称/方言叫法，如『江浙沪』含上海、"
+            "『苏南』含苏州无锡常州；按中国地理常识判断）",
+            default=False,
+        )
+        self._region_member_cache[key] = verdict
+        return verdict
+
+    def _allowed_region_ok(self, rules: DriverRules, lat: float, lng: float, city: str | None = None) -> bool:
+        """allowed_regions 合规判定（静态表/子串 → bbox → 语义兜底）。
+
+        旧版在区域名不在静态表里时只能靠子串匹配，一旦未知区域名（未知司机
+        / 方言）匹配不上任何城市，就会拒掉**所有**货源、整月闲置——这是
+        毛利归零级别的失败模式。语义兜底让任意区域叫法都能解析出成员城市。"""
+        if not rules.allowed_regions:
+            return True
+        if _target_matches_allowed_regions(rules.allowed_regions, lat, lng, city):
+            return True
+        if city:
+            return any(self._city_in_region_sem(r, city) for r in rules.allowed_regions)
+        return False
+
+    def _forbidden_region_hit(self, region: str, city: str) -> bool:
+        """forbidden_regions 命中判定（子串 → 区域组关键词 → 语义兜底）。"""
+        if not region or not city:
+            return False
+        if _region_in_city(region, city):
+            return True
+        key = _allowed_region_key(region)
+        if key is not None:
+            keywords, _bbox = _ALLOWED_REGION_GROUPS[key]
+            if any(_region_in_city(kw, city) for kw in keywords):
+                return True
+        return self._city_in_region_sem(region, city)
 
     def _merge_llm_rules(self, rules: DriverRules, data: dict[str, Any], texts: list[str] | None = None) -> None:
         all_text = "\n".join(texts) if texts else ""
@@ -3248,15 +3475,17 @@ class ModelDecisionService:
         # matching keywords.  This prevents LLM hallucinations on unseen drivers.
         # Compound grounding: require BOTH a time indicator AND an action keyword
         # to reduce false positives from common words like "休息" or "不接"
-        _NDW_TIME_KW = ("点", "时", "小时", "上午", "下午", "中午", "凌晨", "晚上", "早上", ":", "：")
-        _NDW_ACTION_KW = ("不出车", "不接单", "不开车", "不跑车", "不空跑", "不空驶", "不运营", "不工作", "不干活", "不接活", "不赶路", "不许出", "不允许出", "别派活", "别赶路", "停车熄火", "禁止出车", "不准出车", "别开车", "别跑车", "收工", "停运", "收车", "封车", "落锁", "熄火", "歇着", "休息", "睡觉", "不动弹", "不动车", "别动车", "不跑", "不接")
+        _NDW_TIME_KW = ("点", "时", "小时", "上午", "下午", "中午", "凌晨", "晚上", "早上", "晏昼", "夜晚", "夜里", "朝早", "晌午", ":", "：")
+        _NDW_ACTION_KW = ("不出车", "不接单", "不开车", "不跑车", "不空跑", "不空驶", "不运营", "不工作", "不干活", "不接活", "不赶路", "不许出", "不允许出", "别派活", "别赶路", "停车熄火", "禁止出车", "不准出车", "别开车", "别跑车", "收工", "停运", "收车", "封车", "落锁", "熄火", "歇着", "休息", "睡觉", "不动弹", "不动车", "别动车", "不跑", "不接",
+                          # dialect (Cantonese / Wu) variants — finals drivers
+                          "唔出车", "唔接单", "唔开车", "唔接", "唔跑", "咪接", "咪开车", "咪出车", "瞓觉", "瞓", "返屋企", "勿接", "勿开车", "勿出车", "覅接", "覅出车", "弗接", "弗出车", "困觉", "歇夜", "歇班", "转屋里")
         _NDW_KW = _NDW_ACTION_KW  # for logging compatibility
-        _AVOID_KW = ("少接", "尽量不", "尽量少", "避免", "避开", "绕开", "不太想", "不愿意", "不喜欢", "最好别", "别给我", "尽量别", "能不接", "嫌麻烦", "犯怵", "不是绝对", "除非价钱", "能换就换", "不太愿意", "能不碰")
-        _FZ_KW = ("不进", "不去", "禁止进入", "不要去", "不要进", "别去", "远离", "不往", "不到", "不可进", "不得进", "禁入", "不允许进", "严禁", "禁驶入", "禁止驶入", "避开", "绕开", "堵", "修路", "不想跑", "不做")
-        _ALLOW_REGION_KW = ("只跑", "只接", "只在", "仅在", "限定", "不出", "不离开", "不离", "固定在", "范围内", "区域内")
+        _AVOID_KW = ("少接", "尽量不", "尽量少", "避免", "避开", "绕开", "不太想", "不愿意", "不喜欢", "最好别", "别给我", "尽量别", "能不接", "嫌麻烦", "犯怵", "不是绝对", "除非价钱", "能换就换", "不太愿意", "能不碰", "唔想", "唔愿", "唔中意", "尽量唔", "覅", "勿要", "弗要")
+        _FZ_KW = ("不进", "不去", "禁止进入", "不要去", "不要进", "别去", "远离", "不往", "不到", "不可进", "不得进", "禁入", "不允许进", "严禁", "禁驶入", "禁止驶入", "避开", "绕开", "堵", "修路", "不想跑", "不做", "唔去", "唔入", "咪去", "咪入", "勿去", "覅去", "弗去")
+        _ALLOW_REGION_KW = ("只跑", "只接", "只在", "仅在", "限定", "不出", "不离开", "不离", "固定在", "范围内", "区域内", "净系", "只系", "就喺", "唔出", "勿出", "覅出", "弗出")
         _BA_KW = ("范围", "区域内", "不超出", "只在", "仅在", "限定", "活动区域", "纬度", "经度", "运营区域", "只做", "只跑")
         _MV_KW = ("必须去", "一定要到", "每月去", "至少去", "必须到", "必访", "定期去", "经过", "起码", "至少", "接够")
-        _HOME_KW = ("回家", "到家", "家里", "返回住所", "回住处", "回去", "回到家", "归家", "在家", "家附近", "停在家")
+        _HOME_KW = ("回家", "到家", "家里", "返回住所", "回住处", "回去", "回到家", "归家", "在家", "家附近", "停在家", "返屋企", "屋企", "屋里厢", "转屋里", "归屋")
         _DOL_KW = ("不超过", "上限", "最多", "不得超过", "不得多于", "顶多", "封顶", "单以内", "趟以内")
         _DOL_SCOPE_KW = ("同一天", "每天", "每日", "单日", "当天", "一天", "每个自然日", "自然日")
         _HAUL_KW = ("装货", "卸货", "干线", "运距", "里程", "运输距离", "运输", "提货", "交货", "运货", "距离", "公里", "不超", "单趟")
@@ -3665,9 +3894,32 @@ class ModelDecisionService:
                     raw = raw.rsplit("在", 1)[-1]
                 self._add_allowed_region(rules, raw, text)
 
-    _NIGHT_KW = ("夜", "晚", "宵", "黑")
-    _REST_KW = ("停", "休", "熄", "睡", "眠", "收", "歇", "锁", "不出", "不接", "不动", "归家")
+    _NIGHT_KW = ("夜", "晚", "宵", "黑", "瞓", "暝")
+    _REST_KW = ("停", "休", "熄", "睡", "眠", "收", "歇", "锁", "不出", "不接", "不动", "归家",
+                "瞓", "困", "屋企", "屋里", "唔出", "唔接", "咪出", "咪接", "勿出", "勿接", "覅出", "覅接", "弗出", "弗接")
     _CLOCK_RE = re.compile(r"([01]?\d|2[0-4])(?:[：:]([0-5]\d)|点(半)?|时)")
+    # Chinese-numeral clock tokens ("晚上九点" / "廿三点" / "十一点半") so the
+    # offline night fail-safe also fires on non-Arabic-digit phrasings.
+    _CN_CLOCK_RE = re.compile(r"([零一二两三四五六七八九十廿卅]{1,4})(?=[点时：:])")
+    _PM_CONTEXT = ("晚", "夜", "暝", "宵")
+    _AM_CONTEXT = ("凌晨", "朝", "早", "晨", "上午")
+
+    @classmethod
+    def _extract_clock_times(cls, text: str) -> list[int]:
+        """All clock times in minutes-of-day, with CN numerals normalised and
+        PM context applied (e.g. "晚上九点" → 21:00, "朝早六点" → 06:00)."""
+        norm = cls._CN_CLOCK_RE.sub(lambda m: str(_cn_to_int(m.group(1))), text)
+        times: list[int] = []
+        for m in cls._CLOCK_RE.finditer(norm):
+            h = int(m.group(1))
+            mins = int(m.group(2)) if m.group(2) else (30 if m.group(3) else 0)
+            ctx = norm[max(0, m.start() - 4):m.start()]
+            if h < 12 and any(k in ctx for k in cls._PM_CONTEXT) and not any(k in ctx for k in cls._AM_CONTEXT):
+                h += 12
+            t = h * 60 + mins
+            if 0 <= t <= DAY_MINUTES:
+                times.append(t)
+        return times
 
     def _supplement_night_failsafe(self, texts: list[str], rules: DriverRules) -> None:
         """夜休 fail-safe：夜间禁驶是按天重复扣分的最大罚项之一，漏抽代价极高。
@@ -3684,11 +3936,7 @@ class ModelDecisionService:
                 continue
             if not any(k in text for k in self._REST_KW):
                 continue
-            times: list[int] = []
-            for m in self._CLOCK_RE.finditer(text):
-                h = int(m.group(1))
-                mins = int(m.group(2)) if m.group(2) else (30 if m.group(3) else 0)
-                times.append(h * 60 + mins)
+            times = self._extract_clock_times(text)
             evening = [t for t in times if t >= 18 * 60]
             morning = [t for t in times if 0 < t <= 9 * 60]
             if not evening or not morning:
@@ -4621,6 +4869,12 @@ def _cn_to_int(token: str) -> int:
             current = 0
         elif ch == "千":
             total += (current if current else 1) * 1000
+            current = 0
+        elif ch == "廿":  # dialect: 20 (e.g. 廿三 = 23)
+            total += 20
+            current = 0
+        elif ch == "卅":  # dialect: 30 (e.g. 卅一 = 31)
+            total += 30
             current = 0
     total += current
     return total
