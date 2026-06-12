@@ -1404,9 +1404,23 @@ class ModelDecisionService:
         focus = data.get("category_focus")
         if isinstance(focus, str) and focus.strip() and focus.strip().lower() != "null":
             notes_parts.append(f"今日优先品类：{focus.strip()}")
+        # Replacement (relaxation) of the static windows is the ONE spot where
+        # the daily planner can cause penalties instead of just losing income:
+        # a hallucinated "today is relaxed" replaces e.g. a 21:00 start with
+        # 23:00 and the driver gets fined every such day. It therefore needs a
+        # dedicated verification with default-REJECT (falls back to the
+        # additive union, which can never cause a penalty).
+        replace_ok = False
+        if bool(data.get("replaces_default")) and windows and rules.no_drive_windows:
+            replace_ok = self._verify_directive_replacement(driver_id, rules, day, windows)
+            if not replace_ok:
+                self._logger.info(
+                    "daily directive: replacement NOT verified driver_id=%s day=%d windows=%s — using union",
+                    driver_id, day, windows,
+                )
         rules.daily_directives[int(day)] = {
             "windows": windows,
-            "replace": bool(data.get("replaces_default")),
+            "replace": replace_ok,
             "notes": "；".join(notes_parts),
         }
         plan["_directive_key"] = cache_key
@@ -1415,6 +1429,57 @@ class ModelDecisionService:
             driver_id, day, windows, bool(data.get("replaces_default")),
             rules.no_drive_windows_for(day), "；".join(notes_parts)[:120],
         )
+
+    def _verify_directive_replacement(
+        self, driver_id: str, rules: DriverRules, day: int,
+        windows: list[tuple[int, int]],
+    ) -> bool:
+        """Two-gate verification before a directive may REPLACE static windows.
+
+        1. Geometric gate: every directive window must lie inside some static
+           window (a legitimate relaxation only reshapes/shrinks coverage; a
+           window extending beyond the static set is handled by the additive
+           union anyway, so replacement is never needed for it).
+        2. Semantic gate: a dedicated default-REJECT yes/no check that the
+           preference text explicitly allows TODAY's relaxation (weekend /
+           specific-date clauses). This is deliberately the opposite bias of
+           _confirm_rule_holds: dropping a relaxation only costs a couple of
+           idle hours, while accepting a hallucinated one costs a per-day fine.
+        """
+        def _is_subset(dw: tuple[int, int]) -> bool:
+            for shift in (-DAY_MINUTES, 0, DAY_MINUTES):
+                ds, de = dw[0] + shift, dw[1] + shift
+                for ss, se in rules.no_drive_windows:
+                    se_n = se if se > ss else se + DAY_MINUTES
+                    if ss <= ds and de <= se_n:
+                        return True
+            return False
+
+        if not all(_is_subset(w) for w in windows):
+            return False
+        records = self._pref_records.get(driver_id) or []
+        all_text = "\n".join(
+            r["content"] + (f"\n（普通话释义：{r['mandarin']}）" if r.get("mandarin") else "")
+            for r in records
+        )
+        if not all_text.strip():
+            return False
+        date_str, weekday_str, is_weekend = _calendar_for_day(day)
+
+        def _fmt(wins: list[tuple[int, int]]) -> str:
+            return "、".join(
+                f"{ws // 60:02d}:{ws % 60:02d}-{(we % DAY_MINUTES) // 60:02d}:{(we % DAY_MINUTES) % 60:02d}"
+                for ws, we in wins
+            )
+
+        question = (
+            f"司机偏好原文如下（可能含方言）：\n{all_text}\n\n"
+            f"司机平日的禁驶/停车时段是 {_fmt(rules.no_drive_windows)}。"
+            f"今天是 {date_str}（{weekday_str}{'，周末' if is_weekend else '，工作日'}）。"
+            f"原文是否**明确**允许今天把禁驶时段放宽为 {_fmt(windows)}"
+            f"（例如周末或特定日期可以晚些休息）？只有原文明确支持才回答true，拿不准一律回答false。"
+        )
+        return self._llm_semantic_yes_no(question, default=False)
 
     @staticmethod
     def _coerce_directive_window(w: Any) -> tuple[int, int] | None:
@@ -2637,6 +2702,7 @@ class ModelDecisionService:
         aug_texts = [self._augmented_pref_text(driver_id, t) for t in texts]
         self._supplement_relative_allowed_regions(aug_texts, rules, init_lat, init_lng)
         self._supplement_night_failsafe(aug_texts, rules)
+        self._supplement_critical_rules(aug_texts, rules)
         self._dedup_avoid_forbidden(rules)
         if self._rules_fingerprint(rules) != before:
             self._logger.info(
@@ -2991,7 +3057,8 @@ class ModelDecisionService:
         "must_visit[{lat,lng,radius_km,required_days}]; required_region{region,min_days}\n\n"
         "审计准则：\n"
         "1) 漏一条「每日生效」约束（夜休/禁驶时段/回家）代价最高：重点核对时间窗是否齐全、起止时刻与原文一致。\n"
-        "2) 月度品类指标、整月休息天数、日期事件（某天到某地）逐条核对数字与日期。\n"
+        "2) 月度品类指标、整月休息天数、月度长途单数上限（如「每月超过X小时的长途最多N单」）、"
+        "日期事件（某天到某地）逐条核对数字与日期。\n"
         "3) 某约束无法用上述字段表达时：representable=false、patch 留空、missing 写明该约束原意。\n"
         "4) penalty_amounts 金额越高的偏好越要逐字核对。\n"
         "5) 已完整覆盖就 covered=true 且不输出 patch；拿不准时 covered=false 并给出 patch"
@@ -3934,6 +4001,67 @@ class ModelDecisionService:
             self._logger.info("night fail-safe: derived overnight window %d-%d from text %r", sm, em, text[:60])
             self._apply_rest_window(rules, sm, em)
             return
+
+    def _supplement_critical_rules(self, texts: list[str], rules: DriverRules) -> None:
+        """Always-on deterministic backstop for high-stakes scalar rules.
+
+        Unlike _supplement_basic_rules (offline fallback only), this runs even
+        when the LLM compile succeeded. These three rule kinds carry repeat or
+        lump penalties — per-order over-cap fines, per-day rest shortfalls,
+        one-shot monthly off-day fines — so a single missed parse compounds for
+        the whole season, while a false positive merely costs a little income.
+        The patterns require explicit wording (they never fire on text that
+        does not impose the constraint) and merge conservatively: only fill a
+        missing cap / take the stricter value.
+        """
+        for text in texts:
+            # Monthly long-haul cap ("每个月超过八小时的长途只能接最多5单"). Since
+            # the global default cap was removed (preference-driven now), missing
+            # a real cap means unlimited over-cap orders × per-order penalty.
+            if (rules.longhaul_cap_orders is None
+                    and ("长途" in text or "远活" in text or "远路" in text)
+                    and ("每月" in text or "每个月" in text or "一个月" in text)):
+                m_n = re.search(
+                    r"(?:最多|只能|不超过?|至多|顶多)[接拉跑]?\s*(?:最多)?\s*"
+                    r"([零一二两三四五六七八九十\d]+)\s*(?:单|票|趟)",
+                    text,
+                )
+                if m_n:
+                    cap = _cn_to_int(m_n.group(1))
+                    if cap > 0:
+                        rules.longhaul_cap_orders = cap
+                        m_h = re.search(r"超过\s*([零一二两三四五六七八九十\d]+)\s*个?\s*(?:小时|钟头)", text)
+                        if m_h and _cn_to_int(m_h.group(1)) > 0:
+                            rules.longhaul_min_minutes = _cn_to_int(m_h.group(1)) * 60
+                        self._logger.info(
+                            "critical supplement: longhaul cap=%d (>%dmin) from %r",
+                            cap, rules.longhaul_min_minutes, text[:60],
+                        )
+            # Daily continuous rest hours ("每天连续休息满8小时" — per-day penalty).
+            rest_m = re.search(
+                r"(?:每天|每日)?.*?(?:连续|连着).*?(?:停车|停着|休息|歇|熄火).*?"
+                r"(?:满|至少|起码)?\s*([零一二两三四五六七八九十\d]+)\s*(?:个)?\s*小时",
+                text,
+            )
+            if rest_m:
+                hours = _cn_to_int(rest_m.group(1))
+                if 0 < hours <= 16 and hours * 60 > rules.daily_rest_minutes:
+                    rules.daily_rest_minutes = hours * 60
+                    self._logger.info(
+                        "critical supplement: daily rest=%dh from %r", hours, text[:60]
+                    )
+            # Monthly full off-days ("每月至少两天完全不出车" — one-shot lump penalty).
+            if (
+                ("整天" in text or "全天" in text or "完全" in text) and any(
+                    k in text for k in ("歇", "休息", "停驶", "不接单", "不空车", "不空跑", "不出车", "不开工")
+                )
+            ):
+                cnt = self._parse_cn_count(text)
+                if cnt and cnt > rules.off_days_min:
+                    rules.off_days_min = cnt
+                    self._logger.info(
+                        "critical supplement: off_days_min=%d from %r", cnt, text[:60]
+                    )
 
     def _supplement_relative_allowed_regions(
         self,

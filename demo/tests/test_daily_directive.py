@@ -37,12 +37,20 @@ WEEKEND_NIGHT = (1380, 1800)  # 23:00 -> next-day 06:00
 
 
 class _StubApi:
-    """SimulationApiPort stub returning a canned model response."""
+    """SimulationApiPort stub returning a canned model response.
 
-    def __init__(self, content: str | None = None, fail: bool = False):
+    ``chat_calls`` counts only directive-planner calls (the replacement
+    verification is a separate semantic yes/no call, counted in
+    ``verify_calls``), so the per-day caching assertions keep their meaning.
+    """
+
+    def __init__(self, content: str | None = None, fail: bool = False,
+                 verify_answer: bool = True):
         self.content = content
         self.fail = fail
         self.chat_calls = 0
+        self.verify_calls = 0
+        self.verify_answer = verify_answer
 
     def get_driver_status(self, driver_id):  # noqa: ANN001, ANN201
         return {}
@@ -54,6 +62,10 @@ class _StubApi:
         return {"records": []}
 
     def model_chat_completion(self, payload):  # noqa: ANN001, ANN201
+        system = payload["messages"][0]["content"]
+        if "语义判定助手" in system:
+            self.verify_calls += 1
+            return {"choices": [{"message": {"content": json.dumps({"answer": self.verify_answer})}}]}
         self.chat_calls += 1
         if self.fail:
             raise RuntimeError("model unavailable")
