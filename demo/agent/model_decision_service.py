@@ -1,9 +1,15 @@
 """模型决策服务：依赖 `simkit.ports.SimulationApiPort`，由评测进程注入具体环境。
 
-架构（闭环偏好编译 + 每日合规计划，面向未知司机泛化；偏好原文为第一公民）：
+架构（方言归一 + 闭环偏好编译 + 每日合规计划，面向未知司机泛化；偏好原文为第一公民）：
 
+0. 方言/口语归一化：复赛司机来自广东与江浙沪，偏好原文可能是粤语/吴语方言、
+   口语或乱序缺字文本。每条新偏好先经一次 LLM「普通话转写」（缓存、fail-safe），
+   转写结果与原文**并行**喂给抽取、审计、语义接地、正则兜底与每日计划层——
+   只增召回，绝不替代原文。
 1. 编译（LLM 优先，逐条）：每条自然语言偏好单独交给 LLM 抽取成结构化规则
    （时间窗 / 区域 / 品类 / 配额 / 日期事件…），逐字段做语义接地确认。
+   日期事件/blackout 支持显式月份；编译出的"过去日"事件自动重锚定到最近的
+   未过月份（偏好可见即不可能要求过去的事）。
 2. 审计修复（闭环）：编译完成后，再用一次 LLM 审计「每条偏好的全部约束是否
    都已体现在结构化规则里」，缺失的部分以补丁形式回填——这取代了旧版按
    D001 措辞写死的正则补抽层（正则解析仅在模型不可用时作为离线兜底）。
@@ -15,10 +21,12 @@
    今日必须做/避免的事、品类缺口提醒）。任意措辞、任意条件式偏好（周末
    不同时段、特定日期事件、月度结转）都在这一层被按天具象化，不依赖固定
    schema 能否表达。计划层失效时自动退化为纯静态规则（fail-safe）。
-5. 确定性执行：调度器与各动作守卫使用"静态窗 ∪ 当日计划窗"的**有效禁驶窗**
-   硬性拦截违规动作（每日休息 / 夜间休息窗 / 整月整休天数 / 禁接货类 /
-   禁接区域 / 必接区域 / 赴装空驶上限 / 特定日期到点事件），并在合规候选中
-   按净收益择单。
+5. 确定性执行（确定性优先）：调度器与各动作守卫使用"静态窗 ∪ 当日计划窗"的
+   **有效禁驶窗**硬性拦截违规动作（每日休息 / 夜间休息窗 / 按自然月铺点的
+   整休天数 / 禁接货类 / 禁接区域 / 必接区域 / 赴装空驶上限 / 特定日期到点
+   事件），并在合规候选中按净收益择单。决策 LLM 不再每 3 步参与决策，只在
+   引擎找不到任何合规单、即将整段空等时作为「救场」提供一次重定位建议
+   （建议仍须通过全部确定性守卫）。
 """
 
 from __future__ import annotations
@@ -580,6 +588,13 @@ class ModelDecisionService:
         # compliance planner and the decision prompt always work from the raw
         # text, never only from the parsed schema.
         self._pref_records: dict[str, list[dict[str, Any]]] = {}
+        # raw preference text -> standard-Mandarin rewrite. The finals drivers
+        # are 广东 / 江浙沪 and their preference texts may be dialect (粤语 /
+        # 吴语), colloquial or scrambled; every downstream consumer (extraction,
+        # audit, grounding, regex fail-safes, daily planner) works on
+        # raw + normalized so an off-Mandarin phrasing can never silently drop
+        # a rule.
+        self._pref_normalized: dict[str, str] = {}
         self._initial_position: dict[str, tuple[float, float]] = {}
         # cargo_id -> metadata seen during scans; used to reconstruct monthly
         # accumulators from the authoritative decision history (see
@@ -732,20 +747,28 @@ class ModelDecisionService:
         # any failure the static parse stays in charge.
         self._ensure_daily_directive(driver_id, rules, plan, day)
 
-        # Try LLM-driven decision with history context
-        action = None
+        # Deterministic-first decision flow. The rule engine maximises net/h
+        # under every compliance guard with a wide cargo scan; per-step LLM
+        # co-decision proved strictly worse in finals A/Bs (it overrode strong
+        # picks with waits and added latency/token cost/run-to-run variance).
+        # The LLM is now consulted only as an *idle rescue*: when the engine
+        # found no compliant order from here and would sit out 2h, ask it for a
+        # smarter reposition (e.g. toward a logistics hub beyond the scan
+        # radius). Its proposal still passes every deterministic guard.
         step = self._step_count[driver_id]
         consecutive_waits = plan.get("_consecutive_waits", 0)
-        # Call LLM every 3 steps (or when idle), but skip if stuck in wait loop (>2 consecutive)
-        use_llm = (step % 3 == 0 or plan.get("_last_action") == "wait") and consecutive_waits < 3
-        if use_llm:
-            action = self._llm_decide_with_history(
+        action = self._schedule(driver_id, status, rules, plan, now, lat, lng)
+        if (
+            action.get("action") == "wait"
+            and plan.pop("_idle_wait", False)
+            and consecutive_waits < 3
+        ):
+            llm_action = self._llm_decide_with_history(
                 driver_id, status, rules, plan, history, now, lat, lng, day, tod
             )
-
-        # Fallback to rule engine if LLM decision is None or failed
-        if action is None:
-            action = self._schedule(driver_id, status, rules, plan, now, lat, lng)
+            # Only a validated take/reposition can improve on an idle wait.
+            if llm_action is not None and llm_action.get("action") != "wait":
+                action = llm_action
 
         # Track consecutive waits to detect LLM getting stuck
         if action.get("action") == "wait":
@@ -834,7 +857,7 @@ class ModelDecisionService:
         cargo_resp = self._query_cargo(driver_id=driver_id, latitude=lat, longitude=lng, k=30)
         items = cargo_resp.get("items", [])
         now = int(self._api.get_driver_status(driver_id)["simulation_progress_minutes"])
-        hard_end = self._hard_order_deadline(rules, plan, now, day)
+        hard_end = self._effective_order_deadline(rules, plan, now, day)
         blackout_regions = {r for r, days in rules.blackout if day in days}
         failed_ids = plan.get("failed_cargo_ids", set())
 
@@ -1056,6 +1079,30 @@ class ModelDecisionService:
                 hard_end = min(hard_end, cutoff)
         return hard_end
 
+    def _effective_order_deadline(self, rules: DriverRules, plan: dict, now: int, day: int) -> int:
+        """`_hard_order_deadline` plus the past-midnight allowance.
+
+        A flexible-rest driver (and, a fortiori, a driver with no daily time
+        constraint at all) may let the day's last order finish past midnight.
+        This must be applied consistently at scoring AND at the pre-take
+        revalidation: previously the revalidation recomputed the bare
+        `_hard_order_deadline`, so every late-finishing pick was selected and
+        then rejected — losing the order that would have fit instead.
+        """
+        day_end = (day + 1) * DAY_MINUTES
+        hard_end = self._hard_order_deadline(rules, plan, now, day)
+        if (rules.rest_window is None and not rules.has_no_drive(day)
+                and not rules.has_no_drive(day + 1)
+                and self._next_day_is_ordinary(rules, plan, day)):
+            if rules.daily_rest_minutes > 0:
+                hard_end = max(hard_end, day_end + (DAY_MINUTES - rules.day_rest_block))
+            elif (rules.home_by_minute is None and rules.no_drive_until_minute is None
+                  and not rules.has_any_no_drive()):
+                # No daily time constraint of any kind: finishing an order past
+                # midnight is penalty-free revenue, so don't wrap up by 24:00.
+                hard_end = max(hard_end, day_end + DAY_MINUTES)
+        return hard_end
+
     def _interval_overlaps_no_drive(self, rules: DriverRules, start: int, end: int) -> bool:
         """Whether an absolute minute interval touches a repeated no-drive window."""
         if end <= start or not rules.has_any_no_drive():
@@ -1197,7 +1244,8 @@ class ModelDecisionService:
     _DIRECTIVE_SYSTEM = (
         "你是货运司机的每日合规计划助手。司机有若干自然语言偏好（违反会扣钱），"
         "你的任务是把这些偏好换算成【今天】的具体执行约束。偏好可能与日历有关"
-        "（如周末时段不同、特定日期有事、月度指标与上月欠额结转），必须结合今天的日期/星期推算。\n"
+        "（如周末时段不同、特定日期有事、月度指标与上月欠额结转），必须结合今天的日期/星期推算。"
+        "偏好原文可能是粤语/吴语等方言或口语（条目可能附带普通话转写供参考），按含义理解。\n"
         "只输出一个JSON对象：\n"
         '{"no_drive_today":[{"start_hour":数字,"end_hour":数字}],'
         '"replaces_default":true或false,'
@@ -1246,7 +1294,11 @@ class ModelDecisionService:
             "今天": f"{date_str} {weekday_str}" + ("（周末）" if is_weekend else "（工作日）"),
             "本月": _month_name(month_idx),
             "偏好": [
-                {"原文": r["content"], "单次违约扣款": r.get("penalty_amount")}
+                {
+                    "原文": r["content"],
+                    "单次违约扣款": r.get("penalty_amount"),
+                    **({"普通话转写": r["normalized"]} if r.get("normalized") else {}),
+                }
                 for r in records
             ],
         }
@@ -1657,11 +1709,7 @@ class ModelDecisionService:
         # still leaves room for a full rest block inside the next day), but only when
         # the next day is an ordinary working day — never crossing into an off day,
         # blackout day or a dated-event day.
-        hard_end = self._hard_order_deadline(rules, plan, now, day)
-        if (rules.rest_window is None and not rules.has_no_drive(day)
-                and not rules.has_no_drive(day + 1) and rules.daily_rest_minutes > 0):
-            if self._next_day_is_ordinary(rules, plan, day):
-                hard_end = max(hard_end, day_end + (DAY_MINUTES - rules.day_rest_block))
+        hard_end = self._effective_order_deadline(rules, plan, now, day)
         order = self._pick_order(driver_id, status, rules, plan, now, lat, lng, day, hard_end)
         if order is not None:
             return order
@@ -1688,6 +1736,12 @@ class ModelDecisionService:
         # (E'') Instead of idling until day end, wait 2 hours and retry.
         remaining = day_end - now
         if remaining > 240:
+            # Mark this wait as *idle* (no compliant order reachable) so decide()
+            # may consult the LLM for a rescue reposition — except when the wait
+            # is a deliberate category-hunt hold (overriding it with a generic
+            # high-net order would defeat the quota strategy).
+            if plan.get("_category_miss_today") != day:
+                plan["_idle_wait"] = True
             return self._safe_wait(rules, now, 120)
         return self._safe_wait(rules, now, max(remaining, 1))
 
@@ -1927,7 +1981,7 @@ class ModelDecisionService:
             )
             return None
         latest_now = int(self._api.get_driver_status(driver_id)["simulation_progress_minutes"])
-        latest_deadline = min(day_end, self._hard_order_deadline(rules, plan, latest_now, day))
+        latest_deadline = min(day_end, self._effective_order_deadline(rules, plan, latest_now, day))
         latest_ev = self._evaluate_cargo(best, best_item or {}, rules, blackout_regions, latest_now, latest_deadline, lat, lng)
         if latest_ev is None:
             self._logger.info(
@@ -2054,7 +2108,7 @@ class ModelDecisionService:
         so the deadhead cap is never tripped (penalty stays 0). Allow up to 2 repositions
         per day to avoid wasting entire days when first target has no cargo."""
         now = int(self._api.get_driver_status(driver_id)["simulation_progress_minutes"])
-        day_end = min(day_end, self._hard_order_deadline(rules, plan, now, day))
+        day_end = min(day_end, self._effective_order_deadline(rules, plan, now, day))
         strand_count = plan.get("strand_count", {}).get(day, 0)
         if strand_count >= 2:
             return None
@@ -2084,7 +2138,7 @@ class ModelDecisionService:
         if best_target is None:
             cargo_resp = self._query_cargo(driver_id=driver_id, latitude=lat, longitude=lng, k=600)
             now = int(self._api.get_driver_status(driver_id)["simulation_progress_minutes"])
-            day_end = min(day_end, self._hard_order_deadline(rules, plan, now, day))
+            day_end = min(day_end, self._effective_order_deadline(rules, plan, now, day))
             best_target, best_net = _best_target(cargo_resp.get("items", []))
         if best_target is None:
             return None
@@ -2320,7 +2374,12 @@ class ModelDecisionService:
     # ----------------------------------------------------------------- planning
     @staticmethod
     def _plan_off_days(rules: DriverRules) -> set[int]:
-        """整月整休日：均匀铺在月中，避开特定日期事件及其前置布置日。
+        """整休日：按【自然月】逐月铺点，避开特定日期事件及其前置布置日。
+
+        "每月至少N天完全不出车"是按月结算的（整月不满足一次性扣钱），所以 N 天
+        必须落在**每个自然月**里。旧实现把 N 天摊在整个赛季（92 天）上，3、4 月
+        各只有 1 天上下，4/5 月按月判定时必然吃罚——一个整休日只损失几百元收入，
+        漏一个月的指标则是数千元罚款，按月铺点是稳赚的不对称交换。
 
         采用确定性铺点而非"挑最晚的几天"，这样即便事件偏好要到临近其日期窗才可见、
         导致 reserved 集合后期才补全，也不会出现"已铺的整休日被事后挪走"的问题。
@@ -2335,19 +2394,22 @@ class ModelDecisionService:
             reserved.add(ev["day"])
             reserved.add(ev["day"] - 1)  # keep the day-before free for staging
         off: set[int] = set()
-        for i in range(n):
-            target = int(round((i + 0.5) * MONTH_DAYS / n))
-            target = min(MONTH_DAYS - 1, max(0, target))
-            chosen = None
-            for delta in range(MONTH_DAYS):
-                for cand in (target + delta, target - delta):
-                    if 0 <= cand < MONTH_DAYS and cand not in reserved and cand not in off:
-                        chosen = cand
+        for m in range(len(_MONTH_START_DAYS) - 1):
+            m_start, m_end = _MONTH_START_DAYS[m], _MONTH_START_DAYS[m + 1]
+            span = m_end - m_start
+            for i in range(n):
+                target = m_start + int(round((i + 0.5) * span / n))
+                target = min(m_end - 1, max(m_start, target))
+                chosen = None
+                for delta in range(span):
+                    for cand in (target + delta, target - delta):
+                        if m_start <= cand < m_end and cand not in reserved and cand not in off:
+                            chosen = cand
+                            break
+                    if chosen is not None:
                         break
                 if chosen is not None:
-                    break
-            if chosen is not None:
-                off.add(chosen)
+                    off.add(chosen)
         return off
 
     # ------------------------------------------------------------- preferences
@@ -2389,6 +2451,14 @@ class ModelDecisionService:
         if not new_items:
             return rules
 
+        # Dialect / colloquial robustness: rewrite each new preference into
+        # standard Mandarin once (cached). The rewrite is consumed alongside the
+        # raw text by every downstream stage — extraction, audit, semantic
+        # grounding, regex fail-safes and the daily planner.
+        norm_by_text: dict[str, str | None] = {
+            t: self._normalize_pref_text(driver_id, t) for t, _ in new_items
+        }
+
         # Keep the raw preference records (ordered, with penalty amounts) for
         # the daily compliance planner and the decision prompt.
         records = self._pref_records.setdefault(driver_id, [])
@@ -2401,22 +2471,31 @@ class ModelDecisionService:
             records.append({
                 "content": content,
                 "penalty_amount": (pref.get("penalty_amount") if isinstance(pref, dict) else None),
+                "normalized": norm_by_text.get(content) or self._pref_normalized.get(content) or None,
             })
 
         before = self._rules_fingerprint(rules)
         coord_map = self._collect_coords(prefs)
+        now_day = int(status.get("simulation_progress_minutes", 0) or 0) // DAY_MINUTES
+        n_single, n_route, n_blackout = (
+            len(rules.dated_single), len(rules.dated_route), len(rules.blackout),
+        )
         compiled: list[tuple[str, Any]] = []
         for text, penalty in new_items:
-            if self._llm_parse_preferences(driver_id, [text], rules, coord_map, [penalty]):
+            norm = norm_by_text.get(text)
+            if self._llm_parse_preferences(
+                driver_id, [text], rules, coord_map, [penalty], normalized=[norm]
+            ):
                 compiled.append((text, penalty))
             else:
                 # offline / model unavailable: deterministic regex fallback for
-                # this text only.
-                self._parse_one(text, rules, coord_map)
-                self._supplement_basic_rules(text, rules)
-                self._supplement_dated_events(text, rules, coord_map)
+                # this text only (and its rewrite when one exists).
+                for t in ([text, norm] if norm else [text]):
+                    self._parse_one(t, rules, coord_map)
+                    self._supplement_basic_rules(t, rules)
+                    self._supplement_dated_events(t, rules, coord_map)
         if compiled:
-            self._audit_preference_coverage(driver_id, compiled, rules, coord_map)
+            self._audit_preference_coverage(driver_id, compiled, rules, coord_map, norm_by_text)
             # Cross-check LLM dated event coords against text-extracted coords.
             # If an LLM coord doesn't match any known coord, snap it to the
             # nearest known one (LLM often inverts or rounds coordinates).
@@ -2451,10 +2530,16 @@ class ModelDecisionService:
                     rules.blackout_coords[region] = loc
                     break
         seen.update(t for t, _ in new_items)
+        # A dated event/blackout scheduled in the past is impossible: the
+        # preference is visible (hence actionable) *now*, so an already-past day
+        # means the date was anchored to the wrong calendar month. Re-anchor it
+        # to the same day-of-month in the soonest month >= today.
+        self._fix_past_dated_days(rules, now_day, n_single, n_route, n_blackout)
         # Dedup avoid/forbidden AFTER supplement so regex-added items are also cleaned
         init_lat, init_lng = self._initial_position[driver_id]
-        self._supplement_relative_allowed_regions(texts, rules, init_lat, init_lng)
-        self._supplement_night_failsafe(texts, rules)
+        all_texts = texts + [n for n in (self._pref_normalized.get(t) for t in texts) if n]
+        self._supplement_relative_allowed_regions(all_texts, rules, init_lat, init_lng)
+        self._supplement_night_failsafe(all_texts, rules)
         self._dedup_avoid_forbidden(rules)
         if self._rules_fingerprint(rules) != before:
             self._logger.info(
@@ -2510,6 +2595,11 @@ class ModelDecisionService:
     # ----------------------------------------------------------- LLM preference parsing
     _PARSE_SYSTEM = (
         "你是货运司机偏好抽取器。把司机的自然语言偏好转成严格 JSON。\n"
+        "偏好原文可能是粤语、吴语（上海/苏杭/宁波话）等方言，也可能是口语、缺字或字序打乱的中文"
+        "（如 唔=不、瞓觉=睡觉、返屋企=回家、收车/收工=结束出车、夜晚黑/夜里向=夜里、"
+        "晏昼=下午、成个月=整个月、覅/勿/弗=不要）。按**含义**抽取，不要因为措辞陌生而漏抽。\n"
+        "输入可能附带 normalized_preferences（普通话转写，仅供理解参考；约束内容以原文含义为准，"
+        "两者矛盾时取更保守、约束更全的一方）。\n"
         "只输出一个 JSON 对象，禁止 markdown / 解释 / think标签。未提及的字段用 null 或空数组。\n\n"
         "字段定义（宁缺毋错）：\n"
         '- daily_rest_hours: 每天连续休息最少小时数（数字或 null）\n'
@@ -2542,10 +2632,11 @@ class ModelDecisionService:
         '  适用于"四月水果必须接满十二单""本月建材至少12单""欠的单数下月补"。\n'
         '- home_rule: 回家规则 {"lat":纬度,"lng":经度,"radius_km":半径,"home_by_hour":几点前到家,"no_drive_until_hour":次日几点前不接单}（或 null）\n'
         '  适用于"每天X点前须在自家位置Y公里内，到次日Z点前不接单不空跑"之类约束。\n'
-        '- blackout: 指定日期不去某地 [{"region":"纯地名","dates":[日期...]}]\n'
-        '- dated_single: 某天必须到某地办事 [{"date":日期,"lat":纬度,"lng":经度,"wait_minutes":停留分钟,"before_hour":最晚到达整点或null}]\n'
+        '- blackout: 指定日期不去某地 [{"region":"纯地名","dates":[日期...],"month":3-5整数或null}]。'
+        '原文明确提到月份（如"四月四号"）时必须填 month，否则 null。\n'
+        '- dated_single: 某天必须到某地办事 [{"date":日期,"month":3-5整数或null,"lat":纬度,"lng":经度,"wait_minutes":停留分钟,"before_hour":最晚到达整点或null}]\n'
         '  触发词：盘库/清库存/对账/验收/盘点/提货/签收/检查/保养/检修/停一趟/办事/开会/取东西/交货/拿货/走一趟/回一趟/去一趟/看看/办手续/送东西/存东西\n'
-        '- dated_route: 某天按顺序经过多个地点 [{"date":日期,"stops":[{"lat":纬度,"lng":经度,"wait_minutes":分钟,"before_hour":整点或null}...]}]\n'
+        '- dated_route: 某天按顺序经过多个地点 [{"date":日期,"month":3-5整数或null,"stops":[{"lat":纬度,"lng":经度,"wait_minutes":分钟,"before_hour":整点或null}...]}]\n'
         '  触发词：赴宴/做寿/先到…再到/先去…再去/先过…赶到/接人/送人/喝喜酒/吃饭/接上配偶/接家人\n'
         '- rule_penalties: 各类规则的单次违约扣款金额对象（仅当输入含 penalty_amounts 时填写，否则 null）。'
         '把每条偏好的金额归因到其抽出的规则类别，键限：'
@@ -2616,13 +2707,88 @@ class ModelDecisionService:
         '"forbidden_categories":[],"avoid_categories":[],"forbidden_regions":[],"forbidden_zones":[],"bounded_area":null,'
         '"required_region":null,"must_visit":[],"pickup_max_km":null,"haul_max_km":null,"monthly_deadhead_max_km":null,'
         '"daily_order_limit":null,"first_order_before_hour":null,"monthly_category_targets":[],"home_rule":null,'
-        '"blackout":[],"dated_single":[{"date":20,"lat":23.25,"lng":113.40,"wait_minutes":120,"before_hour":null}],"dated_route":[]}'
+        '"blackout":[],"dated_single":[{"date":20,"month":null,"lat":23.25,"lng":113.40,"wait_minutes":120,"before_hour":null}],"dated_route":[]}\n\n'
+        "示例7（粤语口语）：\n"
+        '入: {"preferences":["夜晚十一点之后唔好同我派单，我要返屋企瞓觉，瞓到朝早七点先开工","危化品嗰啲嘢一律唔制"]}\n'
+        '出: {"daily_rest_hours":null,"rest_window":{"start_hour":23,"end_hour":7},'
+        '"no_drive_windows":[{"start_hour":23,"end_hour":7}],"off_days_min":0,'
+        '"forbidden_categories":["危化品"],"avoid_categories":[],"forbidden_regions":[],"forbidden_zones":[],"bounded_area":null,'
+        '"required_region":null,"must_visit":[],"pickup_max_km":null,"haul_max_km":null,"monthly_deadhead_max_km":null,'
+        '"daily_order_limit":null,"first_order_before_hour":null,"monthly_category_targets":[],"home_rule":null,'
+        '"blackout":[],"dated_single":[],"dated_route":[]}\n\n'
+        "示例8（吴语口语）：\n"
+        '入: {"preferences":["夜里向十点钟以后勿要拨我派生活，到天亮六点钟才开工","四月里向水果生活起码要做满十二票，少一票扣一趟钞票"]}\n'
+        '出: {"daily_rest_hours":null,"rest_window":{"start_hour":22,"end_hour":6},'
+        '"no_drive_windows":[{"start_hour":22,"end_hour":6}],"off_days_min":0,'
+        '"forbidden_categories":[],"avoid_categories":[],"forbidden_regions":[],"forbidden_zones":[],"bounded_area":null,'
+        '"required_region":null,"must_visit":[],"pickup_max_km":null,"haul_max_km":null,"monthly_deadhead_max_km":null,'
+        '"daily_order_limit":null,"first_order_before_hour":null,'
+        '"monthly_category_targets":[{"month":4,"category":"水果","min_orders":12,"carryover":false}],"home_rule":null,'
+        '"blackout":[],"dated_single":[],"dated_route":[]}'
     )
+
+    # ------------------------------------------- dialect / colloquial rewrite
+    _NORMALIZE_SYSTEM = (
+        "你是货运司机偏好的「普通话转写器」。输入的偏好原文可能是粤语、吴语"
+        "（上海/苏州/杭州/宁波话等）、客家话等方言，也可能是口语、缺字或字序打乱的中文。\n"
+        "把它忠实转写成一句规范的普通话书面语。要求：\n"
+        "1) 不得增加、删除或改写任何约束条件；拿不准的内容按原样保留。\n"
+        "2) 所有数字、时刻、日期、月份、经纬度坐标、地名、货物品类名、金额必须逐字保留。\n"
+        '3) 只输出一个 JSON 对象：{"normalized":"转写后的普通话"}，禁止解释。\n'
+        "常见方言对照（仅供参考）：唔/勿/弗/覅=不；瞓觉=睡觉；返屋企/归屋里厢=回家；"
+        "收工/收车=结束出车；开工=出车；接生意/接活=接单；夜晚黑/夜里向=夜里；"
+        "朝早/早晨头=早上；晏昼=下午；成个月=整个月；两日=两天；唔好=不要；"
+        "嘢/物事=东西；喺/勒=在；畀/拨=给；揸车=开车。"
+    )
+
+    def _normalize_pref_text(self, driver_id: str, text: str) -> str | None:
+        """Rewrite a (possibly dialect / colloquial / scrambled) preference text
+        into standard Mandarin. Returns None when the model is unavailable or
+        the rewrite is unusable — callers must then fall back to the raw text.
+
+        The rewrite is consumed *in addition to* the raw text, never instead of
+        it, so a bad rewrite can only add recall, not lose grounding.
+        """
+        cached = self._pref_normalized.get(text)
+        if cached is not None:
+            return cached or None
+        normalized: str | None = None
+        msgs = [
+            {"role": "system", "content": self._NORMALIZE_SYSTEM},
+            {"role": "user", "content": json.dumps({"原文": text}, ensure_ascii=False)},
+        ]
+        for attempt in range(2):
+            req: dict[str, Any] = {"messages": msgs, "temperature": 0, "max_tokens": 300}
+            if attempt == 0:
+                req["response_format"] = {"type": "json_object"}
+            try:
+                resp = self._api.model_chat_completion(req)
+            except Exception as exc:
+                self._logger.info(
+                    "pref normalize attempt %d unavailable driver_id=%s err=%s",
+                    attempt, driver_id, exc,
+                )
+                continue
+            data = self._extract_json(resp)
+            if isinstance(data, dict):
+                cand = str(data.get("normalized") or "").strip()
+                # An empty or far-too-short rewrite is unusable; identical text adds nothing.
+                if cand and cand != text and len(cand) >= max(4, len(text) // 4):
+                    normalized = cand
+                break
+        self._pref_normalized[text] = normalized or ""
+        if normalized:
+            self._logger.info(
+                "pref normalized driver_id=%s raw=%r -> %r",
+                driver_id, text[:60], normalized[:60],
+            )
+        return normalized
 
     def _llm_parse_preferences(
         self, driver_id: str, texts: list[str], rules: DriverRules,
         coord_map: dict[str, tuple[float, float]] | None = None,
         penalties: list[Any] | None = None,
+        normalized: list[str | None] | None = None,
     ) -> bool:
         """用大模型把全部可见偏好解析成结构化规则并合并进 rules。
 
@@ -2632,6 +2798,9 @@ class ModelDecisionService:
         if not texts:
             return False
         payload: dict[str, Any] = {"preferences": texts}
+        norm_list = [n for n in (normalized or []) if n]
+        if norm_list:
+            payload["normalized_preferences"] = norm_list
         if penalties and len(penalties) == len(texts) and any(p for p in penalties):
             payload["penalty_amounts"] = penalties
         if coord_map:
@@ -2643,6 +2812,10 @@ class ModelDecisionService:
             {"role": "system", "content": self._PARSE_SYSTEM},
             {"role": "user", "content": user},
         ]
+        # Grounding text = raw + normalized rewrite, so a correct extraction from
+        # dialect wording is never dropped because the canonical term only
+        # appears in the rewrite (or vice versa).
+        ground_texts = list(texts) + norm_list
         # Try with json_object format first; retry without if it fails (some
         # platform endpoints may not support response_format).
         for attempt in range(2):
@@ -2658,7 +2831,7 @@ class ModelDecisionService:
             if data is not None:
                 self._logger.info("llm raw output driver_id=%s data=%s", driver_id, json.dumps(data, ensure_ascii=False)[:800])
                 try:
-                    self._merge_llm_rules(rules, data, texts)
+                    self._merge_llm_rules(rules, data, ground_texts)
                 except Exception as exc:
                     self._logger.warning("llm parse: merge failed driver_id=%s err=%s", driver_id, exc)
                     continue
@@ -2693,6 +2866,8 @@ class ModelDecisionService:
     _PREF_AUDIT_SYSTEM = (
         "你是货运司机偏好「覆盖审计器」。调度引擎已把司机的自然语言偏好编译成结构化规则；"
         "你逐条审计：每条偏好原文里的**全部约束**是否都已体现在 structured_rules 里。\n"
+        "偏好原文可能是粤语/吴语等方言、口语或字序打乱的中文，按**含义**审计；"
+        "输入可能附带 normalized_preferences（普通话转写，仅供理解参考）。\n"
         '输入 JSON: {"preferences":[原文...], "penalty_amounts":[违约扣款金额或null...], '
         '"structured_rules":"已结构化规则清单"}\n'
         "只输出一个 JSON 对象，禁止 markdown/解释：\n"
@@ -2706,8 +2881,8 @@ class ModelDecisionService:
         "pickup_max_km; haul_max_km; monthly_deadhead_max_km; daily_order_limit; "
         "first_order_before_hour; monthly_category_targets[{month,category,min_orders,carryover}]; "
         "home_rule{lat,lng,radius_km,home_by_hour,no_drive_until_hour}; "
-        "blackout[{region,dates[]}]; dated_single[{date,lat,lng,wait_minutes,before_hour}]; "
-        "dated_route[{date,stops[{lat,lng,wait_minutes,before_hour}]}]; "
+        "blackout[{region,dates[],month}]; dated_single[{date,month,lat,lng,wait_minutes,before_hour}]; "
+        "dated_route[{date,month,stops[{lat,lng,wait_minutes,before_hour}]}]; "
         "forbidden_zones[{lat,lng,radius_km}]; bounded_area{lat_min,lat_max,lng_min,lng_max}; "
         "must_visit[{lat,lng,radius_km,required_days}]; required_region{region,min_days}\n\n"
         "审计准则：\n"
@@ -2795,6 +2970,7 @@ class ModelDecisionService:
         compiled: list[tuple[str, Any]],
         rules: DriverRules,
         coord_map: dict[str, tuple[float, float]] | None = None,
+        norm_by_text: dict[str, str | None] | None = None,
     ) -> None:
         """Closed-loop verification: ask the model whether every obligation in
         each compiled preference is represented by the structured rules; merge
@@ -2807,11 +2983,14 @@ class ModelDecisionService:
         """
         texts = [t for t, _ in compiled]
         penalties = [p for _, p in compiled]
+        norms = [(norm_by_text or {}).get(t) for t in texts]
         payload: dict[str, Any] = {
             "preferences": texts,
             "penalty_amounts": penalties,
             "structured_rules": self._describe_rules_for_audit(rules),
         }
+        if any(norms):
+            payload["normalized_preferences"] = norms
         if coord_map:
             payload["known_coordinates"] = {
                 name: {"lat": loc[0], "lng": loc[1]} for name, loc in coord_map.items()
@@ -2854,9 +3033,10 @@ class ModelDecisionService:
             text = texts[idx]
             patch = entry.get("patch")
             patched = False
+            ground = [text] + ([norms[idx]] if norms[idx] else [])
             if isinstance(patch, dict) and any(v for v in patch.values()):
                 try:
-                    self._merge_llm_rules(rules, patch, [text])
+                    self._merge_llm_rules(rules, patch, ground)
                     patched = True
                     self._logger.info(
                         "coverage audit: repaired pref #%d driver_id=%s missing=%s",
@@ -3010,6 +3190,8 @@ class ModelDecisionService:
             msgs = [
                 {"role": "system", "content": (
                     "你判断一段司机偏好原文是否确实包含某条约束。"
+                    "原文可能是粤语/吴语等方言、口语或字序打乱/缺字的中文，按含义判断"
+                    "（如 唔=不、瞓觉=睡觉、返屋企=回家、收车/收工=结束出车、勿/覅=不要）。"
                     "只输出JSON {\"holds\": true/false}。"
                     "只有当原文明显不支持该约束时才返回false；含义相符或不确定一律返回true。"
                 )},
@@ -3047,7 +3229,8 @@ class ModelDecisionService:
         try:
             msgs = [
                 {"role": "system", "content": (
-                    "你是货运领域的语义判定助手。输入文本可能是乱序/缺字的中文。"
+                    "你是货运领域的语义判定助手。输入文本可能是乱序/缺字的中文，"
+                    "也可能是粤语/吴语等方言或口语，按含义判断。"
                     "只输出JSON {\"answer\": true/false}。"
                 )},
                 {"role": "user", "content": question},
@@ -3152,11 +3335,13 @@ class ModelDecisionService:
             if not isinstance(bo, dict):
                 continue
             reg = bo.get("region")
+            bo_month = self._month_to_idx(bo.get("month")) if bo.get("month") is not None else None
+            bo_base = _MONTH_START_DAYS[bo_month] if bo_month is not None else 0
             days = set()
             for d in bo.get("dates") or []:
                 dv = self._coerce_date(d)
                 if dv is not None:
-                    days.add(dv - 1)
+                    days.add(min(bo_base + dv - 1, MONTH_DAYS - 1))
             if isinstance(reg, str) and reg.strip() and days and not any(r == self._clean_region_name(reg) for r, _ in rules.blackout):
                 r = self._clean_region_name(reg)
                 if not r:
@@ -3631,6 +3816,15 @@ class ModelDecisionService:
                 return d if 1 <= d <= 31 else None
         return None
 
+    def _dated_day_index(self, ev: dict[str, Any], date: int) -> int:
+        """Season day index for a dated event: honour an explicit month when the
+        extraction provides one (events from April/May preferences used to be
+        anchored to March and silently missed), else default to the first month."""
+        month_idx = self._month_to_idx(ev.get("month")) if ev.get("month") is not None else None
+        base = _MONTH_START_DAYS[month_idx] if month_idx is not None else 0
+        day = base + int(date) - 1
+        return min(day, MONTH_DAYS - 1)
+
     def _coerce_single(self, ev: Any) -> dict[str, Any] | None:
         if not isinstance(ev, dict):
             return None
@@ -3651,7 +3845,7 @@ class ModelDecisionService:
             wait = int(wm.group(1)) if wm else 120
         wait = int(wait) if isinstance(wait, (int, float)) and wait > 0 else 120
         return {
-            "day": int(date) - 1,
+            "day": self._dated_day_index(ev, date),
             "lat": float(lat),
             "lng": float(lng),
             "min_wait": wait,
@@ -3691,7 +3885,61 @@ class ModelDecisionService:
             )
         if not stops:
             return None
-        return {"day": int(date) - 1, "stops": stops}
+        return {"day": self._dated_day_index(ev, date), "stops": stops}
+
+    def _fix_past_dated_days(
+        self, rules: DriverRules, now_day: int,
+        n_single: int = 0, n_route: int = 0, n_blackout: int = 0,
+    ) -> None:
+        """Re-anchor newly-compiled dated events/blackouts that landed in the past.
+
+        Dates without an explicit month default to the first simulated month, but
+        a preference only becomes *visible* inside its own date window — so an
+        April/May "十二号去仓库" pref compiled on day 61 used to produce day 11,
+        which had already passed, and the event was silently missed (these carry
+        the highest penalties). Since a visible preference cannot demand
+        something in the past, shift the same day-of-month to the soonest
+        calendar month that is not over yet. Only entries appended by the
+        current compile pass (beyond the n_* snapshots) are touched, so events
+        that legitimately completed earlier are never re-scheduled.
+        """
+        if now_day <= 0:
+            return
+
+        def _shift(day: int) -> int:
+            month_idx = _month_index_for_day(day)
+            dom = day - _MONTH_START_DAYS[month_idx]
+            for m in range(len(_MONTH_START_DAYS) - 1):
+                cand = _MONTH_START_DAYS[m] + dom
+                if cand >= now_day and cand < _MONTH_START_DAYS[m + 1]:
+                    return cand
+            return day
+
+        for ev in rules.dated_single[n_single:]:
+            if ev["day"] < now_day:
+                new_day = _shift(ev["day"])
+                if new_day != ev["day"]:
+                    self._logger.info(
+                        "dated_single past-day fix: %d -> %d (now_day=%d)", ev["day"], new_day, now_day
+                    )
+                    ev["day"] = new_day
+        for ev in rules.dated_route[n_route:]:
+            if ev["day"] < now_day:
+                new_day = _shift(ev["day"])
+                if new_day != ev["day"]:
+                    self._logger.info(
+                        "dated_route past-day fix: %d -> %d (now_day=%d)", ev["day"], new_day, now_day
+                    )
+                    ev["day"] = new_day
+        for i in range(n_blackout, len(rules.blackout)):
+            region, days = rules.blackout[i]
+            shifted = {(_shift(d) if d < now_day else d) for d in days}
+            if shifted != days:
+                self._logger.info(
+                    "blackout past-day fix: %s %s -> %s (now_day=%d)",
+                    region, sorted(days), sorted(shifted), now_day,
+                )
+                rules.blackout[i] = (region, shifted)
 
     @staticmethod
     def _rules_fingerprint(rules: DriverRules) -> str:
