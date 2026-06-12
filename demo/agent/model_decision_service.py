@@ -872,13 +872,20 @@ class ModelDecisionService:
         cargo_resp = self._query_cargo(driver_id=driver_id, latitude=lat, longitude=lng, k=30)
         items = cargo_resp.get("items", [])
         now = int(self._api.get_driver_status(driver_id)["simulation_progress_minutes"])
-        hard_end = self._hard_order_deadline(rules, plan, now, day)
+        # Same cross-midnight allowance as the deterministic scheduler, so the
+        # LLM sees the same candidate set (evening long-hauls included for
+        # drivers whose rest rules permit finishing past midnight).
+        hard_end = self._extended_order_end(rules, plan, now, day)
         blackout_regions = {r for r, days in rules.blackout if day in days}
         failed_ids = plan.get("failed_cargo_ids", set())
 
         # Build a compact list of locally feasible cargo. LLM may express preference,
-        # but execution safety stays deterministic.
-        cargo_summary = []
+        # but execution safety stays deterministic. Evaluate ALL scanned items and
+        # keep the best by (category-target first, then net-per-hour): the scan is
+        # nearest-first, so truncating in distance order used to let cheap nearby
+        # orders crowd every high-net candidate out of the LLM's view.
+        cat_target_rank, cat_needed_rank = self._get_category_target(rules, plan, day)
+        ranked: list[tuple[bool, float, dict[str, Any]]] = []
         for item in items:
             cargo = item.get("cargo", {})
             cargo_id = str(cargo.get("cargo_id", ""))
@@ -888,18 +895,27 @@ class ModelDecisionService:
             if ev is None:
                 continue
             net, _touches_required, occupied, pickup_km = ev
-            cargo_summary.append({
+            cargo_name = str(cargo.get("cargo_name", ""))
+            is_cat = bool(
+                cat_target_rank and cat_needed_rank > 0
+                and self._category_matches_sem(cat_target_rank, cargo_name)
+            )
+            net_per_h = round(float(net) / max(1, int(occupied)) * 60, 1)
+            entry = {
                 "cargo_id": cargo_id,
-                "name": cargo.get("cargo_name", ""),
+                "name": cargo_name,
                 "price": round(float(cargo.get("price", 0) or 0), 2),
                 "minutes": int(occupied),
                 "pickup_km": round(float(pickup_km), 1),
-                "net_per_h": round(float(net) / max(1, int(occupied)) * 60, 1),
+                "net_per_h": net_per_h,
                 "from": cargo.get("start", {}).get("city", ""),
                 "to": cargo.get("end", {}).get("city", ""),
-            })
-            if len(cargo_summary) >= _LLM_CARGO_SUMMARY_LIMIT:
-                break
+            }
+            if is_cat:
+                entry["指标品类"] = True
+            ranked.append((is_cat, net_per_h, entry))
+        ranked.sort(key=lambda r: (not r[0], -r[1]))
+        cargo_summary = [entry for _, _, entry in ranked[:_LLM_CARGO_SUMMARY_LIMIT]]
 
         # Build preference rules summary
         pref_summary = self._format_rules_for_llm(driver_id, rules, plan, day)
@@ -933,12 +949,14 @@ class ModelDecisionService:
             "- 只输出一个JSON对象: {\"action\": \"...\", \"params\": {...}, \"reason\": \"20字内\"}\n"
         )
 
-        # Add category target warning
-        cat_target, cat_needed = self._get_category_target(rules, plan, day)
+        # Add category target warning (reuse the ranking pass's computation)
+        cat_target, cat_needed = cat_target_rank, cat_needed_rank
         month_deadhead = plan.setdefault("monthly_deadhead_km", {}).get(month_idx, 0.0)
+        # The shortfall comes from this driver's PARSED targets (incl. carryover) —
+        # never assume D001's "12 orders" for other drivers.
         cat_warning = ""
         if cat_target and cat_needed > 0:
-            cat_warning = f"\n⚠️ 品类指标警告: 本月需要'{cat_target}'至少12单，还差{cat_needed}单！优先接此品类。\n"
+            cat_warning = f"\n⚠️ 品类指标警告: 本月品类'{cat_target}'的指标还差{cat_needed}单未完成！优先接此品类。\n"
 
         # P3: history-driven daily compliance self-audit (hard time-windows +
         # any previous-day in-window driving). Placed up top so it anchors the
@@ -1078,20 +1096,56 @@ class ModelDecisionService:
     def _safe_wait(self, rules: DriverRules, now: int, duration: int) -> dict[str, Any]:
         return self._wait(self._extend_wait_for_no_drive(rules, now, duration))
 
-    def _hard_order_deadline(self, rules: DriverRules, plan: dict, now: int, day: int) -> int:
-        """Latest acceptable finish time for a new order from this step."""
+    def _hard_order_deadline(
+        self, rules: DriverRules, plan: dict, now: int, day: int,
+        base_end: int | None = None,
+    ) -> int:
+        """Latest acceptable finish time for a new order from this step.
+
+        ``base_end`` lets the caller start from an already-extended deadline
+        (cross-midnight completion for drivers whose rest rules leave room for
+        it, see _extended_order_end); the default is today's midnight. Window
+        and home-rule cutoffs still shrink the deadline either way.
+        """
         day_start = day * DAY_MINUTES
         day_end = day_start + DAY_MINUTES
-        hard_end = day_end
+        hard_end = base_end if base_end is not None else day_end
         for ws, _we in rules.no_drive_windows_for(day):
             ws_today = day_start + min(ws, DAY_MINUTES)
             if now < ws_today < hard_end:
                 hard_end = max(now, ws_today - _ORDER_DEADLINE_BUFFER_MIN)
+        if hard_end > day_end:
+            # Deadline reaches into tomorrow: tomorrow's windows shrink it too.
+            for ws, _we in rules.no_drive_windows_for(day + 1):
+                ws_next = day_end + min(ws, DAY_MINUTES)
+                if now < ws_next < hard_end:
+                    hard_end = max(now, ws_next - _ORDER_DEADLINE_BUFFER_MIN)
         if rules.home_by_minute is not None and day not in plan.get("home_done", set()):
             buffer = 60
             cutoff = day_start + rules.home_by_minute - buffer
             if cutoff > now:
                 hard_end = min(hard_end, cutoff)
+        return hard_end
+
+    def _extended_order_end(self, rules: DriverRules, plan: dict, now: int, day: int) -> int:
+        """Order-finish deadline including the cross-midnight allowance.
+
+        A flexible-rest driver (daily rest quota but no fixed window) may let
+        the day's last order finish past midnight, leaving room inside the
+        next day for a full rest block. A driver with NO rest constraints at
+        all may finish any time before the next midnight — capping such a
+        driver at today's midnight (the old behavior) silently rejected every
+        profitable evening long-haul for no compliance reason at all.
+        Never extends across off days, blackout days, dated-event days, home
+        rules or any no-drive window on either side of the boundary.
+        """
+        hard_end = self._hard_order_deadline(rules, plan, now, day)
+        day_end = (day + 1) * DAY_MINUTES
+        if (rules.rest_window is None and not rules.has_no_drive(day)
+                and not rules.has_no_drive(day + 1)
+                and rules.home_by_minute is None
+                and self._next_day_is_ordinary(rules, plan, day)):
+            hard_end = max(hard_end, day_end + (DAY_MINUTES - rules.day_rest_block))
         return hard_end
 
     def _interval_overlaps_no_drive(self, rules: DriverRules, start: int, end: int) -> bool:
@@ -1712,15 +1766,11 @@ class ModelDecisionService:
                     )
 
         # (E) take the best compliant order, else idle to day end. A flexible-rest
-        # driver may let the day's *last* order finish past midnight (up to a cap that
-        # still leaves room for a full rest block inside the next day), but only when
-        # the next day is an ordinary working day — never crossing into an off day,
-        # blackout day or a dated-event day.
-        hard_end = self._hard_order_deadline(rules, plan, now, day)
-        if (rules.rest_window is None and not rules.has_no_drive(day)
-                and not rules.has_no_drive(day + 1) and rules.daily_rest_minutes > 0):
-            if self._next_day_is_ordinary(rules, plan, day):
-                hard_end = max(hard_end, day_end + (DAY_MINUTES - rules.day_rest_block))
+        # or unconstrained driver may let the day's *last* order finish past
+        # midnight (see _extended_order_end), but only when the next day is an
+        # ordinary working day — never crossing into an off day, blackout day or
+        # a dated-event day.
+        hard_end = self._extended_order_end(rules, plan, now, day)
         order = self._pick_order(driver_id, status, rules, plan, now, lat, lng, day, hard_end)
         if order is not None:
             return order
@@ -1908,10 +1958,12 @@ class ModelDecisionService:
         best_is_category_target = False
         best_pickup_km = 0.0
         best_cost_time = 0
+        skip_ids: set[str] = set()  # picks dropped after going stale mid-step
 
         def _score_item(cargo, item, now_t):
             nonlocal best, best_item, best_score, best_is_required, best_is_category_target, best_pickup_km, best_cost_time
-            if str(cargo.get("cargo_id", "")) in plan.get("failed_cargo_ids", set()):
+            cid = str(cargo.get("cargo_id", ""))
+            if cid in skip_ids or cid in plan.get("failed_cargo_ids", set()):
                 return
             ev = self._evaluate_cargo(cargo, item, rules, blackout_regions, now_t, day_end, lat, lng)
             if ev is None:
@@ -1990,24 +2042,50 @@ class ModelDecisionService:
 
         if best is None:
             return None
-        if hunt_category and urgent_category and not best_is_category_target:
-            plan["_category_miss_today"] = day
-            self._logger.info(
-                "category target urgent: skip non-category best driver_id=%s cat=%s needed=%d remaining_days=%d",
-                driver_id, cat_target, cat_needed, remaining_month_days,
-            )
-            return None
-        latest_now = int(self._api.get_driver_status(driver_id)["simulation_progress_minutes"])
-        latest_deadline = min(day_end, self._hard_order_deadline(rules, plan, latest_now, day))
-        latest_ev = self._evaluate_cargo(best, best_item or {}, rules, blackout_regions, latest_now, latest_deadline, lat, lng)
-        if latest_ev is None:
+        retried = False
+        while True:
+            if hunt_category and urgent_category and not best_is_category_target:
+                plan["_category_miss_today"] = day
+                self._logger.info(
+                    "category target urgent: skip non-category best driver_id=%s cat=%s needed=%d remaining_days=%d",
+                    driver_id, cat_target, cat_needed, remaining_month_days,
+                )
+                return None
+            latest_now = int(self._api.get_driver_status(driver_id)["simulation_progress_minutes"])
+            # Re-derive the deadline at the post-scan clock but KEEP the caller's
+            # cross-midnight extension: the old min(day_end, plain deadline)
+            # clamped the deadline back to midnight, so revalidation rejected
+            # every extended pick the scoring pass had legitimately accepted.
+            latest_deadline = self._hard_order_deadline(rules, plan, latest_now, day, base_end=day_end)
+            latest_ev = self._evaluate_cargo(best, best_item or {}, rules, blackout_regions, latest_now, latest_deadline, lat, lng)
+            if latest_ev is not None:
+                break
             self._logger.info(
                 "rejected selected order after scan-time revalidation cargo_id=%s now=%d deadline=%d",
                 best.get("cargo_id"),
                 latest_now,
                 latest_deadline,
             )
-            return None
+            if retried:
+                return None
+            # One retry: drop the stale pick and re-score the already-scanned
+            # items at the fresh clock. Losing the whole step (idling up to an
+            # hour) because the best pick went stale during a long k=600 scan is
+            # strictly worse than taking the second-best compliant order now.
+            retried = True
+            skip_ids.add(str(best.get("cargo_id")))
+            best = None
+            best_item = None
+            best_score = 0.0
+            best_is_required = False
+            best_is_category_target = False
+            best_pickup_km = 0.0
+            best_cost_time = 0
+            _, last_items = plan.get("_scan_items") or (now, items)
+            for item in last_items:
+                _score_item(item.get("cargo", {}), item, latest_now)
+            if best is None:
+                return None
         latest_net, _latest_required, latest_occupied, latest_pickup_km = latest_ev
         # Preference-driven soft long-haul cap: keep an over-cap order only if its
         # net beats the penalty (consistent with _score_item / _validate_llm_take_order).
