@@ -40,3 +40,5 @@ demo/server/config/config.json
 
 # Evaluation artifacts
 demo/results/
+demo/tools/shadow_data/
+demo/tools/shadow_results/

@@ -2296,30 +2296,96 @@ class ModelDecisionService:
         scan = plan.get("_scan_items")
         if scan is not None and scan[0] == now:
             best_target, best_net = _best_target(scan[1])
+        wide_items: list[dict[str, Any]] | None = None
         if best_target is None:
             cargo_resp = self._query_cargo(driver_id=driver_id, latitude=lat, longitude=lng, k=600)
             now = int(self._api.get_driver_status(driver_id)["simulation_progress_minutes"])
             day_end = min(day_end, self._hard_order_deadline(rules, plan, now, day))
-            best_target, best_net = _best_target(cargo_resp.get("items", []))
+            wide_items = cargo_resp.get("items", [])
+            best_target, best_net = _best_target(wide_items)
         if best_target is None:
-            return None
-        action = self._safe_reposition(
-            rules,
-            now,
-            lat,
-            lng,
-            best_target[0],
-            best_target[1],
-            deadline=day_end,
-            tag="anti_strand",
-            target_city=best_target[2],
-        )
-        if action is None:
-            return None
+            # Deep-strand rescue: not even ONE order in the widest scan can pay
+            # back the approach — the driver is in a cargo desert (a previous
+            # haul dropped it hundreds of km from any cluster). Single-order
+            # economics can never justify the return trip, so the driver would
+            # idle for the REST OF THE SEASON (shadow benchmark measured 57
+            # zero-order days). Treat the return deadhead as an investment in
+            # future daily earning capacity and head toward the densest pickup
+            # cluster, one day-sized leg at a time.
+            action = self._deep_strand_rescue(rules, now, day_end, lat, lng, wide_items or [])
+            if action is None:
+                return None
+        else:
+            action = self._safe_reposition(
+                rules,
+                now,
+                lat,
+                lng,
+                best_target[0],
+                best_target[1],
+                deadline=day_end,
+                tag="anti_strand",
+                target_city=best_target[2],
+            )
+            if action is None:
+                return None
         plan["strand_repo"].add(day)
         plan.setdefault("strand_count", {})
         plan["strand_count"][day] = plan["strand_count"].get(day, 0) + 1
         return action
+
+    _RESCUE_MIN_DESERT_KM = 80.0  # nearer cargo than this → not a desert, normal flow
+
+    def _deep_strand_rescue(self, rules, now, day_end, lat, lng, items) -> dict[str, Any] | None:
+        """Reposition toward the densest pickup cluster visible in the wide scan.
+
+        Only fires when the nearest scanned pickup is farther than
+        _RESCUE_MIN_DESERT_KM (a true desert; anything closer is left to the
+        normal anchor logic). The leg is clipped to today's drivable budget so
+        it always ends before the day's hard deadline / night window; if still
+        stranded tomorrow, the next rescue leg continues the journey.
+        """
+        pickups: list[tuple[float, float, str]] = []
+        for item in items:
+            start = (item.get("cargo") or {}).get("start") or {}
+            try:
+                plat, plng = float(start.get("lat")), float(start.get("lng"))
+            except (TypeError, ValueError):
+                continue
+            pickups.append((plat, plng, str(start.get("city", ""))))
+        if not pickups:
+            return None
+        if min(_haversine_km(lat, lng, p[0], p[1]) for p in pickups) < self._RESCUE_MIN_DESERT_KM:
+            return None
+        # Densest pickup: most neighbours within 60 km (sampled for O(n²) control).
+        sample = pickups[:150]
+        best_i, best_density = 0, -1
+        for i, (ilat, ilng, _c) in enumerate(sample):
+            density = sum(
+                1 for jlat, jlng, _c2 in sample
+                if _haversine_km(ilat, ilng, jlat, jlng) < 60.0
+            )
+            if density > best_density:
+                best_i, best_density = i, density
+        tlat, tlng, tcity = sample[best_i]
+        budget_min = day_end - now - _ORDER_DEADLINE_BUFFER_MIN
+        if budget_min < 60:
+            return None
+        max_km = budget_min / 60.0 * SPEED_KM_PER_HOUR
+        dist = _haversine_km(lat, lng, tlat, tlng)
+        if dist > max_km:
+            frac = max_km / dist
+            tlat = lat + (tlat - lat) * frac
+            tlng = lng + (tlng - lng) * frac
+            tcity = None
+        self._logger.info(
+            "deep-strand rescue: heading to densest cluster (%.3f,%.3f) density=%d dist=%.0fkm (clipped to %.0fkm)",
+            tlat, tlng, best_density, dist, min(dist, max_km),
+        )
+        return self._safe_reposition(
+            rules, now, lat, lng, tlat, tlng,
+            deadline=day_end, tag="strand_rescue", target_city=tcity,
+        )
 
     def _evaluate_relocation(self, cargo, rules, blackout_regions, now, day_end, lat, lng):
         """Net of an order if the driver first repositions to its pickup. Mirrors
@@ -2554,7 +2620,12 @@ class ModelDecisionService:
     # ----------------------------------------------------------------- planning
     @staticmethod
     def _plan_off_days(rules: DriverRules) -> set[int]:
-        """整月整休日：均匀铺在月中，避开特定日期事件及其前置布置日。
+        """整休日：在**每个日历月内**均匀铺 off_days_min 天，避开事件日及其前置日。
+
+        "每月至少N天完全不出车" 是按月评定的——旧实现把 N 天摊到整个 92 天赛季
+        （N=2 时只铺 3 月下旬和 5 月上旬各一天），busy 月份 0 个整休日就吃一次
+        整月罚款（影子基准实测 D102 四月 0 整休 → 3000 罚）。按月铺保证每个月
+        都达标；多歇几天的收入损失远小于按月罚款。
 
         采用确定性铺点而非"挑最晚的几天"，这样即便事件偏好要到临近其日期窗才可见、
         导致 reserved 集合后期才补全，也不会出现"已铺的整休日被事后挪走"的问题。
@@ -2569,19 +2640,21 @@ class ModelDecisionService:
             reserved.add(ev["day"])
             reserved.add(ev["day"] - 1)  # keep the day-before free for staging
         off: set[int] = set()
-        for i in range(n):
-            target = int(round((i + 0.5) * MONTH_DAYS / n))
-            target = min(MONTH_DAYS - 1, max(0, target))
-            chosen = None
-            for delta in range(MONTH_DAYS):
-                for cand in (target + delta, target - delta):
-                    if 0 <= cand < MONTH_DAYS and cand not in reserved and cand not in off:
-                        chosen = cand
+        for m_start, m_end in zip(_MONTH_START_DAYS[:-1], _MONTH_START_DAYS[1:]):
+            span = m_end - m_start
+            for i in range(min(n, span)):
+                target = m_start + int(round((i + 0.5) * span / n))
+                target = min(m_end - 1, max(m_start, target))
+                chosen = None
+                for delta in range(span):
+                    for cand in (target + delta, target - delta):
+                        if m_start <= cand < m_end and cand not in reserved and cand not in off:
+                            chosen = cand
+                            break
+                    if chosen is not None:
                         break
                 if chosen is not None:
-                    break
-            if chosen is not None:
-                off.add(chosen)
+                    off.add(chosen)
         return off
 
     # ------------------------------------------------------------- preferences
@@ -3970,8 +4043,42 @@ class ModelDecisionService:
                 self._add_allowed_region(rules, raw, text)
 
     _NIGHT_KW = ("夜", "晚", "宵", "黑")
-    _REST_KW = ("停", "休", "熄", "睡", "眠", "收", "歇", "锁", "不出", "不接", "不动", "归家")
+    _REST_KW = ("停", "休", "熄", "睡", "眠", "收", "歇", "锁", "不出", "不接", "不动", "归家",
+                "唔好", "覅", "勿", "困觉", "唞")
     _CLOCK_RE = re.compile(r"([01]?\d|2[0-4])(?:[：:]([0-5]\d)|点(半)?|时)")
+    # Chinese-numeral clocks ("十点" "十一点半") used by colloquial/dialect texts.
+    _CN_CLOCK_RE = re.compile(r"([零一二两三四五六七八九十]{1,3})\s*点(半)?")
+
+    @classmethod
+    def _clock_minutes_with_context(cls, text: str) -> list[int]:
+        """All clock times in ``text`` as minutes-of-day, dialect-aware.
+
+        Handles digit clocks ("21:00" "21点") and Chinese-numeral clocks
+        ("十点" "十一点半"). Colloquial texts express evening times on the
+        12-hour dial ("晚黑十点" == 22:00), so an hour ≤ 11 preceded within a
+        few characters by a night marker is shifted by +12.
+        """
+        out: list[int] = []
+        seen_spans: list[tuple[int, int]] = []
+        for m in cls._CLOCK_RE.finditer(text):
+            h = int(m.group(1))
+            mins = int(m.group(2)) if m.group(2) else (30 if m.group(3) else 0)
+            out.append((h, mins, m.start()))
+            seen_spans.append((m.start(), m.end()))
+        for m in cls._CN_CLOCK_RE.finditer(text):
+            if any(s <= m.start() < e for s, e in seen_spans):
+                continue
+            h = _cn_to_int(m.group(1))
+            if not (0 <= h <= 24):
+                continue
+            out.append((h, 30 if m.group(2) else 0, m.start()))
+        result: list[int] = []
+        for h, mins, pos in out:
+            ctx = text[max(0, pos - 6):pos]
+            if h <= 11 and any(k in ctx for k in ("晚", "夜", "黑", "宵", "挨晚", "傍晚")):
+                h += 12
+            result.append(h * 60 + mins)
+        return result
 
     def _supplement_night_failsafe(self, texts: list[str], rules: DriverRules) -> None:
         """夜休 fail-safe：夜间禁驶是按天重复扣分的最大罚项之一，漏抽代价极高。
@@ -3988,11 +4095,7 @@ class ModelDecisionService:
                 continue
             if not any(k in text for k in self._REST_KW):
                 continue
-            times: list[int] = []
-            for m in self._CLOCK_RE.finditer(text):
-                h = int(m.group(1))
-                mins = int(m.group(2)) if m.group(2) else (30 if m.group(3) else 0)
-                times.append(h * 60 + mins)
+            times = self._clock_minutes_with_context(text)
             evening = [t for t in times if t >= 18 * 60]
             morning = [t for t in times if 0 < t <= 9 * 60]
             if not evening or not morning:
@@ -4053,7 +4156,8 @@ class ModelDecisionService:
             # Monthly full off-days ("每月至少两天完全不出车" — one-shot lump penalty).
             if (
                 ("整天" in text or "全天" in text or "完全" in text) and any(
-                    k in text for k in ("歇", "休息", "停驶", "不接单", "不空车", "不空跑", "不出车", "不开工")
+                    k in text for k in ("歇", "休息", "停驶", "不接单", "不空车", "不空跑", "不出车",
+                                        "不开工", "唔开工", "唔出车", "勿出车", "覅出车")
                 )
             ):
                 cnt = self._parse_cn_count(text)
@@ -4679,9 +4783,11 @@ class ModelDecisionService:
     def _parse_cn_count(text: str) -> int:
         m = re.search(r"([一二两三四五六七八九十\d]+)\s*个?\s*(?:整天|不同的日子|不同日子|个不同)", text)
         if not m:
+            # 天/日 both accepted (粤语用"日"); allow a short connective ("要/得")
+            # and dialect negations (唔/勿/覅) before the rest verb.
             m = re.search(
-                r"([一二两三四五六七八九十\d]+)\s*天\s*(?:完全|彻底|整天|整)?\s*"
-                r"(?:歇|休|停|不接|不出|不空)",
+                r"([一二两三四五六七八九十\d]+)\s*[天日]\s*(?:要|得|都)?\s*(?:完全|彻底|整天|整)?\s*"
+                r"(?:歇|休|停|不接|不出|不空|唔开|唔出|勿出|覅出|留喺|待牢)",
                 text,
             )
         if not m:
