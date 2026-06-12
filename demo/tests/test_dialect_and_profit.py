@@ -310,16 +310,83 @@ def test_driver_with_prefs_wraps_up_by_midnight() -> None:
     assert action["action"] != "take_order", action
 
 
-def test_daily_planner_not_invoked_by_decide() -> None:
-    """The per-day compliance planner stays dormant (finals A/B: every
-    planner-based build had a 64.5k+ penalty vs 46.0k without it)."""
+def test_daily_planner_additive_only_in_decide() -> None:
+    """The per-day planner runs (3 majority-vote samples) and can only ADD
+    windows — replace semantics are permanently off after the round-2
+    penalty regression."""
     api = SimStubApi(
         [CARGO_LATE], now=8 * 60,
         preferences=[{"content": "每天接单不超过3单。", "penalty_amount": 200}],
     )
     svc = ModelDecisionService(api)
     svc.decide("DZ07")
-    assert api.planner_calls == 0, api.planner_calls
+    assert api.planner_calls == 3, api.planner_calls
+    directive = svc._rules["DZ07"].daily_directives.get(0)
+    assert directive is not None and directive["replace"] is False, directive
+
+
+def test_confirm_drop_requires_double_false() -> None:
+    """A rule is only dropped when the verifier says 'false' twice; a single
+    flaky 'false' (the old silent-delete path) keeps the rule."""
+
+    class _ConfirmSeqApi:
+        def __init__(self, verdicts):
+            self.verdicts = list(verdicts)
+
+        def get_driver_status(self, driver_id):  # noqa: ANN001, ANN201
+            return {}
+
+        def query_cargo(self, *args, **kwargs):  # noqa: ANN002, ANN003, ANN201
+            return {"items": []}
+
+        def query_decision_history(self, driver_id, step):  # noqa: ANN001, ANN201
+            return {"records": []}
+
+        def model_chat_completion(self, payload):  # noqa: ANN001, ANN201
+            system = payload["messages"][0]["content"]
+            if "是否确实包含某条约束" in system:
+                return _resp({"holds": self.verdicts.pop(0)})
+            return _resp({})
+
+    # false then true -> kept (uncorroborated drop)
+    svc = ModelDecisionService(_ConfirmSeqApi([False, True]))
+    rules = DriverRules()
+    svc._merge_llm_rules(rules, {"forbidden_categories": ["生鲜"]}, ["生鲜嘅货唔好同我派"])
+    assert "生鲜" in rules.forbidden_categories, rules.forbidden_categories
+
+    # false twice -> dropped
+    svc2 = ModelDecisionService(_ConfirmSeqApi([False, False]))
+    rules2 = DriverRules()
+    svc2._merge_llm_rules(rules2, {"forbidden_categories": ["生鲜"]}, ["每天最多接三单"])
+    assert "生鲜" not in rules2.forbidden_categories, rules2.forbidden_categories
+
+
+def test_residual_veto_downgrades_take_order() -> None:
+    """With residual (unstructured) preferences, a clear LLM veto downgrades a
+    deterministic take_order to a short wait — veto-only, so the LLM can
+    refuse revenue but never cause a violation."""
+
+    class _VetoApi(SimStubApi):
+        def model_chat_completion(self, payload):  # noqa: ANN001, ANN201
+            system = payload["messages"][0]["content"]
+            if "明显违反" in system:
+                return _resp({"violates": True})
+            return super().model_chat_completion(payload)
+
+    api = _VetoApi([CARGO_LATE], now=8 * 60)
+    svc = ModelDecisionService(api)
+    rules = svc._rules.setdefault("DV01", DriverRules())
+    rules.has_any_preference = True
+    rules.residual_constraints.append(
+        {"text": "落大雨嗰日生鲜嘅货唔好同我派", "penalty": 800, "note": ""}
+    )
+    action = svc.decide("DV01")
+    assert action["action"] == "wait", action
+    # without residuals the same setup takes the order (sanity check)
+    api2 = _VetoApi([CARGO_LATE], now=8 * 60)
+    svc2 = ModelDecisionService(api2)
+    action2 = svc2.decide("DV02")
+    assert action2["action"] == "take_order", action2
 
 
 def test_idle_wait_consults_llm_for_rescue_reposition() -> None:

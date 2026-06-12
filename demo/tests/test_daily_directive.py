@@ -144,7 +144,7 @@ def test_coerce_directive_window() -> None:
 def test_planner_applies_directive_and_caches_per_day() -> None:
     api = _StubApi(content=json.dumps({
         "no_drive_today": [{"start_hour": 23, "end_hour": 6}],
-        "replaces_default": True,
+        "replaces_default": True,  # v2: replace semantics are ignored
         "today_plan": "周六夜休可推迟到23点；本月水果还差3单",
         "category_focus": "水果",
     }, ensure_ascii=False))
@@ -158,15 +158,30 @@ def test_planner_applies_directive_and_caches_per_day() -> None:
     directive = rules.daily_directives.get(6)
     assert directive is not None
     assert directive["windows"] == [WEEKEND_NIGHT], directive
-    assert directive["replace"] is True
+    # additive-only v2: an LLM directive can never replace a static window
+    assert directive["replace"] is False
     assert "水果" in directive["notes"]
-    assert rules.no_drive_windows_for(6) == [WEEKEND_NIGHT]
+    eff = rules.no_drive_windows_for(6)
+    assert NIGHT_STATIC in eff and WEEKEND_NIGHT in eff, eff
 
     calls = api.chat_calls
+    assert calls == 3, "majority vote needs 3 proposal samples"
     svc._ensure_daily_directive("DX", rules, plan, 6)  # same day -> cached
     assert api.chat_calls == calls, "directive must be computed once per day"
     svc._ensure_daily_directive("DX", rules, plan, 7)  # new day -> recomputed
-    assert api.chat_calls == calls + 1
+    assert api.chat_calls == calls + 3
+
+
+def test_vote_directive_windows_majority() -> None:
+    vote = ModelDecisionService._vote_directive_windows
+    a = (1380, 1800)
+    # 2 of 3 proposals agree -> accepted; 1 of 3 -> rejected
+    assert vote([[a], [a], []]) == [a]
+    assert vote([[a], [], []]) == []
+    # a single successful proposal stands as-is (additive windows are fail-safe)
+    assert vote([[a]]) == [a]
+    # overlapping agreeing windows merge into the union span
+    assert vote([[(1260, 1800)], [(1290, 1800)]]) == [(1260, 1800)]
 
 
 def test_planner_failure_falls_back_to_static_with_bounded_retries() -> None:

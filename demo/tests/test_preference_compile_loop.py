@@ -93,11 +93,18 @@ PREF_RAIN = "但凡落大雨嗰日，生鲜嘅货一律唔好同我派。"
 
 
 def test_per_pref_compile_calls_llm_once_per_text() -> None:
-    """Each preference text is compiled individually (not batched)."""
+    """Each preference text is compiled individually (not batched), with a
+    3-sample ensemble per text whose results merge accretively."""
     api = ScriptedApi(
         extract_responses=[
+            # pref 1: only one of the three samples catches the night window
             {"no_drive_windows": [{"start_hour": 22, "end_hour": 6}]},
+            {},
+            {},
+            # pref 2: samples agree on the off-days quota
             {"off_days_min": 2},
+            {"off_days_min": 2},
+            {},
         ],
         audit_response={"audits": [{"index": 0, "covered": True},
                                    {"index": 1, "covered": True}]},
@@ -107,7 +114,7 @@ def test_per_pref_compile_calls_llm_once_per_text() -> None:
         {"content": PREF_NIGHT, "penalty_amount": 2700},
         {"content": PREF_OFFDAYS, "penalty_amount": 3000},
     ]))
-    assert len(api.extract_payloads) == 2, api.extract_payloads
+    assert len(api.extract_payloads) == 6, api.extract_payloads
     for payload in api.extract_payloads:
         assert len(payload["preferences"]) == 1, payload
     assert (1320, 1800) in rules.no_drive_windows, rules.no_drive_windows
@@ -118,7 +125,7 @@ def test_per_pref_compile_calls_llm_once_per_text() -> None:
         {"content": PREF_NIGHT, "penalty_amount": 2700},
         {"content": PREF_OFFDAYS, "penalty_amount": 3000},
     ]))
-    assert len(api.extract_payloads) == 2, "already-seen prefs must not be re-compiled"
+    assert len(api.extract_payloads) == 6, "already-seen prefs must not be re-compiled"
 
 
 def test_audit_repairs_missed_daily_window() -> None:

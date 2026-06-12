@@ -16,18 +16,25 @@
 3. 零静默丢弃：审计后仍无法用结构化字段表达的偏好，进入
    ``DriverRules.residual_constraints``，逐步注入决策 prompt（带违约金额），
    由决策 LLM 在线遵守——任何偏好都不会被悄悄丢掉。
-4. 每日合规计划层（**默认停用**）：`_ensure_daily_directive` 的机制保留但
-   `decide()` 不再调用——复赛实测无计划器的提交扣分 46.0k，所有带计划器的
-   构建扣分 64.5k+：其"替换"语义允许某天一条错误的 LLM 指令重塑真实夜窗
-   （按天复利扣分），且每司机日多一次 LLM 调用。静态编译窗是保守下限，
-   周末放宽这类日历放松刻意不去利用。
-5. 确定性执行（确定性优先）：调度器与各动作守卫按静态有效禁驶窗硬性拦截
-   违规动作（每日休息 / 夜间休息窗 / 按自然月铺点的整休天数 / 禁接货类 /
+4. 每日合规计划层（v2，**只增不减**）：每个仿真日 3 份 LLM 提案做多数表决，
+   把偏好原文按当天日历（日期/星期/月度进度）具象化为**额外的**今日禁驶窗。
+   不再支持 replace——LLM 永远无法移走或重塑一条静态窗（第二轮实测 replace
+   语义是扣分翻倍的元凶之一），多出来的窗最多损失几小时收入，绝不会新增违规。
+5. 确定性执行（确定性优先）：调度器与各动作守卫按"静态窗 ∪ 当日加窗"硬性
+   拦截违规动作（每日休息 / 夜间休息窗 / 按自然月铺点的整休天数 / 禁接货类 /
    禁接区域 / 必接区域 / 赴装空驶上限 / 特定日期到点事件），并在合规候选中
-   按净收益择单。决策 LLM 不再每 3 步参与决策，只在引擎找不到任何合规单、
-   即将整段空等时作为「救场」提供一次重定位建议（建议仍须通过全部确定性
-   守卫，每天至多 2 次）。有偏好的司机一律在 24:00 前收尾；只有**完全没有
-   偏好**的司机才允许末单跨午夜（零罚分纯增收）。
+   按净收益择单。决策 LLM 不参与逐步择单，只承担三类「fail-safe 方向」的
+   角色：(a) 空闲救场——引擎找不到任何合规单时给一次重定位建议（仍须通过
+   全部守卫，每天≤3次）；(b) residual 否决——对 schema 无法表达的偏好，
+   接单前问一次"是否明显违反"，LLM 只能否决收入、不可能制造违规（每天≤3次）；
+   (c) 语义判定（品类归属/地名真实性/规则确认，其中"丢规则"须连续两次 false
+   才生效）。有偏好的司机一律在 24:00 前收尾；只有**完全没有偏好**的司机才
+   允许末单跨午夜（零罚分纯增收）。
+
+token 预算观（500 万/司机）：token 不是稀缺资源，**4 小时总时长与单步决策
+耗时才是**。因此预算花在编译期（逐条 3 采样集成抽取 + 审计 + 双重确认）与
+日界（每日 3 提案表决），而不是逐步热路径；全部新增调用都只朝"多休几小时/
+少接一单"的安全方向出错，不可能朝"违规扣分"方向出错。
 """
 
 from __future__ import annotations
@@ -747,24 +754,22 @@ class ModelDecisionService:
         lng = float(status["current_lng"])
         day, tod = divmod(now, DAY_MINUTES)
 
-        # NOTE: the per-day compliance planner (`_ensure_daily_directive`) is
-        # intentionally NOT invoked. Finals A/B: the only submission without it
-        # scored 54.4k with a 46.0k penalty, while every planner-based build
-        # had a 64.5k+ penalty — its replace semantics lets one bad per-day LLM
-        # directive reshape a real night window (a daily-compounding penalty),
-        # and it adds ~1 LLM call per driver-day of tokens/latency. The static
-        # compiled windows are the conservative floor; calendar relaxations
-        # (e.g. weekend late-rest) are deliberately left unexploited.
+        # Daily compliance planning (additive-only v2): once per day, 3 LLM
+        # samples concretize the raw NL preferences for *today* and a majority
+        # vote yields extra no-drive windows. The planner can only ADD windows
+        # (replace semantics removed after the round-2 penalty regression), so
+        # its worst case is a few idle hours, never a violation.
+        self._ensure_daily_directive(driver_id, rules, plan, day)
 
         # Deterministic-first decision flow. The rule engine maximises net/h
         # under every compliance guard with a wide cargo scan; per-step LLM
         # co-decision proved strictly worse in finals A/Bs (it overrode strong
         # picks with waits and added latency/token cost/run-to-run variance).
-        # The LLM is now consulted only as an *idle rescue*: when the engine
-        # found no compliant order from here and would sit out 2h, ask it for a
+        # The LLM is consulted only as an *idle rescue*: when the engine found
+        # no compliant order from here and would sit out 2h, ask it for a
         # smarter reposition (e.g. toward a logistics hub beyond the scan
         # radius). Its proposal still passes every deterministic guard, and at
-        # most 2 rescues per day are attempted (token/latency cap).
+        # most 3 rescues per day are attempted (wall-clock cap, not tokens).
         step = self._step_count[driver_id]
         consecutive_waits = plan.get("_consecutive_waits", 0)
         action = self._schedule(driver_id, status, rules, plan, now, lat, lng)
@@ -773,7 +778,7 @@ class ModelDecisionService:
             action.get("action") == "wait"
             and plan.pop("_idle_wait", False)
             and consecutive_waits < 3
-            and rescue_days.get(day, 0) < 2
+            and rescue_days.get(day, 0) < 3
         ):
             rescue_days[day] = rescue_days.get(day, 0) + 1
             llm_action = self._llm_decide_with_history(
@@ -782,6 +787,23 @@ class ModelDecisionService:
             # Only a validated take/reposition can improve on an idle wait.
             if llm_action is not None and llm_action.get("action") != "wait":
                 action = llm_action
+
+        # Residual-constraint veto (LLM as compliance gatekeeper, veto-only):
+        # preferences the schema could not express are otherwise unenforced
+        # under the deterministic-first flow. Before executing a take_order,
+        # ask once whether it clearly violates a residual preference; a veto
+        # downgrades the step to a short wait (bounded to 3/day so a trigger-
+        # happy verifier cannot idle the whole day). Veto-only is fail-safe:
+        # the LLM can refuse revenue but can never cause a violation.
+        if (
+            action.get("action") == "take_order"
+            and rules.residual_constraints
+            and plan.setdefault("_veto_days", {}).get(day, 0) < 3
+        ):
+            cargo_id = str((action.get("params") or {}).get("cargo_id", ""))
+            if cargo_id and self._residual_veto(driver_id, rules, cargo_id, day, tod):
+                plan["_veto_days"][day] = plan["_veto_days"].get(day, 0) + 1
+                action = self._safe_wait(rules, now, 45)
 
         # Track consecutive waits to detect LLM getting stuck
         if action.get("action") == "wait":
@@ -1264,7 +1286,6 @@ class ModelDecisionService:
         "偏好原文可能是粤语/吴语等方言或口语（条目可能附带普通话转写供参考），按含义理解。\n"
         "只输出一个JSON对象：\n"
         '{"no_drive_today":[{"start_hour":数字,"end_hour":数字}],'
-        '"replaces_default":true或false,'
         '"today_plan":"100字内的今日执行要点",'
         '"category_focus":"今天应优先承接的货物品类名或null"}\n'
         "字段说明：\n"
@@ -1272,13 +1293,52 @@ class ModelDecisionService:
         '跨午夜用 end_hour<start_hour（如21点到次日6点→start_hour 21, end_hour 6）。半小时用0.5。'
         '凡偏好含"某时段不出车/不揽货/收车/熄火/休息/睡觉/归家不动"含义且今天适用的，必须全部列出——'
         '这类约束按天扣钱，漏一条代价极高；偏好中没有此类约束则给空数组。\n'
-        "- replaces_default: 仅当你确定 no_drive_today 已**完整**给出今天的全部时段约束、"
-        "且今天的时段与平日默认不同（例如偏好明确说周末可以晚些休息，而今天正是周末）时才填 true；"
-        "不确定时一律 false。\n"
         "- today_plan: 简述今天必须做/必须避免的事（品类缺口与欠额、特定日期事项、区域或长途限制等）。\n"
         "- category_focus: 若有月度品类指标且尚有缺口（含上月欠额需本月同品类补）则给出应优先的品类名，否则 null。\n"
         "规则：宁可保守，绝不编造偏好中不存在的约束；时段必须严格按偏好原文给出的时刻推算。"
     )
+
+    @staticmethod
+    def _vote_directive_windows(proposals: list[list[tuple[int, int]]]) -> list[tuple[int, int]]:
+        """Majority vote over per-day window proposals.
+
+        A window is accepted when a strict majority of proposals contains a
+        window overlapping it by at least half of the shorter one (a single
+        successful proposal is accepted as-is — additive windows are fail-safe,
+        and one opinion beats none). Accepted overlapping windows are merged
+        into their union span (the conservative shape).
+        """
+        if not proposals:
+            return []
+        if len(proposals) == 1:
+            accepted = list(dict.fromkeys(proposals[0]))
+        else:
+            def _overlap(a: tuple[int, int], b: tuple[int, int]) -> int:
+                best = 0
+                for shift in (-DAY_MINUTES, 0, DAY_MINUTES):
+                    s = max(a[0], b[0] + shift)
+                    e = min(a[1], b[1] + shift)
+                    best = max(best, e - s)
+                return best
+
+            accepted = []
+            for p in proposals:
+                for w in p:
+                    support = sum(
+                        1 for q in proposals
+                        if any(_overlap(w, w2) * 2 >= min(w[1] - w[0], w2[1] - w2[0]) for w2 in q)
+                    )
+                    if support * 2 > len(proposals) and w not in accepted:
+                        accepted.append(w)
+        # merge overlapping accepted windows into union spans
+        accepted.sort()
+        merged: list[tuple[int, int]] = []
+        for w in accepted:
+            if merged and w[0] <= merged[-1][1]:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], w[1]))
+            else:
+                merged.append(w)
+        return merged
 
     def _ensure_daily_directive(
         self, driver_id: str, rules: DriverRules, plan: dict[str, Any], day: int
@@ -1288,9 +1348,14 @@ class ModelDecisionService:
         这是对未知司机泛化的核心层——它不依赖静态 schema 能否表达某类偏好，
         只依赖偏好原文 + 今天的日期/星期/月度进度。产出的今日禁驶窗由
         ``DriverRules.no_drive_windows_for`` 与各动作守卫确定性强制执行；
-        today_plan/category_focus 注入决策 prompt。任何失败都只是退回静态
-        解析结果（fail-safe），且每天最多重试 2 次、结果按天缓存，token
-        开销 ~1 次小调用/司机日。
+        today_plan/category_focus 注入决策 prompt。
+
+        v2（吸取第二轮扣分翻倍的教训）：**只增不减** —— 不再支持
+        ``replaces_default``（LLM 永远无法移走或重塑一条静态窗，多出来的窗
+        最多损失几小时收入，绝不可能新增违规）；且每天采样 3 份提案做
+        **多数表决**（≥2/3 重叠才采纳，单份成功时直接采纳），用 token 预算
+        换掉单次调用的幻觉风险。任何失败都只是退回静态解析结果（fail-safe），
+        每天最多重试 2 次、结果按天缓存。
         """
         records = self._pref_records.get(driver_id) or []
         if not records:
@@ -1333,52 +1398,63 @@ class ModelDecisionService:
                 payload["上月品类指标"] = prev_targets
                 payload["上月品类实接"] = plan.get("monthly_category_orders", {}).get(month_idx - 1, {}) or {}
 
-        try:
-            req: dict[str, Any] = {
-                "messages": [
-                    {"role": "system", "content": self._DIRECTIVE_SYSTEM},
-                    {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
-                ],
-                "temperature": 0,
-                "max_tokens": 300,
-                "response_format": {"type": "json_object"},
-            }
-            try:
-                resp = self._api.model_chat_completion(req)
-            except Exception:
-                req.pop("response_format", None)
-                resp = self._api.model_chat_completion(req)
-            data = self._extract_json(resp)
-        except Exception as exc:
-            self._logger.info(
-                "daily directive unavailable driver_id=%s day=%d err=%s", driver_id, day, exc
-            )
-            return
-        if not isinstance(data, dict):
-            self._logger.info("daily directive: no JSON driver_id=%s day=%d", driver_id, day)
-            return
-
-        windows: list[tuple[int, int]] = []
-        for w in data.get("no_drive_today") or []:
-            win = self._coerce_directive_window(w)
-            if win is not None and win not in windows:
-                windows.append(win)
+        msgs = [
+            {"role": "system", "content": self._DIRECTIVE_SYSTEM},
+            {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+        ]
+        proposals: list[list[tuple[int, int]]] = []
         notes_parts: list[str] = []
-        today_plan = str(data.get("today_plan") or "").strip()
-        if today_plan:
-            notes_parts.append(today_plan[:160])
-        focus = data.get("category_focus")
-        if isinstance(focus, str) and focus.strip() and focus.strip().lower() != "null":
-            notes_parts.append(f"今日优先品类：{focus.strip()}")
+        for _sample in range(3):
+            try:
+                req: dict[str, Any] = {
+                    "messages": msgs,
+                    "temperature": 0,
+                    "max_tokens": 300,
+                    "response_format": {"type": "json_object"},
+                }
+                try:
+                    resp = self._api.model_chat_completion(req)
+                except Exception:
+                    req.pop("response_format", None)
+                    resp = self._api.model_chat_completion(req)
+                data = self._extract_json(resp)
+            except Exception as exc:
+                self._logger.info(
+                    "daily directive sample unavailable driver_id=%s day=%d err=%s",
+                    driver_id, day, exc,
+                )
+                break  # gateway down: don't burn the remaining samples
+            if not isinstance(data, dict):
+                self._logger.info("daily directive sample: no JSON driver_id=%s day=%d", driver_id, day)
+                continue
+            wins: list[tuple[int, int]] = []
+            for w in data.get("no_drive_today") or []:
+                win = self._coerce_directive_window(w)
+                if win is not None and win not in wins:
+                    wins.append(win)
+            proposals.append(wins)
+            if not notes_parts:
+                today_plan = str(data.get("today_plan") or "").strip()
+                if today_plan:
+                    notes_parts.append(today_plan[:160])
+                focus = data.get("category_focus")
+                if isinstance(focus, str) and focus.strip() and focus.strip().lower() != "null":
+                    notes_parts.append(f"今日优先品类：{focus.strip()}")
+        if not proposals:
+            return  # planner failed today; attempts cap retries on a later step
+
+        windows = self._vote_directive_windows(proposals)
+        # Additive-only: replace is permanently False — the planner can extend
+        # today's constraints but can never lift or reshape a static window.
         rules.daily_directives[int(day)] = {
             "windows": windows,
-            "replace": bool(data.get("replaces_default")),
+            "replace": False,
             "notes": "；".join(notes_parts),
         }
         plan["_directive_key"] = cache_key
         self._logger.info(
-            "daily directive driver_id=%s day=%d windows=%s replace=%s effective=%s notes=%s",
-            driver_id, day, windows, bool(data.get("replaces_default")),
+            "daily directive driver_id=%s day=%d proposals=%d windows=%s effective=%s notes=%s",
+            driver_id, day, len(proposals), windows,
             rules.no_drive_windows_for(day), "；".join(notes_parts)[:120],
         )
 
@@ -1400,6 +1476,72 @@ class ModelDecisionService:
         if em < sm:
             em += DAY_MINUTES  # overnight window crossing into the next day
         return (sm, em)
+
+    def _residual_veto(
+        self, driver_id: str, rules: DriverRules, cargo_id: str, day: int, tod: int
+    ) -> bool:
+        """Ask the LLM whether taking this order CLEARLY violates one of the
+        driver's residual (unstructured) preferences today.
+
+        Veto-only and fail-open: any model failure or uncertainty returns
+        False (take the order). Precision over recall — residuals are the
+        constraints the schema could not express, and a spurious veto costs
+        revenue, so the prompt demands an obvious violation. Cached per
+        (cargo_id, day).
+        """
+        cache = getattr(self, "_residual_veto_cache", None)
+        if cache is None:
+            cache = {}
+            self._residual_veto_cache = cache
+        key = (cargo_id, int(day))
+        if key in cache:
+            return cache[key]
+        meta = self._cargo_meta.get(cargo_id) or {}
+        date_str, weekday_str, _is_weekend = _calendar_for_day(day)
+        payload = {
+            "未结构化偏好": [
+                {"原文": rc.get("text", ""), "违约扣款": rc.get("penalty")}
+                for rc in rules.residual_constraints[:4]
+            ],
+            "拟接订单": {
+                "货物": meta.get("cargo_name", ""),
+                "装货城市": meta.get("start_city", ""),
+                "卸货城市": meta.get("end_city", ""),
+                "运输分钟": meta.get("cost_time_minutes", 0),
+            },
+            "当前时间": f"{date_str} {weekday_str} {tod // 60:02d}:{tod % 60:02d}",
+        }
+        verdict = False
+        try:
+            req: dict[str, Any] = {
+                "messages": [
+                    {"role": "system", "content": (
+                        "你判断接下某笔货运订单是否**明显违反**司机的某条偏好"
+                        "（偏好可能是粤语/吴语等方言或口语，按含义判断）。"
+                        '只输出JSON {"violates": true/false}。'
+                        "只有依据订单信息能明确判定违反时才返回true；信息不足或不确定一律false。"
+                    )},
+                    {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+                ],
+                "temperature": 0,
+                "max_tokens": 30,
+            }
+            try:
+                req["response_format"] = {"type": "json_object"}
+                resp = self._api.model_chat_completion(req)
+            except Exception:
+                req.pop("response_format", None)
+                resp = self._api.model_chat_completion(req)
+            data = self._extract_json(resp)
+            if isinstance(data, dict) and data.get("violates") is True:
+                verdict = True
+                self._logger.info(
+                    "residual veto driver_id=%s cargo_id=%s day=%d", driver_id, cargo_id, day
+                )
+        except Exception as exc:
+            self._logger.info("residual veto unavailable driver_id=%s err=%s", driver_id, exc)
+        cache[key] = verdict
+        return verdict
 
     def _compliance_self_audit(self, rules: "DriverRules", history: "DecisionHistory", day: int) -> str:
         """P3 — history-driven daily self-audit.
@@ -2802,6 +2944,9 @@ class ModelDecisionService:
             )
         return normalized
 
+    # how many extraction samples to merge per preference text (ensemble)
+    _PARSE_SAMPLES = 3
+
     def _llm_parse_preferences(
         self, driver_id: str, texts: list[str], rules: DriverRules,
         coord_map: dict[str, tuple[float, float]] | None = None,
@@ -2834,28 +2979,50 @@ class ModelDecisionService:
         # dialect wording is never dropped because the canonical term only
         # appears in the rewrite (or vice versa).
         ground_texts = list(texts) + norm_list
-        # Try with json_object format first; retry without if it fails (some
-        # platform endpoints may not support response_format).
-        for attempt in range(2):
+        # Ensemble extraction: compile each preference _PARSE_SAMPLES times and
+        # merge every successful sample. The token budget (5M/driver) dwarfs the
+        # cost, and the merge is accretive in the fail-safe direction (windows /
+        # categories / regions are unioned, scalar rules take the safer bound),
+        # so any sample catching a constraint the others missed reduces the
+        # daily-compounding penalty class. The gateway is non-deterministic even
+        # at temperature 0 (see optimization notes §2), which provides natural
+        # sample diversity without raising hallucination rates; per-item
+        # semantic-confirm gates still filter spurious additions.
+        samples_merged = 0
+        transport_failures = 0
+        use_response_format = True
+        while samples_merged < self._PARSE_SAMPLES and transport_failures < 2:
             req: dict[str, Any] = {"messages": msgs, "temperature": 0}
-            if attempt == 0:
+            if use_response_format:
                 req["response_format"] = {"type": "json_object"}
             try:
                 resp = self._api.model_chat_completion(req)
             except Exception as exc:
-                self._logger.info("llm parse attempt %d unavailable driver_id=%s err=%s", attempt, driver_id, exc)
+                self._logger.info(
+                    "llm parse sample unavailable driver_id=%s err=%s", driver_id, exc
+                )
+                if use_response_format:
+                    use_response_format = False  # endpoint may not support it
+                else:
+                    transport_failures += 1
                 continue
             data = self._extract_json(resp)
-            if data is not None:
-                self._logger.info("llm raw output driver_id=%s data=%s", driver_id, json.dumps(data, ensure_ascii=False)[:800])
-                try:
-                    self._merge_llm_rules(rules, data, ground_texts)
-                except Exception as exc:
-                    self._logger.warning("llm parse: merge failed driver_id=%s err=%s", driver_id, exc)
-                    continue
-                return True
-            self._logger.warning("llm parse attempt %d: no JSON driver_id=%s", attempt, driver_id)
-        return False
+            if data is None:
+                self._logger.warning("llm parse sample: no JSON driver_id=%s", driver_id)
+                transport_failures += 1
+                continue
+            self._logger.info(
+                "llm raw output driver_id=%s sample=%d data=%s",
+                driver_id, samples_merged, json.dumps(data, ensure_ascii=False)[:800],
+            )
+            try:
+                self._merge_llm_rules(rules, data, ground_texts)
+            except Exception as exc:
+                self._logger.warning("llm parse: merge failed driver_id=%s err=%s", driver_id, exc)
+                transport_failures += 1
+                continue
+            samples_merged += 1
+        return samples_merged > 0
 
     @staticmethod
     def _extract_json(resp: dict[str, Any]) -> dict[str, Any] | None:
@@ -3193,6 +3360,14 @@ class ModelDecisionService:
         lifted by a clear "yes" (off-vocabulary phrasings generalise), while a
         flaky/unavailable verifier never silently discards a real constraint
         whose default is True.
+
+        Dropping requires DOUBLE confirmation: a single "false" from a flaky
+        gateway used to silently delete a real (often dialect-phrased) rule —
+        the daily-compounding penalty class. A "false" verdict is therefore
+        re-asked once, and the rule is only discarded when the model says
+        "false" twice in a row. Token cost is negligible against the 5M/driver
+        budget; the asymmetry (extra rule = a few idle hours, missed rule =
+        a daily penalty all season) makes the second opinion strictly worth it.
         """
         if not all_text.strip():
             return default
@@ -3203,32 +3378,48 @@ class ModelDecisionService:
         key = (rule_desc, all_text)
         if key in cache:
             return cache[key]
-        verdict = default
-        try:
-            msgs = [
-                {"role": "system", "content": (
-                    "你判断一段司机偏好原文是否确实包含某条约束。"
-                    "原文可能是粤语/吴语等方言、口语或字序打乱/缺字的中文，按含义判断"
-                    "（如 唔=不、瞓觉=睡觉、返屋企=回家、收车/收工=结束出车、勿/覅=不要）。"
-                    "只输出JSON {\"holds\": true/false}。"
-                    "只有当原文明显不支持该约束时才返回false；含义相符或不确定一律返回true。"
-                )},
-                {"role": "user", "content": json.dumps(
-                    {"原文": all_text, "约束": rule_desc}, ensure_ascii=False)},
-            ]
-            req: dict[str, Any] = {"messages": msgs, "temperature": 0, "max_tokens": 30}
+
+        def _ask_once() -> bool | None:
             try:
-                req["response_format"] = {"type": "json_object"}
-                resp = self._api.model_chat_completion(req)
-            except Exception:
-                req.pop("response_format", None)
-                resp = self._api.model_chat_completion(req)
-            data = self._extract_json(resp)
-            if isinstance(data, dict) and isinstance(data.get("holds"), bool):
-                verdict = data["holds"]
-        except Exception as exc:
-            self._logger.info("rule-confirm unavailable (default=%s) desc=%s err=%s", default, rule_desc, exc)
+                msgs = [
+                    {"role": "system", "content": (
+                        "你判断一段司机偏好原文是否确实包含某条约束。"
+                        "原文可能是粤语/吴语等方言、口语或字序打乱/缺字的中文，按含义判断"
+                        "（如 唔=不、瞓觉=睡觉、返屋企=回家、收车/收工=结束出车、勿/覅=不要）。"
+                        "只输出JSON {\"holds\": true/false}。"
+                        "只有当原文明显不支持该约束时才返回false；含义相符或不确定一律返回true。"
+                    )},
+                    {"role": "user", "content": json.dumps(
+                        {"原文": all_text, "约束": rule_desc}, ensure_ascii=False)},
+                ]
+                req: dict[str, Any] = {"messages": msgs, "temperature": 0, "max_tokens": 30}
+                try:
+                    req["response_format"] = {"type": "json_object"}
+                    resp = self._api.model_chat_completion(req)
+                except Exception:
+                    req.pop("response_format", None)
+                    resp = self._api.model_chat_completion(req)
+                data = self._extract_json(resp)
+                if isinstance(data, dict) and isinstance(data.get("holds"), bool):
+                    return data["holds"]
+            except Exception as exc:
+                self._logger.info(
+                    "rule-confirm unavailable (default=%s) desc=%s err=%s", default, rule_desc, exc
+                )
+            return None
+
+        first = _ask_once()
+        if first is None:
             verdict = default
+        elif first:
+            verdict = True
+        else:
+            second = _ask_once()
+            verdict = False if second is False else default
+            if verdict is not False and second is not False:
+                self._logger.info(
+                    "rule-confirm: single 'false' not corroborated, keeping rule desc=%s", rule_desc
+                )
         cache[key] = verdict
         return verdict
 
