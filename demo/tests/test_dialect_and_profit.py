@@ -225,12 +225,15 @@ CARGO_LATE = {
 class SimStubApi:
     """Full decide() stub: fixed position/time, scripted cargo and LLM."""
 
-    def __init__(self, items, now, decision_action=None, decision_fails=False):
+    def __init__(self, items, now, decision_action=None, decision_fails=False,
+                 preferences=None):
         self.items = items
         self.now = now
         self.decision_llm_calls = 0
+        self.planner_calls = 0
         self._decision_action = decision_action
         self._decision_fails = decision_fails
+        self._preferences = preferences or []
 
     def get_driver_status(self, driver_id):  # noqa: ANN001, ANN201
         return {
@@ -238,7 +241,7 @@ class SimStubApi:
             "simulation_progress_minutes": self.now,
             "current_lat": 23.0,
             "current_lng": 113.2,
-            "preferences": [],
+            "preferences": self._preferences,
         }
 
     def query_cargo(self, *args, **kwargs):  # noqa: ANN002, ANN003, ANN201
@@ -254,6 +257,11 @@ class SimStubApi:
             if self._decision_fails:
                 raise RuntimeError("decision llm down")
             return _resp(self._decision_action or {})
+        if "每日合规计划助手" in system:
+            self.planner_calls += 1
+            return _resp({})
+        if "是否确实包含某条约束" in system:
+            return _resp({"holds": True})
         return _resp({})
 
 
@@ -267,10 +275,11 @@ def test_deterministic_take_order_skips_decision_llm() -> None:
     assert api.decision_llm_calls == 0, api.decision_llm_calls
 
 
-def test_unconstrained_driver_takes_past_midnight_order() -> None:
-    """No daily time constraints -> an order may finish past midnight, and the
-    pre-take revalidation must agree with the scoring (regression: it used to
-    recompute the bare deadline and reject every late pick)."""
+def test_prefless_driver_takes_past_midnight_order() -> None:
+    """A driver with NO preferences at all may finish an order past midnight
+    (nothing to violate), and the pre-take revalidation must agree with the
+    scoring (regression: it used to recompute the bare deadline and reject
+    every late pick)."""
     api = SimStubApi([CARGO_LATE], now=20 * 60)  # day 0, 20:00; finish 06:00 day 1
     svc = ModelDecisionService(api)
     action = svc.decide("DZ02")
@@ -286,6 +295,31 @@ def test_night_rest_driver_does_not_take_past_midnight_order() -> None:
     rules.no_drive_windows.append((21 * 60, 30 * 60))  # 21:00 -> 06:00
     action = svc.decide("DZ03")
     assert action["action"] == "wait", action
+
+
+def test_driver_with_prefs_wraps_up_by_midnight() -> None:
+    """Any driver WITH preferences wraps up by 24:00 even when no time rule was
+    parsed — if the real rule is an unparsed/flattened night window, overnight
+    hauls would violate it every single night (daily-compounding penalty)."""
+    api = SimStubApi(
+        [CARGO_LATE], now=20 * 60,
+        preferences=[{"content": "成日要瞓够八个钟先顶得顺。", "penalty_amount": 400}],
+    )
+    svc = ModelDecisionService(api)
+    action = svc.decide("DZ06")
+    assert action["action"] != "take_order", action
+
+
+def test_daily_planner_not_invoked_by_decide() -> None:
+    """The per-day compliance planner stays dormant (finals A/B: every
+    planner-based build had a 64.5k+ penalty vs 46.0k without it)."""
+    api = SimStubApi(
+        [CARGO_LATE], now=8 * 60,
+        preferences=[{"content": "每天接单不超过3单。", "penalty_amount": 200}],
+    )
+    svc = ModelDecisionService(api)
+    svc.decide("DZ07")
+    assert api.planner_calls == 0, api.planner_calls
 
 
 def test_idle_wait_consults_llm_for_rescue_reposition() -> None:

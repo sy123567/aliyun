@@ -16,17 +16,18 @@
 3. 零静默丢弃：审计后仍无法用结构化字段表达的偏好，进入
    ``DriverRules.residual_constraints``，逐步注入决策 prompt（带违约金额），
    由决策 LLM 在线遵守——任何偏好都不会被悄悄丢掉。
-4. 每日合规计划层：每个仿真日开始时，把**偏好原文** + 当天日历（几月几号、
-   星期几）+ 月度合规进度交给 LLM，产出"今天"的具体约束（今日禁驶时段、
-   今日必须做/避免的事、品类缺口提醒）。任意措辞、任意条件式偏好（周末
-   不同时段、特定日期事件、月度结转）都在这一层被按天具象化，不依赖固定
-   schema 能否表达。计划层失效时自动退化为纯静态规则（fail-safe）。
-5. 确定性执行（确定性优先）：调度器与各动作守卫使用"静态窗 ∪ 当日计划窗"的
-   **有效禁驶窗**硬性拦截违规动作（每日休息 / 夜间休息窗 / 按自然月铺点的
-   整休天数 / 禁接货类 / 禁接区域 / 必接区域 / 赴装空驶上限 / 特定日期到点
-   事件），并在合规候选中按净收益择单。决策 LLM 不再每 3 步参与决策，只在
-   引擎找不到任何合规单、即将整段空等时作为「救场」提供一次重定位建议
-   （建议仍须通过全部确定性守卫）。
+4. 每日合规计划层（**默认停用**）：`_ensure_daily_directive` 的机制保留但
+   `decide()` 不再调用——复赛实测无计划器的提交扣分 46.0k，所有带计划器的
+   构建扣分 64.5k+：其"替换"语义允许某天一条错误的 LLM 指令重塑真实夜窗
+   （按天复利扣分），且每司机日多一次 LLM 调用。静态编译窗是保守下限，
+   周末放宽这类日历放松刻意不去利用。
+5. 确定性执行（确定性优先）：调度器与各动作守卫按静态有效禁驶窗硬性拦截
+   违规动作（每日休息 / 夜间休息窗 / 按自然月铺点的整休天数 / 禁接货类 /
+   禁接区域 / 必接区域 / 赴装空驶上限 / 特定日期到点事件），并在合规候选中
+   按净收益择单。决策 LLM 不再每 3 步参与决策，只在引擎找不到任何合规单、
+   即将整段空等时作为「救场」提供一次重定位建议（建议仍须通过全部确定性
+   守卫，每天至多 2 次）。有偏好的司机一律在 24:00 前收尾；只有**完全没有
+   偏好**的司机才允许末单跨午夜（零罚分纯增收）。
 """
 
 from __future__ import annotations
@@ -281,6 +282,10 @@ class DriverRules:
     """结构化偏好规则。"""
 
     def __init__(self) -> None:
+        # Whether the driver has ANY preference text at all (parsed or not).
+        # Used as a hard gate for risky revenue extensions: a driver with
+        # preferences but no parsed time rule might simply have an unparsed one.
+        self.has_any_preference: bool = False
         self.daily_rest_minutes: int = 0
         self.rest_window: tuple[int, int] | None = None  # (start_min, end_min) within day, from 0
         self.off_days_min: int = 0
@@ -742,10 +747,14 @@ class ModelDecisionService:
         lng = float(status["current_lng"])
         day, tod = divmod(now, DAY_MINUTES)
 
-        # Daily compliance planning: concretize the raw NL preferences for
-        # *today* (calendar-aware) before any action is chosen. Fail-safe: on
-        # any failure the static parse stays in charge.
-        self._ensure_daily_directive(driver_id, rules, plan, day)
+        # NOTE: the per-day compliance planner (`_ensure_daily_directive`) is
+        # intentionally NOT invoked. Finals A/B: the only submission without it
+        # scored 54.4k with a 46.0k penalty, while every planner-based build
+        # had a 64.5k+ penalty — its replace semantics lets one bad per-day LLM
+        # directive reshape a real night window (a daily-compounding penalty),
+        # and it adds ~1 LLM call per driver-day of tokens/latency. The static
+        # compiled windows are the conservative floor; calendar relaxations
+        # (e.g. weekend late-rest) are deliberately left unexploited.
 
         # Deterministic-first decision flow. The rule engine maximises net/h
         # under every compliance guard with a wide cargo scan; per-step LLM
@@ -754,15 +763,19 @@ class ModelDecisionService:
         # The LLM is now consulted only as an *idle rescue*: when the engine
         # found no compliant order from here and would sit out 2h, ask it for a
         # smarter reposition (e.g. toward a logistics hub beyond the scan
-        # radius). Its proposal still passes every deterministic guard.
+        # radius). Its proposal still passes every deterministic guard, and at
+        # most 2 rescues per day are attempted (token/latency cap).
         step = self._step_count[driver_id]
         consecutive_waits = plan.get("_consecutive_waits", 0)
         action = self._schedule(driver_id, status, rules, plan, now, lat, lng)
+        rescue_days = plan.setdefault("_rescue_days", {})
         if (
             action.get("action") == "wait"
             and plan.pop("_idle_wait", False)
             and consecutive_waits < 3
+            and rescue_days.get(day, 0) < 2
         ):
+            rescue_days[day] = rescue_days.get(day, 0) + 1
             llm_action = self._llm_decide_with_history(
                 driver_id, status, rules, plan, history, now, lat, lng, day, tod
             )
@@ -1080,27 +1093,30 @@ class ModelDecisionService:
         return hard_end
 
     def _effective_order_deadline(self, rules: DriverRules, plan: dict, now: int, day: int) -> int:
-        """`_hard_order_deadline` plus the past-midnight allowance.
+        """`_hard_order_deadline` plus a narrowly-gated past-midnight allowance.
 
-        A flexible-rest driver (and, a fortiori, a driver with no daily time
-        constraint at all) may let the day's last order finish past midnight.
-        This must be applied consistently at scoring AND at the pre-take
-        revalidation: previously the revalidation recomputed the bare
-        `_hard_order_deadline`, so every late-finishing pick was selected and
-        then rejected — losing the order that would have fit instead.
+        Only a driver with NO preferences at all may let an order finish past
+        midnight: with no configured rules the scorer has nothing to penalise,
+        so overnight finishing is pure revenue. Any driver WITH preferences
+        wraps up by 24:00 even when no time rule was parsed — if their real
+        rule is a fixed night window that the (possibly dialect) parse missed
+        or flattened into a flexible daily-rest quota, overnight hauls would
+        violate it every single night, which is exactly the daily-compounding
+        penalty class. (The flexible-rest overnight extension was effectively
+        dead code in the best-scoring submission — the revalidation recomputed
+        the bare deadline and rejected every late pick — and activating it
+        coincided with the penalty doubling, so it is now disabled; the
+        consistent deadline below still removes the "late pick selected then
+        rejected, blocking the runner-up order" failure.)
         """
         day_end = (day + 1) * DAY_MINUTES
         hard_end = self._hard_order_deadline(rules, plan, now, day)
-        if (rules.rest_window is None and not rules.has_no_drive(day)
-                and not rules.has_no_drive(day + 1)
+        if (not rules.has_any_preference
+                and rules.rest_window is None and rules.daily_rest_minutes == 0
+                and not rules.has_any_no_drive()
+                and rules.home_by_minute is None and rules.no_drive_until_minute is None
                 and self._next_day_is_ordinary(rules, plan, day)):
-            if rules.daily_rest_minutes > 0:
-                hard_end = max(hard_end, day_end + (DAY_MINUTES - rules.day_rest_block))
-            elif (rules.home_by_minute is None and rules.no_drive_until_minute is None
-                  and not rules.has_any_no_drive()):
-                # No daily time constraint of any kind: finishing an order past
-                # midnight is penalty-free revenue, so don't wrap up by 24:00.
-                hard_end = max(hard_end, day_end + DAY_MINUTES)
+            hard_end = max(hard_end, day_end + DAY_MINUTES)
         return hard_end
 
     def _interval_overlaps_no_drive(self, rules: DriverRules, start: int, end: int) -> bool:
@@ -2445,6 +2461,8 @@ class ModelDecisionService:
                 text, penalty = str(pref), None
             if text.strip():
                 items.append((text, penalty))
+        if items:
+            rules.has_any_preference = True
         texts = [t for t, _ in items]
         seen = self._seen_prefs.setdefault(driver_id, set())
         new_items = [(t, p) for t, p in items if t not in seen]
@@ -3816,14 +3834,15 @@ class ModelDecisionService:
                 return d if 1 <= d <= 31 else None
         return None
 
-    def _dated_day_index(self, ev: dict[str, Any], date: int) -> int:
-        """Season day index for a dated event: honour an explicit month when the
-        extraction provides one (events from April/May preferences used to be
-        anchored to March and silently missed), else default to the first month."""
+    def _dated_day_index(self, ev: dict[str, Any], date: int) -> tuple[int, bool]:
+        """(season day index, month_explicit) for a dated event: honour an
+        explicit month when the extraction provides one (events from April/May
+        preferences used to be anchored to March and silently missed), else
+        default to the first month."""
         month_idx = self._month_to_idx(ev.get("month")) if ev.get("month") is not None else None
         base = _MONTH_START_DAYS[month_idx] if month_idx is not None else 0
         day = base + int(date) - 1
-        return min(day, MONTH_DAYS - 1)
+        return min(day, MONTH_DAYS - 1), month_idx is not None
 
     def _coerce_single(self, ev: Any) -> dict[str, Any] | None:
         if not isinstance(ev, dict):
@@ -3844,8 +3863,10 @@ class ModelDecisionService:
             wm = re.search(r'(\d+)', wait)
             wait = int(wm.group(1)) if wm else 120
         wait = int(wait) if isinstance(wait, (int, float)) and wait > 0 else 120
+        day, month_explicit = self._dated_day_index(ev, date)
         return {
-            "day": self._dated_day_index(ev, date),
+            "day": day,
+            "month_explicit": month_explicit,
             "lat": float(lat),
             "lng": float(lng),
             "min_wait": wait,
@@ -3885,7 +3906,8 @@ class ModelDecisionService:
             )
         if not stops:
             return None
-        return {"day": self._dated_day_index(ev, date), "stops": stops}
+        day, month_explicit = self._dated_day_index(ev, date)
+        return {"day": day, "month_explicit": month_explicit, "stops": stops}
 
     def _fix_past_dated_days(
         self, rules: DriverRules, now_day: int,
@@ -3916,7 +3938,9 @@ class ModelDecisionService:
             return day
 
         for ev in rules.dated_single[n_single:]:
-            if ev["day"] < now_day:
+            # An explicit month is authoritative: a past explicit date was
+            # simply missed and must NOT be re-scheduled into another month.
+            if ev["day"] < now_day and not ev.get("month_explicit"):
                 new_day = _shift(ev["day"])
                 if new_day != ev["day"]:
                     self._logger.info(
@@ -3924,7 +3948,7 @@ class ModelDecisionService:
                     )
                     ev["day"] = new_day
         for ev in rules.dated_route[n_route:]:
-            if ev["day"] < now_day:
+            if ev["day"] < now_day and not ev.get("month_explicit"):
                 new_day = _shift(ev["day"])
                 if new_day != ev["day"]:
                     self._logger.info(
@@ -3933,7 +3957,9 @@ class ModelDecisionService:
                     ev["day"] = new_day
         for i in range(n_blackout, len(rules.blackout)):
             region, days = rules.blackout[i]
-            shifted = {(_shift(d) if d < now_day else d) for d in days}
+            # day >= 31 can only come from an explicit (non-March) month —
+            # leave those untouched; default-anchored days (< 31) may shift.
+            shifted = {(_shift(d) if d < min(now_day, 31) else d) for d in days}
             if shifted != days:
                 self._logger.info(
                     "blackout past-day fix: %s %s -> %s (now_day=%d)",
