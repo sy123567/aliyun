@@ -1317,6 +1317,35 @@ class ModelDecisionService:
                     return True
         return False
 
+    def _nodrive_window_covering(
+        self, rules: DriverRules, start: int, end: int
+    ) -> tuple[int, int] | None:
+        """Earliest no-drive window that a haul ``[start, end)`` runs *into* while
+        having *departed before* the window begins.
+
+        Returns ``(win_start_abs, win_end_abs)`` for that window, else ``None``.
+        Used to price an evening haul that finishes inside a penalised rest
+        window as a soft per-day cost (see ``_evaluate_cargo``) instead of hard
+        rejecting it. The ``start < win_start`` guard means the truck always
+        leaves *before* the rest window — it never *starts* fresh work inside the
+        window — so at most one penalised crossing happens per day."""
+        if end <= start or not rules.has_any_no_drive():
+            return None
+        first_day = start // DAY_MINUTES - 1
+        last_day = (end - 1) // DAY_MINUTES + 1
+        best: tuple[int, int] | None = None
+        for day_idx in range(first_day, last_day + 1):
+            day_base = day_idx * DAY_MINUTES
+            for ws, we in rules.no_drive_windows_for(day_idx):
+                win_start = day_base + int(ws)
+                win_end = day_base + int(we)
+                if win_end <= win_start:
+                    win_end += DAY_MINUTES
+                if start < win_start and start < win_end and end > win_start:
+                    if best is None or win_start < best[0]:
+                        best = (win_start, win_end)
+        return best
+
     def _safe_reposition(
         self,
         rules: DriverRules,
@@ -2628,12 +2657,36 @@ class ModelDecisionService:
                     return None  # would miss load window
                 ready = max(arrival, ls)
         finish = ready + cost_time
-        if finish > day_end:
+        finish_buffer = _ORDER_DEADLINE_BUFFER_MIN if rules.has_no_drive(now // DAY_MINUTES) else 0
+        if self._interval_overlaps_no_drive(rules, now, finish + finish_buffer):
+            # Economic treatment of the rest / no-drive window, mirroring the
+            # soft long-haul cap: a haul that runs *into* a penalised rest window
+            # is priced (one per-day rest penalty) rather than hard-rejected, so
+            # a genuinely big evening order is taken whenever its net beats the
+            # day's penalty — the documented gross-income leak was capping the
+            # working day at the window start and dropping the most profitable
+            # evening hauls. Bounded & fail-safe:
+            #   * only when the window has a KNOWN penalty (uncertain parse →
+            #     hard reject, the guard that prevented the every-night blow-up);
+            #   * the haul must finish *within* the same overnight window (never
+            #     run past its end into the next day's driving);
+            #   * the truck must have departed before the window (handled by the
+            #     pickup-overlap reject above + ``_nodrive_window_covering``), so
+            #     at most one penalised crossing per day; the scheduler rests for
+            #     the remainder of the window afterwards.
+            night_pen = rules.rule_penalties.get("night_window")
+            nd_window = self._nodrive_window_covering(rules, now, finish)
+            if (
+                not isinstance(night_pen, (int, float))
+                or night_pen <= 0
+                or nd_window is None
+                or finish > nd_window[1]
+                or finish > MONTH_DAYS * DAY_MINUTES
+            ):
+                return None
+            violation_cost += float(night_pen)
+        elif finish > day_end:
             return None  # don't cross midnight (keeps rest windows clean)
-        if self._interval_overlaps_no_drive(
-            rules, now, finish + (_ORDER_DEADLINE_BUFFER_MIN if rules.has_no_drive(now // DAY_MINUTES) else 0)
-        ):
-            return None
         haul_km = _haversine_km(slat, slng, elat, elng)
         # haul_max_km / haul_min_km: single-order haul distance limits
         if rules.haul_max_km is not None and haul_km > rules.haul_max_km:
