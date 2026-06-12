@@ -81,6 +81,23 @@ _LIQ_TOP_N = int(os.environ.get("AGENT_LIQ_TOP_N", "8"))
 # board), so idling a compliant >=60元/h order for "something better" is itself
 # a net-income leak. Env-tunable for platform sweeps.
 _LLM_WAIT_OVERRIDE_NET_PER_H = float(os.environ.get("AGENT_LLM_WAIT_OVERRIDE_NET_PER_H", "60"))
+# Safety margin required to soft-cross a penalised night/rest window for a big
+# evening order (see ``_evaluate_cargo``). The crossing model charges only ONE
+# per-day rest penalty, but its realised cost is systematically UNDER-estimated:
+#   * the big order's realised gross is uncertain (gateway nondeterminism; the
+#     order can still fail / be sniped) — see notes §2;
+#   * finishing deep inside the rest window compresses the next morning and can
+#     trip *additional* daily-recurring rules (continuous-rest / home-by rules)
+#     that the single-penalty model does not price (notes §-2.1 deferred this);
+#   * the leaderboard regression after the aggressive value-layer rollout showed
+#     crossings cost MORE penalty than the gross they unlocked (penalty 25k→44k,
+#     net 59.6k→49.4k) — too many *marginal* crossings were taken.
+# So a crossing is allowed only when the order's penalty-free margin clears
+# ``night_pen * (_NIGHT_CROSS_MARGIN - 1)`` (i.e. net stays well above the day's
+# rest penalty after the charge). 1.0 == legacy behaviour (net>0). Default 1.5
+# keeps the genuinely big hauls (the feature's intent) while dropping the thin
+# crossings that drove the penalty up. Env-tunable for platform sweeps (§2).
+_NIGHT_CROSS_MARGIN = max(1.0, float(os.environ.get("AGENT_NIGHT_CROSS_MARGIN", "1.5")))
 # Thinking mode for the per-step decision call. Default ON (submission runs
 # with thinking); set AGENT_DECISION_THINKING=0 to disable. Measured on the
 # finals gateway (qwen3.7-plus) with real decision prompts: ~22s avg latency
@@ -2612,6 +2629,9 @@ class ModelDecisionService:
         # and the order survives only if it is still profitable (same pattern
         # as the long-haul soft cap). Unknown penalty → conservative hard reject.
         violation_cost = 0.0
+        # >0 when this haul soft-crosses a penalised night/rest window; used to
+        # apply the conservative crossing margin (_NIGHT_CROSS_MARGIN) below.
+        crossed_night_pen = 0.0
         name = str(cargo.get("cargo_name", ""))
         if self._is_forbidden_cargo(name, rules.forbidden_categories):
             fp = rules.rule_penalties.get("forbidden_categories")
@@ -2726,6 +2746,7 @@ class ModelDecisionService:
             ):
                 return None
             violation_cost += float(night_pen)
+            crossed_night_pen = float(night_pen)
         elif finish > day_end:
             return None  # don't cross midnight (keeps rest windows clean)
         haul_km = _haversine_km(slat, slng, elat, elng)
@@ -2737,6 +2758,17 @@ class ModelDecisionService:
         price = float(cargo.get("price", 0.0))
         net = price - COST_PER_KM * (pickup_km + haul_km) - violation_cost
         if net <= 0:
+            return None
+        # Conservative night-crossing gate: a crossing is worth its (per-day)
+        # rest penalty only when the order's penalty-free margin clears it with
+        # room to spare. ``net`` here already has the single night penalty
+        # subtracted, so the order's value above the day's rest penalty is
+        # ``net``; require it to exceed ``night_pen * (_NIGHT_CROSS_MARGIN - 1)``.
+        # margin == 1.0 → legacy behaviour (any net>0 crossing). margin > 1.0
+        # drops the thin crossings whose realised cost (uncertain gross + next-
+        # morning compression + possible stacked daily rules) tends to exceed
+        # the single penalty the model charged — the leaderboard regression.
+        if crossed_night_pen > 0.0 and net <= crossed_night_pen * (_NIGHT_CROSS_MARGIN - 1.0):
             return None
         # Apply avoid_categories soft penalty
         net *= avoid_penalty

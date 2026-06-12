@@ -29,6 +29,7 @@ _DEMO_ROOT = Path(__file__).resolve().parent.parent
 if str(_DEMO_ROOT) not in sys.path:
     sys.path.insert(0, str(_DEMO_ROOT))
 
+import agent.model_decision_service as mds  # noqa: E402
 from agent.model_decision_service import (  # noqa: E402
     COST_PER_KM,
     DriverRules,
@@ -186,6 +187,64 @@ def test_crossing_net_equals_price_minus_mileage_minus_penalty() -> None:
     net, _req, _occ, _pk = ev
     # zero-distance haul => mileage ~ 0 => net == price - penalty
     assert abs(net - (6000.0 - NIGHT_PENALTY)) < 1.0
+
+
+# --------------------------------------------------- crossing safety margin
+
+def _eval_with_margin(margin, svc, rules, cargo, item, now, day_end):
+    """Evaluate ``cargo`` with ``_NIGHT_CROSS_MARGIN`` temporarily set."""
+    original = mds._NIGHT_CROSS_MARGIN
+    mds._NIGHT_CROSS_MARGIN = margin
+    try:
+        return _eval(svc, rules, cargo, item, now, day_end)
+    finally:
+        mds._NIGHT_CROSS_MARGIN = original
+
+
+def test_default_margin_rejects_thin_crossing() -> None:
+    """A crossing whose net only just beats the rest penalty (net=800 < the
+    1350 = penalty*(1.5-1) margin) is dropped by the default 1.5 margin — these
+    thin crossings drove the leaderboard penalty up without enough gross."""
+    svc = _svc()
+    rules = _rules()
+    # zero-distance haul => net == price - penalty == 3500 - 2700 == 800
+    cargo, item = _cargo(price=3500.0, cost_time=300, haul_dst=(GZ_LAT, GZ_LNG))
+    assert _eval_with_margin(1.5, svc, rules, cargo, item, now=1080, day_end=1260) is None
+
+
+def test_legacy_margin_accepts_thin_crossing() -> None:
+    """With margin == 1.0 (legacy) the same thin-but-positive crossing is still
+    accepted — proving the new gate is the only thing rejecting it."""
+    svc = _svc()
+    rules = _rules()
+    cargo, item = _cargo(price=3500.0, cost_time=300, haul_dst=(GZ_LAT, GZ_LNG))
+    ev = _eval_with_margin(1.0, svc, rules, cargo, item, now=1080, day_end=1260)
+    assert ev is not None
+    net, _req, _occ, _pk = ev
+    assert abs(net - 800.0) < 1.0, net
+
+
+def test_big_crossing_survives_default_margin() -> None:
+    """A genuinely big evening haul (net well above the penalty) is still taken
+    under the default margin — the feature's intent is preserved."""
+    svc = _svc()
+    rules = _rules()
+    # net == 6000 - 2700 == 3300 > penalty*(1.5-1)=1350
+    cargo, item = _cargo(price=6000.0, cost_time=300, haul_dst=(GZ_LAT, GZ_LNG))
+    ev = _eval_with_margin(1.5, svc, rules, cargo, item, now=1080, day_end=1260)
+    assert ev is not None
+    net, _req, _occ, _pk = ev
+    assert abs(net - 3300.0) < 1.0, net
+
+
+def test_margin_does_not_affect_daytime_orders() -> None:
+    """The margin only gates crossings: a non-crossing daytime order is
+    unaffected regardless of the margin value."""
+    svc = _svc()
+    rules = _rules()
+    cargo, item = _cargo(price=1000.0, cost_time=120, haul_dst=(GZ_LAT, GZ_LNG))
+    ev = _eval_with_margin(3.0, svc, rules, cargo, item, now=600, day_end=1260)
+    assert ev is not None  # daytime order never sees the crossing gate
 
 
 # ----------------------------------------------- end-to-end scheduler path
