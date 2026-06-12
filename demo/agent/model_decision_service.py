@@ -50,8 +50,17 @@ LONGHAUL_PENALTY = 1000.0
 # below this there is no time to relocate and still complete an order before day end.
 _STRAND_MIN_BUDGET = 240
 _ORDER_DEADLINE_BUFFER_MIN = 10
-_LLM_CARGO_SUMMARY_LIMIT = 8
+_LLM_CARGO_SUMMARY_LIMIT = 12
 _MIN_BOUNDED_AREA_SPAN = 0.1
+# Market-liquidity view built from the scan cache (zero extra sim cost):
+# how many cargo were seen departing each city recently and at what value.
+# Feeds chain-aware order choice (an order into a dead city strands the truck).
+_LIQ_WINDOW_MIN = 3 * DAY_MINUTES
+_LIQ_TOP_N = 6
+# If the LLM asks for a long strategic wait while a compliant candidate at or
+# above this net-per-hour is on the table, take the order instead (the known
+# failure mode of LLM-in-the-loop runs was idling away strong orders).
+_LLM_WAIT_OVERRIDE_NET_PER_H = 80.0
 
 SHENZHEN_BBOX = (22.42, 22.89, 113.74, 114.66)  # lat_min, lat_max, lng_min, lng_max
 _MONTH_START_DAYS = (0, 31, 61, 92)
@@ -626,6 +635,12 @@ class ModelDecisionService:
         # Per-decision-step budget of *new* semantic region lookups, so a wide
         # cargo scan can never stack dozens of blocking model calls.
         self._sem_region_budget: int = 0
+        # Simulation clock per driver at step start; used to timestamp scanned
+        # cargo so the liquidity view can age out stale market data.
+        self._sim_now: dict[str, int] = {}
+        # start_city -> [sum_lat, sum_lng, n] over scanned cargo pickups: a
+        # representative coordinate per city for reposition targets.
+        self._city_centroid: dict[str, list[float]] = {}
 
     def _query_cargo(self, driver_id: str, latitude: float, longitude: float, k: int) -> dict[str, Any]:
         """query_cargo wrapper that caches cargo metadata for every scanned item.
@@ -636,22 +651,85 @@ class ModelDecisionService:
         we ever see here so it can be looked up later by id.
         """
         resp = self._api.query_cargo(driver_id=driver_id, latitude=latitude, longitude=longitude, k=k)
+        seen_at = self._sim_now.get(driver_id, 0)
         for item in resp.get("items", []) or []:
             cargo = item.get("cargo", {}) if isinstance(item, dict) else {}
             cid = str(cargo.get("cargo_id", "") or "")
             if not cid:
                 continue
             name = str(cargo.get("cargo_name", "") or "")
+            start = cargo.get("start") or {}
+            end = cargo.get("end") or {}
+            start_city = str(start.get("city", "") or "")
+            price = float(cargo.get("price", 0.0) or 0.0)
+            cost_time = int(cargo.get("cost_time_minutes", 0) or 0)
+            try:
+                slat, slng = float(start.get("lat", 0.0)), float(start.get("lng", 0.0))
+                haul_km = _haversine_km(slat, slng, float(end.get("lat", 0.0)), float(end.get("lng", 0.0)))
+            except (TypeError, ValueError):
+                slat = slng = haul_km = 0.0
             self._cargo_meta[cid] = {
-                "cost_time_minutes": int(cargo.get("cost_time_minutes", 0) or 0),
+                "cost_time_minutes": cost_time,
                 "cargo_name": name,
-                "price": float(cargo.get("price", 0.0) or 0.0),
-                "start_city": str((cargo.get("start") or {}).get("city", "") or ""),
-                "end_city": str((cargo.get("end") or {}).get("city", "") or ""),
+                "price": price,
+                "start_city": start_city,
+                "end_city": str(end.get("city", "") or ""),
+                # standalone value of the order itself (no pickup deadhead):
+                # feeds the per-city market liquidity view.
+                "net_per_h": (price - COST_PER_KM * haul_km) / max(1, cost_time) * 60.0,
+                "seen_at": seen_at,
             }
             if name:
                 self._cargo_names.add(name)
+            if start_city and slat:
+                cc = self._city_centroid.setdefault(start_city, [0.0, 0.0, 0])
+                cc[0] += slat
+                cc[1] += slng
+                cc[2] += 1
         return resp
+
+    def _cargo_liquidity_stats(self, now: int) -> list[dict[str, Any]]:
+        """Per-pickup-city market view from recently scanned cargo, sorted by
+        liquidity-weighted value (all cities; callers slice the top rows).
+
+        Built entirely from the scan cache — zero extra simulation cost, and it
+        keeps improving all month. Used to (a) annotate each order candidate
+        with how liquid its *destination* is (chain value: a high-net order
+        into a dead city strands the truck), and (b) give the reposition
+        decision concrete, observed targets instead of geographic intuition.
+        """
+        cutoff = now - _LIQ_WINDOW_MIN
+        agg: dict[str, list[float]] = {}
+        for meta in self._cargo_meta.values():
+            if int(meta.get("seen_at", -1)) < cutoff:
+                continue
+            city = str(meta.get("start_city", "") or "")
+            if not city:
+                continue
+            a = agg.setdefault(city, [0.0, 0.0])
+            a[0] += 1
+            a[1] += float(meta.get("net_per_h", 0.0) or 0.0)
+        rows: list[dict[str, Any]] = []
+        for city, (n, s) in agg.items():
+            cc = self._city_centroid.get(city)
+            if not cc or cc[2] <= 0 or n <= 0:
+                continue
+            rows.append({
+                "city": city,
+                "n": int(n),
+                "net_per_h": s / n,
+                "lat": cc[0] / cc[2],
+                "lng": cc[1] / cc[2],
+            })
+        # liquidity-weighted value: plenty of decent cargo beats one outlier
+        rows.sort(key=lambda r: -(r["n"] * max(0.0, r["net_per_h"])))
+        return rows
+
+    def _dest_liquidity(self, liq_rows: list[dict[str, Any]], city: str) -> dict[str, Any] | None:
+        for row in liq_rows:
+            if row["city"] == city or (city and _region_in_city(row["city"], city)):
+                return row
+        return None
 
     def _sync_monthly_counts_from_history(self, driver_id: str, plan: dict[str, Any]) -> None:
         """Rebuild accepted-order accumulators from the authoritative history.
@@ -770,6 +848,7 @@ class ModelDecisionService:
         # set is recomputed each step from the rules known so far.
         plan["off_days"] = self._plan_off_days(rules)
         now = int(status["simulation_progress_minutes"])
+        self._sim_now[driver_id] = now
         lat = float(status["current_lat"])
         lng = float(status["current_lng"])
         day, tod = divmod(now, DAY_MINUTES)
@@ -783,8 +862,14 @@ class ModelDecisionService:
         action = None
         step = self._step_count[driver_id]
         consecutive_waits = plan.get("_consecutive_waits", 0)
-        # Call LLM every 3 steps (or when idle), but skip if stuck in wait loop (>2 consecutive)
-        use_llm = (step % 3 == 0 or plan.get("_last_action") == "wait") and consecutive_waits < 3
+        # LLM co-decides EVERY step (was every 3rd). Finals data point: the #1
+        # team spends ~3.2M tokens/driver (we used ~0.2M of the 5M budget) and
+        # wins entirely on gross income at the SAME preference penalty — the
+        # value side is where unspent token budget converts into score. The
+        # deterministic layer still hard-guards compliance and provides the
+        # fallback; the wait-loop guard keeps the known LLM idle-loop failure
+        # mode in check.
+        use_llm = consecutive_waits < 3
         if use_llm:
             action = self._llm_decide_with_history(
                 driver_id, status, rules, plan, history, now, lat, lng, day, tod
@@ -877,16 +962,24 @@ class ModelDecisionService:
         if block > 0 and day not in plan.get("rest_done", set()):
             return None  # let rule engine handle rest
 
-        # Query available cargo for context
-        cargo_resp = self._query_cargo(driver_id=driver_id, latitude=lat, longitude=lng, k=30)
+        # Query available cargo for context (k=50 ≈ 5 sim-minutes of scan —
+        # about the former blended per-step scan cost, but the LLM now sees a
+        # real market sample instead of the 30 nearest).
+        cargo_resp = self._query_cargo(driver_id=driver_id, latitude=lat, longitude=lng, k=50)
         items = cargo_resp.get("items", [])
         now = int(self._api.get_driver_status(driver_id)["simulation_progress_minutes"])
         hard_end = self._order_finish_deadline(rules, plan, now, day)
         blackout_regions = {r for r, days in rules.blackout if day in days}
         failed_ids = plan.get("failed_cargo_ids", set())
 
-        # Build a compact list of locally feasible cargo. LLM may express preference,
-        # but execution safety stays deterministic.
+        # Observed per-city market liquidity (count + value of cargo recently
+        # seen departing each city). Chain context: an order's true value
+        # includes what the truck can pick up NEXT at its destination.
+        liq_rows = self._cargo_liquidity_stats(now)
+
+        # Build a compact list of locally feasible cargo, best net/h first
+        # (was: first-N in distance order, which buried the best candidates).
+        # LLM may express preference, but execution safety stays deterministic.
         cargo_summary = []
         for item in items:
             cargo = item.get("cargo", {})
@@ -897,7 +990,8 @@ class ModelDecisionService:
             if ev is None:
                 continue
             net, _touches_required, occupied, pickup_km = ev
-            cargo_summary.append({
+            dest_city = str(cargo.get("end", {}).get("city", "") or "")
+            row = {
                 "cargo_id": cargo_id,
                 "name": cargo.get("cargo_name", ""),
                 "price": round(float(cargo.get("price", 0) or 0), 2),
@@ -905,10 +999,15 @@ class ModelDecisionService:
                 "pickup_km": round(float(pickup_km), 1),
                 "net_per_h": round(float(net) / max(1, int(occupied)) * 60, 1),
                 "from": cargo.get("start", {}).get("city", ""),
-                "to": cargo.get("end", {}).get("city", ""),
-            })
-            if len(cargo_summary) >= _LLM_CARGO_SUMMARY_LIMIT:
-                break
+                "to": dest_city,
+            }
+            dest_liq = self._dest_liquidity(liq_rows, dest_city)
+            if dest_liq is not None:
+                # follow-up market at the destination: recent departures + value
+                row["to_liq"] = f"{dest_liq['n']}单/{dest_liq['net_per_h']:.0f}元h"
+            cargo_summary.append(row)
+        cargo_summary.sort(key=lambda r: -r["net_per_h"])
+        cargo_summary = cargo_summary[:_LLM_CARGO_SUMMARY_LIMIT]
 
         # Build preference rules summary
         pref_summary = self._format_rules_for_llm(driver_id, rules, plan, day)
@@ -928,11 +1027,14 @@ class ModelDecisionService:
             "做出最优决策。首要目标是最大化净收益(net=毛收入−成本−偏好罚款)；"
             "罚款只是净收益里的一项成本，毛收入足够高时带点罚款也值得。完成品类指标同样重要(欠单罚款高)。\n\n"
             "可用动作：\n"
-            '- take_order: 接单。参数: {"cargo_id": "ID"}。优先净收益最高的货：候选里 net_per_h(每小时净收益)越高越好；'
-            '若有未达标的品类指标则优先该品类。不要只图短途，长途只要 net_per_h 高就值得接\n'
-            '- wait: 等待。参数: {"duration_minutes": 分钟数}。在司机自己的休息/禁驶时段(见下方硬约束与偏好规则)或货源确实不好时使用\n'
+            '- take_order: 接单。参数: {"cargo_id": "ID"}。综合两点选货：①net_per_h(每小时净收益)越高越好，'
+            '不要只图短途，长途只要 net_per_h 高就值得接；②**接力价值**：to_liq 表示卸货城市近期出发货源的'
+            '「数量/均价(元/h)」——卸到货多价高的城市，下一单立刻有得接；卸到没有 to_liq 的冷门地方会空趟返程，'
+            'net_per_h 略低但 to_liq 旺的单往往全天总收益更高。若有未达标的品类指标则优先该品类\n'
+            '- wait: 等待。参数: {"duration_minutes": 分钟数}。仅用于休息/禁驶时段(见下方硬约束)；'
+            '有正净值候选时等待=白白烧时间，不要因为"等更好的货"而wait\n'
             '- reposition: 空驶到新位置。参数: {"latitude": 纬度, "longitude": 经度}。'
-            '当附近无目标品类货源时，主动移动到可能有货的区域（根据地理常识判断）\n\n'
+            '当本地候选差时，优先从下方【活跃市场】表中选目标城市（用表中坐标），那是实际观测到的货源聚集地\n\n'
             "重要规则：\n"
             "- 在司机自己的休息/禁驶时段内不得接单或空驶，只能wait(具体时段见下方【硬约束】与偏好规则，不同司机时段不同，不要假设固定21:00-06:00)；空驶须在该时段开始前结束\n"
             "- 长途/品类/区域等限制以下方偏好规则为准：没有列出的限制就不存在，不要自行假设(例如不要假设有长途单数上限)\n"
@@ -956,6 +1058,16 @@ class ModelDecisionService:
         audit_text = self._compliance_self_audit(rules, history, day)
         audit_block = f"## 合规自检\n{audit_text}\n\n" if audit_text else ""
 
+        # Observed active markets (from the scan cache): concrete reposition
+        # targets with coordinates, instead of "geographic intuition".
+        liq_block = ""
+        if liq_rows:
+            liq_lines = [
+                f"{r['city']}: 近3天见{r['n']}单, 均{r['net_per_h']:.0f}元/h, 坐标({r['lat']:.2f},{r['lng']:.2f})"
+                for r in liq_rows[:_LIQ_TOP_N]
+            ]
+            liq_block = "## 活跃市场(近期实际扫描到的货源聚集地)\n" + "\n".join(liq_lines) + "\n\n"
+
         user_prompt = (
             f"## 当前状态\n"
             f"司机: {driver_id}, 位置: ({lat:.2f}, {lng:.2f})\n"
@@ -965,7 +1077,8 @@ class ModelDecisionService:
             f"{audit_block}"
             f"## 偏好规则与合规进度\n{pref_summary}\n\n"
             f"## 决策历史\n{history_text}\n\n"
-            f"## 已通过本地可行性检查的候选货源({len(cargo_summary)}条)\n"
+            f"{liq_block}"
+            f"## 已通过本地可行性检查的候选货源({len(cargo_summary)}条, 按net_per_h降序)\n"
             f"{json.dumps(cargo_summary, ensure_ascii=False, separators=(',', ':'))}\n\n"
             f"请做出决策（只输出JSON）:"
         )
@@ -1018,6 +1131,23 @@ class ModelDecisionService:
                             wait_until_window_end = self._minutes_until_window_end(tod, ws, we)
                             if wait_until_window_end > 0:
                                 return self._safe_wait(rules, now, max(dur, wait_until_window_end))
+                    # Strategic-idle guard: the candidates above already passed
+                    # every compliance check (incl. finishing before tonight's
+                    # window), so a long wait while a strong order sits on the
+                    # table is pure lost revenue — the documented failure mode
+                    # of earlier LLM-heavy runs. Take the top candidate instead.
+                    if (
+                        dur >= 60
+                        and cargo_summary
+                        and float(cargo_summary[0]["net_per_h"]) >= _LLM_WAIT_OVERRIDE_NET_PER_H
+                    ):
+                        top_id = str(cargo_summary[0]["cargo_id"])
+                        if self._validate_llm_take_order(top_id, items, rules, plan, now, lat, lng, day, hard_end):
+                            self._logger.info(
+                                "[LLM] wait override driver_id=%s: take %s net_per_h=%.0f instead of %d-min idle",
+                                driver_id, top_id, float(cargo_summary[0]["net_per_h"]), dur,
+                            )
+                            return self._take_order(top_id)
                     return self._safe_wait(rules, now, dur)
                 elif action_type == "reposition" and "latitude" in params and "longitude" in params:
                     return self._safe_reposition(

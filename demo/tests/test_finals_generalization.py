@@ -51,18 +51,20 @@ class ScriptedApi:
     """SimulationApiPort stub that scripts the LLM roles by system prompt."""
 
     def __init__(self, extract_responses=None, audit_response=None, confirm_holds=True,
-                 fail_all=False, yes_no=None, directive_response=None):
+                 fail_all=False, yes_no=None, directive_response=None, decision_response=None):
         self.extract_payloads: list[dict] = []
         self.audit_payloads: list[dict] = []
         self.directive_payloads: list[dict] = []
         self.confirm_payloads: list[dict] = []
         self.yes_no_questions: list[str] = []
+        self.decision_prompts: list[str] = []
         self._extract_responses = list(extract_responses or [])
         self._audit_response = audit_response
         self._confirm_holds = confirm_holds
         self._fail_all = fail_all
         self._yes_no = yes_no  # callable(question) -> bool
         self._directive_response = directive_response
+        self._decision_response = decision_response
 
     def get_driver_status(self, driver_id):  # noqa: ANN001, ANN201
         return {"simulation_progress_minutes": 0}
@@ -95,6 +97,9 @@ class ScriptedApi:
             self.yes_no_questions.append(user)
             ans = self._yes_no(user) if self._yes_no else True
             return _resp({"answer": ans})
+        if "智能货运调度决策AI" in system:
+            self.decision_prompts.append(user)
+            return _resp(self._decision_response or {"action": "wait", "params": {"duration_minutes": 30}})
         return _resp({})
 
 
@@ -412,6 +417,134 @@ def test_monthly_deadhead_cap_driver_can_still_pick_orders() -> None:
     }
     action = svc._pick_order("DG30", {}, rules, plan, now, 23.10, 113.20, day, (day + 1) * DAY_MINUTES)
     assert action is not None and action["action"] == "take_order", action
+
+
+# ----------------------------------------------- 8. value layer (LLM-on-value)
+
+def _fresh_plan() -> dict:
+    return {
+        "off_days": set(), "orders_today": {}, "first_order_taken": set(),
+        "monthly_longhual": {}, "monthly_category_orders": {},
+        "monthly_deadhead_km": {}, "zeng_order_days": set(),
+        "failed_cargo_ids": set(), "failed_cargo_reasons": {},
+        "total_deadhead_km": 0.0, "must_visit_days": {}, "rest_done": set(),
+    }
+
+
+def test_liquidity_stats_aggregation_and_recency() -> None:
+    svc = ModelDecisionService(ScriptedApi())
+    now = 10 * DAY_MINUTES
+    svc._cargo_meta = {
+        "a1": {"start_city": "苏州市", "net_per_h": 90.0, "seen_at": now - 100},
+        "a2": {"start_city": "苏州市", "net_per_h": 110.0, "seen_at": now - 200},
+        "a3": {"start_city": "苏州市", "net_per_h": 100.0, "seen_at": now - 300},
+        "b1": {"start_city": "杭州市", "net_per_h": 200.0, "seen_at": now - 100},
+        "c1": {"start_city": "南京市", "net_per_h": 500.0, "seen_at": now - 10 * DAY_MINUTES},  # stale
+    }
+    svc._city_centroid = {
+        "苏州市": [31.3 * 3, 120.6 * 3, 3],
+        "杭州市": [30.25, 120.16, 1],
+        "南京市": [32.06, 118.80, 1],
+    }
+    rows = svc._cargo_liquidity_stats(now)
+    cities = [r["city"] for r in rows]
+    assert "南京市" not in cities, rows  # aged out
+    # 苏州: 3 × avg100 = 300 beats 杭州: 1 × 200
+    assert cities[0] == "苏州市", rows
+    assert abs(rows[0]["net_per_h"] - 100.0) < 1e-6 and rows[0]["n"] == 3, rows
+    assert abs(rows[0]["lat"] - 31.3) < 1e-6, rows
+
+
+class ValueApi(ScriptedApi):
+    """Decision-layer stub: real clock + one strong scannable cargo."""
+
+    def __init__(self, now: int, items: list[dict], decision_response: dict):
+        super().__init__(decision_response=decision_response)
+        self._now = now
+        self._items = items
+        self.scan_ks: list[int] = []
+
+    def get_driver_status(self, driver_id):  # noqa: ANN001, ANN201
+        return {"simulation_progress_minutes": self._now,
+                "current_lat": 23.10, "current_lng": 113.20, "preferences": []}
+
+    def query_cargo(self, *args, **kwargs):  # noqa: ANN002, ANN003, ANN201
+        self.scan_ks.append(int(kwargs.get("k", 0)))
+        return {"items": self._items}
+
+
+def _strong_item(cargo_id: str = "C-9") -> dict:
+    return {"cargo": {
+        "cargo_id": cargo_id, "cargo_name": "建材", "price": 900.0,
+        "cost_time_minutes": 120,
+        "start": {"lat": 23.11, "lng": 113.21, "city": "广州市"},
+        "end": {"lat": 23.40, "lng": 113.50, "city": "佛山市"},
+    }, "distance_km": 1.5}
+
+
+def test_llm_long_wait_overridden_by_strong_candidate() -> None:
+    """A >=60min strategic wait while a compliant high-net order is on the
+    table gets converted into taking that order (documented failure mode of
+    LLM-in-the-loop runs: idling away strong orders)."""
+    day, tod = 5, 600
+    now = day * DAY_MINUTES + tod
+    api = ValueApi(now, [_strong_item()], {"action": "wait", "params": {"duration_minutes": 240}})
+    svc = ModelDecisionService(api)
+    svc._sim_now["DG40"] = now
+    rules = DriverRules()
+    from agent.model_decision_service import DecisionHistory
+    action = svc._llm_decide_with_history(
+        "DG40", {}, rules, _fresh_plan(), DecisionHistory(), now, 23.10, 113.20, day, tod
+    )
+    assert action is not None and action["action"] == "take_order", action
+    assert action["params"]["cargo_id"] == "C-9", action
+
+
+def test_llm_short_wait_not_overridden() -> None:
+    day, tod = 5, 600
+    now = day * DAY_MINUTES + tod
+    api = ValueApi(now, [_strong_item()], {"action": "wait", "params": {"duration_minutes": 30}})
+    svc = ModelDecisionService(api)
+    svc._sim_now["DG41"] = now
+    rules = DriverRules()
+    from agent.model_decision_service import DecisionHistory
+    action = svc._llm_decide_with_history(
+        "DG41", {}, rules, _fresh_plan(), DecisionHistory(), now, 23.10, 113.20, day, tod
+    )
+    assert action is not None and action["action"] == "wait", action
+
+
+def test_llm_codecides_every_step() -> None:
+    """The decision LLM is consulted on every step now (was every 3rd)."""
+    day, tod = 5, 600
+    now = day * DAY_MINUTES + tod
+    api = ValueApi(now, [], {"action": "wait", "params": {"duration_minutes": 45}})
+    svc = ModelDecisionService(api)
+    a1 = svc.decide("DG42")  # step 1 — old gating (step % 3 == 0) would skip the LLM
+    assert len(api.decision_prompts) == 1, api.decision_prompts
+    assert a1["action"] == "wait", a1
+    svc.decide("DG42")  # step 2 — still consulted
+    assert len(api.decision_prompts) == 2
+
+
+def test_decision_prompt_contains_market_table() -> None:
+    day, tod = 5, 600
+    now = day * DAY_MINUTES + tod
+    api = ValueApi(now, [_strong_item()], {"action": "wait", "params": {"duration_minutes": 30}})
+    svc = ModelDecisionService(api)
+    svc._sim_now["DG43"] = now
+    # pre-seed the scan cache so the liquidity table has content
+    svc._cargo_meta = {"x": {"start_city": "佛山市", "net_per_h": 120.0, "seen_at": now - 50}}
+    svc._city_centroid = {"佛山市": [23.02, 113.12, 1]}
+    rules = DriverRules()
+    from agent.model_decision_service import DecisionHistory
+    svc._llm_decide_with_history(
+        "DG43", {}, rules, _fresh_plan(), DecisionHistory(), now, 23.10, 113.20, day, tod
+    )
+    prompt = api.decision_prompts[-1]
+    assert "活跃市场" in prompt and "佛山市" in prompt, prompt
+    # the candidate going to 佛山市 is annotated with destination liquidity
+    assert "to_liq" in prompt, prompt
 
 
 def main() -> int:
