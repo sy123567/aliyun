@@ -596,6 +596,13 @@ class ModelDecisionService:
         # compliance planner and the decision prompt always work from the raw
         # text, never only from the parsed schema.
         self._pref_records: dict[str, list[dict[str, Any]]] = {}
+        # raw preference text → standard-Mandarin paraphrase ("" = no paraphrase
+        # needed / normalization unavailable). Finals drivers are from 广东 and
+        # 江浙沪, so preference texts may be written in 粤语 / 吴语 or heavy
+        # colloquial phrasing; the paraphrase is appended to the text fed to the
+        # extraction / audit / grounding / daily-planner calls so no rule is
+        # missed because of dialect wording.
+        self._pref_norms: dict[str, str] = {}
         self._initial_position: dict[str, tuple[float, float]] = {}
         # cargo_id -> metadata seen during scans; used to reconstruct monthly
         # accumulators from the authoritative decision history (see
@@ -705,6 +712,20 @@ class ModelDecisionService:
 
     # ------------------------------------------------------------------ decide
     def decide(self, driver_id: str) -> dict[str, Any]:
+        # Bulletproof shell: the orchestrator treats an exception from decide()
+        # as fatal and terminates this driver's ENTIRE month (end_reason="error"),
+        # freezing the score at whatever was earned so far. No single-step bug is
+        # worth that, so any unexpected error degrades to a short safe wait and
+        # the next step gets a fresh chance to decide properly.
+        try:
+            return self._decide_impl(driver_id)
+        except Exception:
+            self._logger.exception(
+                "decide() crashed driver_id=%s — falling back to safe 30min wait", driver_id
+            )
+            return {"action": "wait", "params": {"duration_minutes": 30}}
+
+    def _decide_impl(self, driver_id: str) -> dict[str, Any]:
         status = self._api.get_driver_status(driver_id)
         rules = self._ensure_rules(driver_id, status)
         plan = self._plan.setdefault(
@@ -1235,6 +1256,8 @@ class ModelDecisionService:
         "- today_plan: 简述今天必须做/必须避免的事（品类缺口与欠额、特定日期事项、区域或长途限制等）。\n"
         "- category_focus: 若有月度品类指标且尚有缺口（含上月欠额需本月同品类补）则给出应优先的品类名，否则 null。\n"
         "规则：宁可保守，绝不编造偏好中不存在的约束；时段必须严格按偏好原文给出的时刻推算。"
+        "偏好原文可能是粤语/吴语等方言或口语（如 唔=不要、晚黑=晚上、返屋企=回家、生果=水果、"
+        "夜里向=晚上、覅=不要、困觉=睡觉），可能附带「普通话释义」，一律按含义推算。"
     )
 
     def _ensure_daily_directive(
@@ -1267,7 +1290,11 @@ class ModelDecisionService:
             "今天": f"{date_str} {weekday_str}" + ("（周末）" if is_weekend else "（工作日）"),
             "本月": _month_name(month_idx),
             "偏好": [
-                {"原文": r["content"], "单次违约扣款": r.get("penalty_amount")}
+                {
+                    "原文": r["content"],
+                    "单次违约扣款": r.get("penalty_amount"),
+                    **({"普通话释义": r["mandarin"]} if r.get("mandarin") else {}),
+                }
                 for r in records
             ],
         }
@@ -1717,10 +1744,14 @@ class ModelDecisionService:
         strand = self._anti_strand(driver_id, rules, plan, now, lat, lng, day, hard_end)
         if strand is not None:
             return strand
-        # (E'') Instead of idling until day end, wait 2 hours and retry.
+        # (E'') Instead of idling until day end, wait 1 hour and retry. The cargo
+        # pool is dynamic (new cargo keeps appearing per create_time), so a fresh
+        # scan every hour catches new compliant orders up to an hour earlier than
+        # the previous 2h cadence — the extra rescan only costs a few minutes of
+        # scan time, far less than an idle hour of a lost order.
         remaining = day_end - now
         if remaining > 240:
-            return self._safe_wait(rules, now, 120)
+            return self._safe_wait(rules, now, 60)
         return self._safe_wait(rules, now, max(remaining, 1))
 
     def _next_day_is_ordinary(self, rules, plan, day) -> bool:
@@ -1844,6 +1875,12 @@ class ModelDecisionService:
         # [OPT] Determine current month index and category targets
         month_idx = _month_index_for_day(day)
         longhual_count = plan["monthly_longhual"].get(month_idx, 0)
+        # Month-to-date pickup deadhead, needed by the monthly_deadhead_max_km
+        # checks below. Missing this binding made every _pick_order call raise
+        # NameError for any driver whose preferences impose a deadhead cap —
+        # which aborts that driver's whole simulation (orchestrator treats a
+        # decide() exception as fatal).
+        month_deadhead = plan.setdefault("monthly_deadhead_km", {}).get(month_idx, 0.0)
         cat_target, cat_needed = self._get_category_target(rules, plan, day)
 
         # [OPT] When a monthly category target is at risk, widen earlier.  The
@@ -2452,23 +2489,35 @@ class ModelDecisionService:
             if not content or content in known_contents:
                 continue
             known_contents.add(content)
-            records.append({
+            record: dict[str, Any] = {
                 "content": content,
                 "penalty_amount": (pref.get("penalty_amount") if isinstance(pref, dict) else None),
-            })
+            }
+            mandarin = self._normalize_preference_text(driver_id, content)
+            if mandarin:
+                record["mandarin"] = mandarin
+            records.append(record)
 
         before = self._rules_fingerprint(rules)
         coord_map = self._collect_coords(prefs)
+        # Current calendar date: lets the extractor resolve "本月/这个月/呢个月"
+        # style targets to the right month (preferences become visible inside
+        # their own date window, so "this month" == the month of first sight).
+        cur_day = int(status.get("simulation_progress_minutes", 0) or 0) // DAY_MINUTES
+        date_str, weekday_str, _is_we = _calendar_for_day(min(max(cur_day, 0), MONTH_DAYS - 1))
+        today_str = f"{date_str} {weekday_str}"
         compiled: list[tuple[str, Any]] = []
         for text, penalty in new_items:
-            if self._llm_parse_preferences(driver_id, [text], rules, coord_map, [penalty]):
-                compiled.append((text, penalty))
+            # Dialect robustness: compile/audit/ground against 原文+普通话释义.
+            aug = self._augmented_pref_text(driver_id, text)
+            if self._llm_parse_preferences(driver_id, [aug], rules, coord_map, [penalty], today=today_str):
+                compiled.append((aug, penalty))
             else:
                 # offline / model unavailable: deterministic regex fallback for
                 # this text only.
-                self._parse_one(text, rules, coord_map)
-                self._supplement_basic_rules(text, rules)
-                self._supplement_dated_events(text, rules, coord_map)
+                self._parse_one(aug, rules, coord_map)
+                self._supplement_basic_rules(aug, rules)
+                self._supplement_dated_events(aug, rules, coord_map)
         if compiled:
             self._audit_preference_coverage(driver_id, compiled, rules, coord_map)
             # Cross-check LLM dated event coords against text-extracted coords.
@@ -2507,8 +2556,9 @@ class ModelDecisionService:
         seen.update(t for t, _ in new_items)
         # Dedup avoid/forbidden AFTER supplement so regex-added items are also cleaned
         init_lat, init_lng = self._initial_position[driver_id]
-        self._supplement_relative_allowed_regions(texts, rules, init_lat, init_lng)
-        self._supplement_night_failsafe(texts, rules)
+        aug_texts = [self._augmented_pref_text(driver_id, t) for t in texts]
+        self._supplement_relative_allowed_regions(aug_texts, rules, init_lat, init_lng)
+        self._supplement_night_failsafe(aug_texts, rules)
         self._dedup_avoid_forbidden(rules)
         if self._rules_fingerprint(rules) != before:
             self._logger.info(
@@ -2564,6 +2614,8 @@ class ModelDecisionService:
     # ----------------------------------------------------------- LLM preference parsing
     _PARSE_SYSTEM = (
         "你是货运司机偏好抽取器。把司机的自然语言偏好转成严格 JSON。\n"
+        "偏好原文可能是标准普通话，也可能是粤语、客家话、吴语（江浙沪）等方言或口语俚语"
+        "（有的条目附带「普通话释义」），一律按**含义**抽取，不要因为措辞陌生而漏抽。\n"
         "只输出一个 JSON 对象，禁止 markdown / 解释 / think标签。未提及的字段用 null 或空数组。\n\n"
         "字段定义（宁缺毋错）：\n"
         '- daily_rest_hours: 每天连续休息最少小时数（数字或 null）\n'
@@ -2630,7 +2682,13 @@ class ModelDecisionService:
         '11) "只跑/只接/仅在/不出X"是 allowed_regions，不是 forbidden_regions。\n'
         '12) 输入可能含 penalty_amounts 数组（与 preferences 一一对应的违约扣款金额）。'
         '金额越高的偏好越要逐字推敲、确保其全部约束被完整抽出，绝不能漏；尤其是每日生效的夜休/禁驶窗口和月度品类指标。'
-        '同时把各金额按规则类别归因填入 rule_penalties。\n\n'
+        '同时把各金额按规则类别归因填入 rule_penalties。\n'
+        '13) 方言对照（按含义抽取，绝不漏抽）：粤语 唔/咪=不要、冇=没有、晚黑=晚上、朝早=早上、'
+        '晏昼=下午、挨晚=傍晚、返屋企=回家、收工=收车下班、开工=开始干活、走货/拉货=运货、'
+        '生果=水果、礼拜六日=周末、先至=才；吴语 夜里向/夜到=晚上、早浪向=早上、屋里厢=家里、'
+        '勿/覅=不要、困觉=睡觉、歇生意=不接活、做生活=干活。'
+        '品类名输出标准普通话叫法（「生果」→"水果"）。\n'
+        '14) 输入若含"今天"（当前日期），偏好说"本月/这个月/呢个月"的指标时，month 取今天所在月份。\n\n'
         "示例1：\n"
         '入: {"preferences":["每天零点到六点停着熄火睡觉","凡是生鲜货源碰不得","三月四号五号不往深圳（22.55，114.05）跑"]}\n'
         '出: {"daily_rest_hours":null,"rest_window":{"start_hour":0,"end_hour":6},'
@@ -2676,13 +2734,93 @@ class ModelDecisionService:
         '"forbidden_categories":[],"avoid_categories":[],"forbidden_regions":[],"forbidden_zones":[],"bounded_area":null,'
         '"required_region":null,"must_visit":[],"pickup_max_km":null,"haul_max_km":null,"monthly_deadhead_max_km":null,'
         '"daily_order_limit":null,"first_order_before_hour":null,"monthly_category_targets":[],"home_rule":null,'
-        '"blackout":[],"dated_single":[{"date":20,"lat":23.25,"lng":113.40,"wait_minutes":120,"before_hour":null}],"dated_route":[]}'
+        '"blackout":[],"dated_single":[{"date":20,"lat":23.25,"lng":113.40,"wait_minutes":120,"before_hour":null}],"dated_route":[]}\n\n'
+        "示例7（方言）：\n"
+        '入: {"preferences":["晚黑十点之后唔好再接单走车，要返屋企熄火休息，挨到朝早六点先至好开工","呢个月生果要拉够十二单，少一单扣一次钱"],"今天":"2026-03-02 周一"}\n'
+        '出: {"daily_rest_hours":null,"rest_window":{"start_hour":22,"end_hour":6},'
+        '"no_drive_windows":[{"start_hour":22,"end_hour":6}],"off_days_min":0,'
+        '"forbidden_categories":[],"avoid_categories":[],"forbidden_regions":[],"forbidden_zones":[],"bounded_area":null,'
+        '"required_region":null,"must_visit":[],"pickup_max_km":null,"haul_max_km":null,"monthly_deadhead_max_km":null,'
+        '"daily_order_limit":null,"first_order_before_hour":null,'
+        '"monthly_category_targets":[{"month":3,"category":"水果","min_orders":12,"carryover":false}],"home_rule":null,'
+        '"blackout":[],"dated_single":[],"dated_route":[]}'
     )
+
+    # ------------------------------------------------ dialect normalization
+    _NORMALIZE_SYSTEM = (
+        "你是货运司机偏好的方言转写助手。输入是一条司机偏好原文，可能用粤语、客家话、"
+        "吴语（江浙沪一带）、其他地方方言或口语俚语表述。把它转写成一句等义的标准普通话：\n"
+        "- 所有数字、时刻、日期、星期、地名、坐标、金额、单数/天数指标必须原样保留，一个都不能丢、不能改；\n"
+        "- 不得添加原文没有的约束，也不得弱化、合并或省略任何约束；\n"
+        "- 货物品类名转成通用叫法（如粤语「生果」→「水果」）；\n"
+        "- 若原文已是标准普通话，原样返回。\n"
+        '只输出 JSON {"mandarin":"转写后的普通话"}，禁止 markdown / 解释。\n'
+        "常见方言词对照（粤语）：唔/咪=不要；冇=没有；晚黑/夜晚黑=晚上；朝早=早上；晏昼=下午；"
+        "挨晚=傍晚；半夜三更=深夜；返屋企=回家；收工=下班收车；开工=开始干活；揾食=干活谋生；"
+        "走货/行货/拉货=运货；生果=水果；嘢=东西；礼拜六日=周末；呢个月=这个月；先至=才；唔好=不要。\n"
+        "（吴语/江浙沪）：夜里向/夜到=晚上；早浪向/早上向=早上；屋里厢=家里；勿/覅=不要；"
+        "困觉=睡觉；歇生意=不接活；做生活=干活；交关=非常；礼拜天=星期日；卯辰光=那时候。"
+    )
+
+    def _normalize_preference_text(self, driver_id: str, text: str) -> str | None:
+        """方言/口语偏好 → 标准普通话释义（按原文缓存 + fail-safe）。
+
+        返回 None 表示无需释义或模型不可用；此时管线行为与未引入本层完全一致。
+        """
+        cached = self._pref_norms.get(text)
+        if cached is not None:
+            return cached or None
+        result: str | None = None
+        try:
+            req: dict[str, Any] = {
+                "messages": [
+                    {"role": "system", "content": self._NORMALIZE_SYSTEM},
+                    {"role": "user", "content": text},
+                ],
+                "temperature": 0,
+                "max_tokens": 300,
+            }
+            try:
+                req["response_format"] = {"type": "json_object"}
+                resp = self._api.model_chat_completion(req)
+            except Exception:
+                req.pop("response_format", None)
+                resp = self._api.model_chat_completion(req)
+            data = self._extract_json(resp)
+            if isinstance(data, dict):
+                mand = str(data.get("mandarin") or "").strip()
+                # Identical output means the text was already standard Mandarin.
+                if mand and mand != text.strip():
+                    result = mand
+        except Exception as exc:
+            self._logger.info(
+                "pref normalize unavailable driver_id=%s err=%s", driver_id, exc
+            )
+        self._pref_norms[text] = result or ""
+        if result:
+            self._logger.info(
+                "pref normalize driver_id=%s raw=%s mandarin=%s",
+                driver_id, text[:80], result[:120],
+            )
+        return result
+
+    def _augmented_pref_text(self, driver_id: str, text: str) -> str:
+        """原文 + 普通话释义的合并文本。
+
+        合并文本被一致地用于抽取、覆盖审计、语义接地（_confirm_rule_holds）与
+        离线正则兜底：原文保证接地校验不会因释义产生幻觉约束（原文始终在场），
+        释义保证标准普通话措辞的关键词/语义都能命中。
+        """
+        norm = self._normalize_preference_text(driver_id, text)
+        if norm:
+            return f"{text}\n（普通话释义：{norm}）"
+        return text
 
     def _llm_parse_preferences(
         self, driver_id: str, texts: list[str], rules: DriverRules,
         coord_map: dict[str, tuple[float, float]] | None = None,
         penalties: list[Any] | None = None,
+        today: str | None = None,
     ) -> bool:
         """用大模型把全部可见偏好解析成结构化规则并合并进 rules。
 
@@ -2692,6 +2830,8 @@ class ModelDecisionService:
         if not texts:
             return False
         payload: dict[str, Any] = {"preferences": texts}
+        if today:
+            payload["今天"] = today
         if penalties and len(penalties) == len(texts) and any(p for p in penalties):
             payload["penalty_amounts"] = penalties
         if coord_map:
@@ -2777,7 +2917,9 @@ class ModelDecisionService:
         "3) 某约束无法用上述字段表达时：representable=false、patch 留空、missing 写明该约束原意。\n"
         "4) penalty_amounts 金额越高的偏好越要逐字核对。\n"
         "5) 已完整覆盖就 covered=true 且不输出 patch；拿不准时 covered=false 并给出 patch"
-        "（结构化引擎对重复规则免疫，宁可重复、不可漏掉）。"
+        "（结构化引擎对重复规则免疫，宁可重复、不可漏掉）。\n"
+        "6) 偏好原文可能是粤语/吴语等方言或口语（可能附带「普通话释义」），按含义审计："
+        "如粤语「晚黑收工返屋企」即夜间禁驶+回家、「生果」即水果品类、吴语「夜里向覅跑车」即夜间禁驶。"
     )
 
     def _describe_rules_for_audit(self, rules: DriverRules) -> str:
@@ -3079,6 +3221,8 @@ class ModelDecisionService:
             msgs = [
                 {"role": "system", "content": (
                     "你判断一段司机偏好原文是否确实包含某条约束。"
+                    "原文可能是粤语/吴语等方言或口语（如 唔=不要、晚黑=晚上、返屋企=回家、"
+                    "生果=水果、夜里向=晚上、覅=不要），按含义判断。"
                     "只输出JSON {\"holds\": true/false}。"
                     "只有当原文明显不支持该约束时才返回false；含义相符或不确定一律返回true。"
                 )},
@@ -3116,7 +3260,8 @@ class ModelDecisionService:
         try:
             msgs = [
                 {"role": "system", "content": (
-                    "你是货运领域的语义判定助手。输入文本可能是乱序/缺字的中文。"
+                    "你是货运领域的语义判定助手。输入文本可能是乱序/缺字的中文，"
+                    "也可能含粤语/吴语等方言叫法（如粤语「生果」即「水果」）。"
                     "只输出JSON {\"answer\": true/false}。"
                 )},
                 {"role": "user", "content": question},
@@ -3137,6 +3282,16 @@ class ModelDecisionService:
         cache[question] = verdict
         return verdict
 
+    # 方言品类同义词（仅收录无歧义的等价叫法）：抽取层已要求品类名归一为标准
+    # 普通话，这里是品类匹配的确定性兜底，避免「偏好写生果、货源叫水果」时
+    # 还要依赖一次 LLM 判定。
+    _DIALECT_CATEGORY_SYNONYMS = {
+        "生果": "水果",
+        "菜蔬": "蔬菜",
+        "小菜": "蔬菜",
+        "建筑材料": "建材",
+    }
+
     def _category_matches_sem(self, cat: str, cargo_name: str) -> bool:
         """品类归属判定：子串直接命中；其余交给 LLM 语义判定（缓存），
         模型不可用时降级到 _category_matches 启发式。"""
@@ -3144,6 +3299,10 @@ class ModelDecisionService:
         if not cat or not cargo_name:
             return False
         if cat in cargo_name or cargo_name in cat:
+            return True
+        ncat = self._DIALECT_CATEGORY_SYNONYMS.get(cat, cat)
+        nname = self._DIALECT_CATEGORY_SYNONYMS.get(cargo_name, cargo_name)
+        if ncat in nname or nname in ncat:
             return True
         question = (
             f"货物名称『{cargo_name}』是否属于品类『{cat}』？"
