@@ -26,7 +26,9 @@ from __future__ import annotations
 import json
 import logging
 import math
+import os
 import re
+import time
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -61,6 +63,18 @@ _LIQ_TOP_N = 6
 # above this net-per-hour is on the table, take the order instead (the known
 # failure mode of LLM-in-the-loop runs was idling away strong orders).
 _LLM_WAIT_OVERRIDE_NET_PER_H = 80.0
+# Thinking mode for the per-step decision call. Default ON (submission runs
+# with thinking); set AGENT_DECISION_THINKING=0 to disable. Measured on the
+# finals gateway (qwen3.7-plus) with real decision prompts: ~22s avg latency
+# per LLM decision (vs ~2s without) and ~+800 reasoning tokens/step
+# (~2.3M total/driver projected — still within the 5M cap).
+_DECISION_THINKING = os.environ.get("AGENT_DECISION_THINKING", "1").strip() not in ("0", "false", "False")
+# The finals impose a HARD 4-hour total-runtime cap. Thinking at ~22s/step
+# projects to ~1.9h/driver (≈3.9h for two drivers) — no safety margin. Each
+# driver therefore gets a wall-clock budget; when the run is projected to
+# exceed it (pro-rated by simulation progress), thinking switches off for the
+# rest of that driver's season and decisions fall back to fast mode.
+_THINKING_WALL_BUDGET_SECONDS = float(os.environ.get("AGENT_THINKING_WALL_BUDGET_SECONDS", "6000"))
 
 SHENZHEN_BBOX = (22.42, 22.89, 113.74, 114.66)  # lat_min, lat_max, lng_min, lng_max
 _MONTH_START_DAYS = (0, 31, 61, 92)
@@ -641,6 +655,10 @@ class ModelDecisionService:
         # start_city -> [sum_lat, sum_lng, n] over scanned cargo pickups: a
         # representative coordinate per city for reposition targets.
         self._city_centroid: dict[str, list[float]] = {}
+        # Wall-clock start per driver + drivers whose thinking mode has been
+        # switched off by the runtime-budget guard (finals 4h hard cap).
+        self._wall_start: dict[str, float] = {}
+        self._thinking_off: set[str] = set()
 
     def _query_cargo(self, driver_id: str, latitude: float, longitude: float, k: int) -> dict[str, Any]:
         """query_cargo wrapper that caches cargo metadata for every scanned item.
@@ -843,6 +861,7 @@ class ModelDecisionService:
         self._step_count[driver_id] += 1
         # Fresh per-step budget for semantic region-membership lookups.
         self._sem_region_budget = 6
+        self._wall_start.setdefault(driver_id, time.time())
 
         # Preferences may only become visible inside their date window, so the off-day
         # set is recomputed each step from the rules known so far.
@@ -952,7 +971,6 @@ class ModelDecisionService:
 
         Returns a valid action dict or None (to fall back to rule engine).
         """
-        import time
         start_time = time.time()
 
         # Skip LLM for mandatory actions (rest, off-day, dated events)
@@ -1083,6 +1101,23 @@ class ModelDecisionService:
             f"请做出决策（只输出JSON）:"
         )
 
+        # Thinking-mode runtime guard: pro-rate the per-driver wall budget by
+        # simulation progress; once the run projects past it, drop to fast
+        # mode for the rest of the season (the finals 4h cap is a hard kill).
+        use_thinking = _DECISION_THINKING and driver_id not in self._thinking_off
+        if use_thinking:
+            wall_start = self._wall_start.get(driver_id)
+            sim_frac = min(1.0, now / float(MONTH_DAYS * DAY_MINUTES))
+            if wall_start is not None and sim_frac > 0.02:
+                if (time.time() - wall_start) > _THINKING_WALL_BUDGET_SECONDS * sim_frac:
+                    self._thinking_off.add(driver_id)
+                    use_thinking = False
+                    self._logger.warning(
+                        "[LLM] thinking disabled driver_id=%s: projected past wall budget "
+                        "(%.0fs used at sim_frac=%.2f, budget=%.0fs)",
+                        driver_id, time.time() - wall_start, sim_frac, _THINKING_WALL_BUDGET_SECONDS,
+                    )
+
         try:
             req = {
                 "messages": [
@@ -1095,8 +1130,12 @@ class ModelDecisionService:
                 # finals score a coin flip. We want a high, reproducible floor.
                 "temperature": 0,
                 "response_format": {"type": "json_object"},
-                "max_tokens": 180,
+                # With thinking the completion must hold the reasoning chain
+                # too; 180 would truncate it and break the JSON answer.
+                "max_tokens": 2000 if use_thinking else 180,
             }
+            if use_thinking:
+                req["enable_thinking"] = True
             resp = self._api.model_chat_completion(req)
             elapsed = time.time() - start_time
 

@@ -547,6 +547,38 @@ def test_decision_prompt_contains_market_table() -> None:
     assert "to_liq" in prompt, prompt
 
 
+def test_thinking_disabled_when_wall_budget_projected_exceeded() -> None:
+    """Thinking mode must hand the driver back to fast mode when the run is
+    projected past the per-driver wall budget (finals 4h cap is a hard kill)."""
+    import agent.model_decision_service as mds
+    import time as _time
+
+    day, tod = 46, 600  # mid-season -> sim_frac ~0.5
+    now = day * DAY_MINUTES + tod
+    api = ValueApi(now, [], {"action": "wait", "params": {"duration_minutes": 30}})
+    svc = ModelDecisionService(api)
+    svc._sim_now["DG50"] = now
+    # pretend the run started long ago: way over the pro-rated budget
+    svc._wall_start["DG50"] = _time.time() - mds._THINKING_WALL_BUDGET_SECONDS
+    old = mds._DECISION_THINKING
+    mds._DECISION_THINKING = True
+    try:
+        from agent.model_decision_service import DecisionHistory
+        svc._llm_decide_with_history(
+            "DG50", {}, DriverRules(), _fresh_plan(), DecisionHistory(), now, 23.10, 113.20, day, tod
+        )
+        assert "DG50" in svc._thinking_off
+        # within budget -> thinking stays on for another driver
+        svc._sim_now["DG51"] = now
+        svc._wall_start["DG51"] = _time.time() - 10
+        svc._llm_decide_with_history(
+            "DG51", {}, DriverRules(), _fresh_plan(), DecisionHistory(), now, 23.10, 113.20, day, tod
+        )
+        assert "DG51" not in svc._thinking_off
+    finally:
+        mds._DECISION_THINKING = old
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     passed = 0
