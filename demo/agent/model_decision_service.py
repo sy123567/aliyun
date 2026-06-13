@@ -94,10 +94,17 @@ _LLM_WAIT_OVERRIDE_NET_PER_H = float(os.environ.get("AGENT_LLM_WAIT_OVERRIDE_NET
 #     net 59.6k→49.4k) — too many *marginal* crossings were taken.
 # So a crossing is allowed only when the order's penalty-free margin clears
 # ``night_pen * (_NIGHT_CROSS_MARGIN - 1)`` (i.e. net stays well above the day's
-# rest penalty after the charge). 1.0 == legacy behaviour (net>0). Default 1.5
-# keeps the genuinely big hauls (the feature's intent) while dropping the thin
-# crossings that drove the penalty up. Env-tunable for platform sweeps (§2).
-_NIGHT_CROSS_MARGIN = max(1.0, float(os.environ.get("AGENT_NIGHT_CROSS_MARGIN", "1.5")))
+# rest penalty after the charge). 1.0 == legacy behaviour (net>0).
+# [D3] Raised 1.5 → 2.0 after the leaderboard re-read (notes §-6): the #1 team
+# (baseline) wins with the LOWEST preference penalty on the board (8.5k vs our
+# 31-58k) even though our GROSS income is the highest — the entire gap to #1 is
+# preference penalty, not gross, so the §-2/§-4 "trade penalty for gross" stance
+# has inverted. At 2.0 a crossing must net MORE than a full extra rest penalty
+# after already paying one (gross-mileage > 2× night_pen) → only genuinely huge
+# evening hauls cross, which both lowers the mean penalty and shrinks the run-to-
+# run penalty variance (§2) that drags our floor down. Env-tunable for sweeps;
+# set 1.5 (or 1.0) to restore the more aggressive crossing behaviour.
+_NIGHT_CROSS_MARGIN = max(1.0, float(os.environ.get("AGENT_NIGHT_CROSS_MARGIN", "2.0")))
 # Thinking mode for the per-step decision call. Default ON (submission runs
 # with thinking); set AGENT_DECISION_THINKING=0 to disable. Measured on the
 # finals gateway (qwen3.7-plus) with real decision prompts: ~22s avg latency
@@ -148,9 +155,16 @@ _CHAIN_VALUE_WEIGHT = max(0.0, float(os.environ.get("AGENT_CHAIN_VALUE_WEIGHT", 
 _ABS_NET_ALPHA = max(0.0, float(os.environ.get("AGENT_ABS_NET_ALPHA", "0.0")))
 # A2 — multi-day night crossing: allow a very large haul to run PAST the end of
 # the nightly rest window into the next day(s), pricing one rest penalty PER
-# crossed window instead of hard-rejecting. 1 == legacy (finish must stay inside
-# the same window). Bounded by the month horizon and the per-crossing margin.
-_NIGHT_CROSS_MAX_DAYS = max(1, int(os.environ.get("AGENT_NIGHT_CROSS_MAX_DAYS", "2")))
+# crossed window instead of hard-rejecting. 1 == finish must stay inside the same
+# window (at most one penalised crossing per haul).
+# [D3] Default lowered 2 → 1 (notes §-6): multi-day crossings are pure penalty
+# risk — each extra night is a GUARANTEED extra per-day rest penalty plus the
+# compounding hidden cost (next-morning compression, stacked daily rules, longer
+# gateway-noise exposure). With the gap to #1 being entirely preference penalty,
+# the safe default is to not run through more than one rest window. Set 2+ on the
+# platform (together with AGENT_NIGHT_CROSS_EXTRA_MARGIN_PER_DAY) only if a sweep
+# shows the unlocked multi-day gross beats the extra penalty.
+_NIGHT_CROSS_MAX_DAYS = max(1, int(os.environ.get("AGENT_NIGHT_CROSS_MAX_DAYS", "1")))
 # A2 — extra safety margin charged PER ADDITIONAL crossed night for multi-day
 # crossings. A 2+ day crossing keeps the truck driving through several rest
 # windows: each extra night both guarantees another per-day penalty AND

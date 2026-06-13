@@ -117,8 +117,12 @@ def test_big_evening_order_crosses_window_when_net_beats_penalty() -> None:
     svc = _svc()
     rules = _rules()
     cargo, item = _cargo(price=5000.0, cost_time=300)  # 18:00 -> 23:00
-    # day_end clamped at the 21:00 window start (what the scheduler passes)
-    ev = _eval(svc, rules, cargo, item, now=1080, day_end=1260)
+    # day_end clamped at the 21:00 window start (what the scheduler passes).
+    # Pinned at margin 1.5 to exercise the crossing mechanism itself; the
+    # production default was tightened to 2.0 (notes §-6) where a 5000 order no
+    # longer clears a 2700 penalty by the required margin — see the dedicated
+    # margin tests below for the default-value behaviour.
+    ev = _eval_with_margin(1.5, svc, rules, cargo, item, now=1080, day_end=1260)
     assert ev is not None, "big profitable evening order must be accepted"
     net, _req, occupied, _pk = ev
     # net is reported AFTER the rest penalty is subtracted
@@ -252,8 +256,9 @@ def _eval_with_margin(margin, svc, rules, cargo, item, now, day_end):
 
 def test_default_margin_rejects_thin_crossing() -> None:
     """A crossing whose net only just beats the rest penalty (net=800 < the
-    1350 = penalty*(1.5-1) margin) is dropped by the default 1.5 margin — these
-    thin crossings drove the leaderboard penalty up without enough gross."""
+    1350 = penalty*(1.5-1) margin) is dropped at margin 1.5 — these thin
+    crossings drove the leaderboard penalty up without enough gross. (The
+    production default is now 2.0, which is even stricter; notes §-6.)"""
     svc = _svc()
     rules = _rules()
     # zero-distance haul => net == price - penalty == 3500 - 2700 == 800
@@ -275,7 +280,7 @@ def test_legacy_margin_accepts_thin_crossing() -> None:
 
 def test_big_crossing_survives_default_margin() -> None:
     """A genuinely big evening haul (net well above the penalty) is still taken
-    under the default margin — the feature's intent is preserved."""
+    at margin 1.5 — the feature's intent is preserved for big hauls."""
     svc = _svc()
     rules = _rules()
     # net == 6000 - 2700 == 3300 > penalty*(1.5-1)=1350

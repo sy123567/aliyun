@@ -201,6 +201,23 @@ def _crossing_cargo(price, cost_time):
     return cargo, {"cargo": cargo, "distance_km": 0.0}
 
 
+class _crossing_knobs:
+    """Pin the crossing knobs so these mechanism tests are independent of the
+    (compliance-ward) default values, which are tuned separately (notes §-6)."""
+
+    def __init__(self, *, margin=1.5, max_days=2, extra=0.0):
+        self._vals = (margin, max_days, extra)
+
+    def __enter__(self):
+        self._orig = (mds._NIGHT_CROSS_MARGIN, mds._NIGHT_CROSS_MAX_DAYS, mds._NIGHT_CROSS_EXTRA_MARGIN_PER_DAY)
+        mds._NIGHT_CROSS_MARGIN, mds._NIGHT_CROSS_MAX_DAYS, mds._NIGHT_CROSS_EXTRA_MARGIN_PER_DAY = self._vals
+        return self
+
+    def __exit__(self, *exc):
+        mds._NIGHT_CROSS_MARGIN, mds._NIGHT_CROSS_MAX_DAYS, mds._NIGHT_CROSS_EXTRA_MARGIN_PER_DAY = self._orig
+        return False
+
+
 def test_two_day_crossing_counted() -> None:
     svc = ModelDecisionService(_StubApi())
     # depart 16:40 day0, run 2000 min -> crosses day0 AND day1 night windows
@@ -212,9 +229,10 @@ def test_extra_margin_default_is_noop_for_multiday() -> None:
     a 2-day crossing with net just above the flat margin is still accepted."""
     svc = ModelDecisionService(_StubApi())
     rules = _night_rules(pen=500.0)
-    # net = 1800 - 1000(2*pen) = 800; flat required = 1000*(1.5-1)=500 -> accept
-    cargo, item = _crossing_cargo(price=1800.0, cost_time=2000)
-    ev = svc._evaluate_cargo(cargo, item, rules, set(), 1000, 10 ** 7, LAT, LNG)
+    with _crossing_knobs(margin=1.5, max_days=2, extra=0.0):
+        # net = 1800 - 1000(2*pen) = 800; flat required = 1000*(1.5-1)=500 -> accept
+        cargo, item = _crossing_cargo(price=1800.0, cost_time=2000)
+        ev = svc._evaluate_cargo(cargo, item, rules, set(), 1000, 10 ** 7, LAT, LNG)
     assert ev is not None and abs(ev[0] - 800.0) < 1.0, ev
 
 
@@ -223,17 +241,13 @@ def test_extra_margin_rejects_thin_multiday_crossing() -> None:
     rejected (each extra night demands more penalty-free net)."""
     svc = ModelDecisionService(_StubApi())
     rules = _night_rules(pen=500.0)
-    original = mds._NIGHT_CROSS_EXTRA_MARGIN_PER_DAY
-    mds._NIGHT_CROSS_EXTRA_MARGIN_PER_DAY = 1.0
-    try:
+    with _crossing_knobs(margin=1.5, max_days=2, extra=1.0):
         # required = 500 (flat) + 500*1.0*(2-1)=500 -> 1000; net 800 <= 1000 -> reject
         cargo, item = _crossing_cargo(price=1800.0, cost_time=2000)
         assert svc._evaluate_cargo(cargo, item, rules, set(), 1000, 10 ** 7, LAT, LNG) is None
         # a genuinely huge 2-day haul still clears the raised bar
         big_cargo, big_item = _crossing_cargo(price=4000.0, cost_time=2000)  # net 3000 > 1000
         assert svc._evaluate_cargo(big_cargo, big_item, rules, set(), 1000, 10 ** 7, LAT, LNG) is not None
-    finally:
-        mds._NIGHT_CROSS_EXTRA_MARGIN_PER_DAY = original
 
 
 def test_extra_margin_does_not_touch_single_day_crossing() -> None:
@@ -241,15 +255,11 @@ def test_extra_margin_does_not_touch_single_day_crossing() -> None:
     crossing is unaffected even when the knob is on."""
     svc = ModelDecisionService(_StubApi())
     rules = _night_rules(pen=500.0)
-    original = mds._NIGHT_CROSS_EXTRA_MARGIN_PER_DAY
-    mds._NIGHT_CROSS_EXTRA_MARGIN_PER_DAY = 1.0
-    try:
+    with _crossing_knobs(margin=1.5, max_days=2, extra=1.0):
         # depart 16:40, run 400 min -> finish 23:20 same day: 1 crossing only
         cargo, item = _crossing_cargo(price=900.0, cost_time=400)  # net 400 > flat 250
         ev = svc._evaluate_cargo(cargo, item, rules, set(), 1000, 10 ** 7, LAT, LNG)
-        assert ev is not None and abs(ev[0] - 400.0) < 1.0, ev
-    finally:
-        mds._NIGHT_CROSS_EXTRA_MARGIN_PER_DAY = original
+    assert ev is not None and abs(ev[0] - 400.0) < 1.0, ev
 
 
 def _run() -> int:
