@@ -548,8 +548,11 @@ def test_decision_prompt_contains_market_table() -> None:
 
 
 def test_thinking_disabled_when_wall_budget_projected_exceeded() -> None:
-    """Thinking mode must hand the driver back to fast mode when the run is
-    projected past the per-driver wall budget (finals 4h cap is a hard kill)."""
+    """Legacy permanent-disable guard (AGENT_THINKING_SELECTIVE=0): thinking
+    hands the driver back to fast mode when the run is projected past the
+    per-driver wall budget (finals 4h cap is a hard kill). The default selective
+    mode enforces the same 4h safety via a cumulative cap — see
+    test_selective_thinking.py::test_cumulative_cap_disables_thinking."""
     import agent.model_decision_service as mds
     import time as _time
 
@@ -561,7 +564,9 @@ def test_thinking_disabled_when_wall_budget_projected_exceeded() -> None:
     # pretend the run started long ago: way over the pro-rated budget
     svc._wall_start["DG50"] = _time.time() - mds._THINKING_WALL_BUDGET_SECONDS
     old = mds._DECISION_THINKING
+    old_sel = mds._THINKING_SELECTIVE
     mds._DECISION_THINKING = True
+    mds._THINKING_SELECTIVE = False  # exercise the legacy guard explicitly
     try:
         from agent.model_decision_service import DecisionHistory
         svc._llm_decide_with_history(
@@ -577,6 +582,7 @@ def test_thinking_disabled_when_wall_budget_projected_exceeded() -> None:
         assert "DG51" not in svc._thinking_off
     finally:
         mds._DECISION_THINKING = old
+        mds._THINKING_SELECTIVE = old_sel
 
 
 def main() -> int:
