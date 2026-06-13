@@ -115,6 +115,26 @@ _DECISION_THINKING = os.environ.get("AGENT_DECISION_THINKING", "1").strip() not 
 # so more steps can afford thinking. The pro-rated guard below still hard-stops
 # before 4h, so this only spends otherwise-idle wall-clock budget.
 _THINKING_WALL_BUDGET_SECONDS = float(os.environ.get("AGENT_THINKING_WALL_BUDGET_SECONDS", "6600"))
+# [D1] Selective thinking. The submission ran with the *permanent* runtime guard
+# above: as soon as the early-season wall time exceeded the budget pro-rated by
+# (tiny) simulation progress, thinking was switched off for the WHOLE season and
+# never came back — the leaderboard run shows avg ~2.9s/step and only ~2.0M
+# tokens used (out of 10M for two drivers), i.e. thinking effectively never ran
+# and the spare reasoning budget was wasted. Selective mode instead (a) keeps a
+# HARD cumulative thinking-time cap per driver (never risks the 4h finals kill),
+# (b) gates per-step on a self-regulating pro-rated pace (so the budget is spread
+# across the season instead of burned in the first hour), and (c) only spends the
+# expensive reasoning on *high-stakes* steps — the decisions that actually move
+# net income (a big-net candidate on the table, category-deadline pressure). All
+# other steps stay in fast mode. This converts the otherwise-idle token/wall
+# budget into better picks on the few decisions that matter. Set 0 for the legacy
+# permanent-disable behaviour.
+_THINKING_SELECTIVE = os.environ.get("AGENT_THINKING_SELECTIVE", "1").strip() not in ("0", "false", "False")
+# A step counts as high-stakes (worth thinking) when the best candidate's
+# absolute net is at least this, OR there is unmet category-quota pressure (those
+# are the picks where deep chain/penalty reasoning changes the monthly net most).
+# Env-tunable; calibrate on the platform (notes §2).
+_THINKING_HIGH_STAKES_NET = float(os.environ.get("AGENT_THINKING_HIGH_STAKES_NET", "1500"))
 # --- value-layer "balanced" optimisation knobs (plan A/B/C; all env-tunable so
 #     the optimum can be swept on the official platform, see notes §2) -------
 # A1 — chain value: an order whose drop-off city has a liquid follow-up market
@@ -131,6 +151,19 @@ _ABS_NET_ALPHA = max(0.0, float(os.environ.get("AGENT_ABS_NET_ALPHA", "0.0")))
 # crossed window instead of hard-rejecting. 1 == legacy (finish must stay inside
 # the same window). Bounded by the month horizon and the per-crossing margin.
 _NIGHT_CROSS_MAX_DAYS = max(1, int(os.environ.get("AGENT_NIGHT_CROSS_MAX_DAYS", "2")))
+# A2 — extra safety margin charged PER ADDITIONAL crossed night for multi-day
+# crossings. A 2+ day crossing keeps the truck driving through several rest
+# windows: each extra night both guarantees another per-day penalty AND
+# compounds the hidden cost the single-penalty model ignores (next-morning
+# compression, stacked daily rules, longer exposure to gross-income gateway
+# noise — notes §-3). So beyond the flat ``_NIGHT_CROSS_MARGIN`` we require an
+# additional ``night_pen * extra`` of penalty-free net for every crossed night
+# past the first. 0 == no extra (legacy: only the flat per-crossing margin),
+# so the default is a strict no-op and existing single-day crossings are
+# unaffected. Raise it on the platform to trim the marginal multi-day crossings
+# that pushed the preference penalty up without hard-rejecting the genuinely
+# huge multi-day hauls.
+_NIGHT_CROSS_EXTRA_MARGIN_PER_DAY = max(0.0, float(os.environ.get("AGENT_NIGHT_CROSS_EXTRA_MARGIN_PER_DAY", "0")))
 # A3 — weak-local reposition: when the best locally-pickable order's efficiency
 # is below this net-per-hour, prefer an anti-strand reposition toward a richer
 # observed market instead of locking the day into the weak order. 0 == off
@@ -733,6 +766,10 @@ class ModelDecisionService:
         # switched off by the runtime-budget guard (finals 4h hard cap).
         self._wall_start: dict[str, float] = {}
         self._thinking_off: set[str] = set()
+        # [D1] Cumulative wall-clock seconds spent in thinking-mode decisions per
+        # driver. Selective mode caps this at _THINKING_WALL_BUDGET_SECONDS so the
+        # spare reasoning budget is spent without ever risking the 4h finals cap.
+        self._thinking_spent: dict[str, float] = {}
 
     def _query_cargo(self, driver_id: str, latitude: float, longitude: float, k: int) -> dict[str, Any]:
         """query_cargo wrapper that caches cargo metadata for every scanned item.
@@ -1294,11 +1331,33 @@ class ModelDecisionService:
             f"请做出决策（只输出JSON）:"
         )
 
-        # Thinking-mode runtime guard: pro-rate the per-driver wall budget by
-        # simulation progress; once the run projects past it, drop to fast
-        # mode for the rest of the season (the finals 4h cap is a hard kill).
+        # Thinking-mode runtime guard. The finals 4h total-runtime cap is a hard
+        # kill, so thinking time is always bounded by the per-driver wall budget.
         use_thinking = _DECISION_THINKING and driver_id not in self._thinking_off
-        if use_thinking:
+        if use_thinking and _THINKING_SELECTIVE:
+            # [D1] Selective mode: spend the (otherwise idle) reasoning budget on
+            # the few decisions that move net income, spread across the season,
+            # under a hard cumulative cap — instead of the legacy behaviour that
+            # burned the early budget then disabled thinking for the whole run.
+            spent = self._thinking_spent.get(driver_id, 0.0)
+            sim_frac = min(1.0, now / float(MONTH_DAYS * DAY_MINUTES))
+            # (a) hard cumulative cap — total thinking time per driver can never
+            #     exceed the budget (the 4h-cap safety the legacy guard provided).
+            over_total = spent >= _THINKING_WALL_BUDGET_SECONDS
+            # (b) self-regulating pace — don't burn the whole budget up front; the
+            #     allowance grows with simulation progress and reopens once the
+            #     run falls back under the pro-rated line (unlike the permanent
+            #     legacy disable that never recovered).
+            over_pace = sim_frac > 0.02 and spent > _THINKING_WALL_BUDGET_SECONDS * sim_frac
+            # (c) high-stakes only — a big-net candidate on the table or unmet
+            #     category-quota pressure; routine/low-value steps stay fast.
+            top_net = max((float(r.get("net", 0) or 0) for r in cargo_summary), default=0.0)
+            high_stakes = top_net >= _THINKING_HIGH_STAKES_NET or (cat_target and cat_needed > 0)
+            use_thinking = (not over_total) and (not over_pace) and bool(high_stakes)
+        elif use_thinking:
+            # Legacy permanent-disable guard: pro-rate the per-driver wall budget
+            # by simulation progress; once the run projects past it, drop to fast
+            # mode for the rest of the driver's season.
             wall_start = self._wall_start.get(driver_id)
             sim_frac = min(1.0, now / float(MONTH_DAYS * DAY_MINUTES))
             if wall_start is not None and sim_frac > 0.02:
@@ -1329,8 +1388,15 @@ class ModelDecisionService:
             }
             if use_thinking:
                 req["enable_thinking"] = True
+            api_start = time.time()
             resp = self._api.model_chat_completion(req)
             elapsed = time.time() - start_time
+            # [D1] Charge thinking calls against the per-driver cumulative budget
+            # so selective gating (above) keeps total thinking time bounded.
+            if use_thinking:
+                self._thinking_spent[driver_id] = (
+                    self._thinking_spent.get(driver_id, 0.0) + (time.time() - api_start)
+                )
 
             # Timeout check: if >60s, log warning (for next iteration consider disabling thinking)
             if elapsed > 60:
@@ -3023,8 +3089,16 @@ class ModelDecisionService:
         # drops the thin crossings whose realised cost (uncertain gross + next-
         # morning compression + possible stacked daily rules) tends to exceed
         # the single penalty the model charged — the leaderboard regression.
-        if crossed_night_pen > 0.0 and net <= crossed_night_pen * (_NIGHT_CROSS_MARGIN - 1.0):
-            return None
+        if crossed_night_pen > 0.0:
+            required_margin = crossed_night_pen * (_NIGHT_CROSS_MARGIN - 1.0)
+            # [A2] Multi-day crossings (crossings > 1) carry compounding hidden
+            # cost beyond the per-day penalty already in ``net``; demand extra
+            # penalty-free net for every night past the first. Default 0 → no-op
+            # (single-day crossings are never affected by this term).
+            if _NIGHT_CROSS_EXTRA_MARGIN_PER_DAY > 0.0 and crossings > 1:
+                required_margin += float(night_pen) * _NIGHT_CROSS_EXTRA_MARGIN_PER_DAY * (crossings - 1)
+            if net <= required_margin:
+                return None
         # Apply avoid_categories soft penalty
         net *= avoid_penalty
         touches_required = False
