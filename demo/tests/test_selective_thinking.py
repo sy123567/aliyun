@@ -87,6 +87,22 @@ def _last_thinking(api) -> bool:
 
 
 # ===================================================== D1: high-stakes gating
+#
+# NOTE: selective thinking is DEFAULT OFF (it caused a 4h-cap timeout on the
+# platform — notes §-7). These tests pin it ON to validate the *mechanism* that
+# is retained behind the flag for a future where the per-season step count is low
+# enough to afford thinking.
+
+class _selective_on:
+    def __enter__(self):
+        self._orig = mds._THINKING_SELECTIVE
+        mds._THINKING_SELECTIVE = True
+        return self
+
+    def __exit__(self, *exc):
+        mds._THINKING_SELECTIVE = self._orig
+        return False
+
 
 def test_big_net_candidate_triggers_thinking() -> None:
     """A candidate whose net clears the high-stakes threshold makes the step
@@ -94,7 +110,8 @@ def test_big_net_candidate_triggers_thinking() -> None:
     big = _cargo("BIG", price=3000.0, cost_time=120)  # zero-dist net 3000 >= 1500
     api = _StubApi([big], progress=480)
     svc = ModelDecisionService(api)
-    _decide_once(svc, api, DriverRules(), now=480, day=0, tod=480)
+    with _selective_on():
+        _decide_once(svc, api, DriverRules(), now=480, day=0, tod=480)
     assert _last_thinking(api) is True
     assert api.payloads[-1]["max_tokens"] == 2000
     # the thinking call was charged against the per-driver cumulative budget
@@ -107,7 +124,8 @@ def test_low_stakes_step_stays_fast() -> None:
     small = _cargo("S", price=400.0, cost_time=120)  # net 400 < 1500
     api = _StubApi([small], progress=480)
     svc = ModelDecisionService(api)
-    _decide_once(svc, api, DriverRules(), now=480, day=0, tod=480)
+    with _selective_on():
+        _decide_once(svc, api, DriverRules(), now=480, day=0, tod=480)
     assert _last_thinking(api) is False
     assert api.payloads[-1]["max_tokens"] == 180
     assert "D" not in svc._thinking_spent  # nothing charged
@@ -122,7 +140,8 @@ def test_category_pressure_triggers_thinking_even_on_small_orders() -> None:
     rules = DriverRules()
     rules.monthly_category_targets = {0: {"水果": 12}}
     rules.rule_penalties["category_targets"] = 500.0
-    _decide_once(svc, api, rules, now=480, day=0, tod=480)
+    with _selective_on():
+        _decide_once(svc, api, rules, now=480, day=0, tod=480)
     assert _last_thinking(api) is True
 
 
@@ -133,7 +152,8 @@ def test_cumulative_cap_disables_thinking() -> None:
     api = _StubApi([big], progress=480)
     svc = ModelDecisionService(api)
     svc._thinking_spent["D"] = mds._THINKING_WALL_BUDGET_SECONDS  # fully spent
-    _decide_once(svc, api, DriverRules(), now=480, day=0, tod=480)
+    with _selective_on():
+        _decide_once(svc, api, DriverRules(), now=480, day=0, tod=480)
     assert _last_thinking(api) is False
 
 
@@ -147,23 +167,21 @@ def test_pace_gate_throttles_when_ahead_of_budget() -> None:
     # spent above budget*0.5 (over pace) but below the total budget (not capped)
     svc._thinking_spent["D"] = mds._THINKING_WALL_BUDGET_SECONDS * 0.5 + 100.0
     day = half // mds.DAY_MINUTES
-    _decide_once(svc, api, DriverRules(), now=half, day=day, tod=half % mds.DAY_MINUTES)
+    with _selective_on():
+        _decide_once(svc, api, DriverRules(), now=half, day=day, tod=half % mds.DAY_MINUTES)
     assert _last_thinking(api) is False
 
 
-def test_selective_can_be_disabled_for_legacy_behaviour() -> None:
-    """With selective off and no permanent disable yet, thinking runs as before
-    (legacy guard); selective gating must not be the only path to thinking."""
+def test_selective_off_by_default_uses_legacy_guard() -> None:
+    """Default (selective OFF): thinking falls through to the legacy guard, which
+    keeps it on until projected past the wall budget — the proven-safe PR78
+    timing behaviour that avoided the 4h timeout."""
+    assert mds._THINKING_SELECTIVE is False, "selective thinking must default OFF (timeout, §-7)"
     big = _cargo("BIG", price=3000.0, cost_time=120)
     api = _StubApi([big], progress=480)
     svc = ModelDecisionService(api)
-    original = mds._THINKING_SELECTIVE
-    mds._THINKING_SELECTIVE = False
-    try:
-        _decide_once(svc, api, DriverRules(), now=480, day=0, tod=480)
-        assert _last_thinking(api) is True
-    finally:
-        mds._THINKING_SELECTIVE = original
+    _decide_once(svc, api, DriverRules(), now=480, day=0, tod=480)
+    assert _last_thinking(api) is True  # legacy guard, wall_start unset -> stays on
 
 
 def test_thinking_off_when_decision_thinking_disabled() -> None:

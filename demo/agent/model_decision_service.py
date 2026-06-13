@@ -122,21 +122,20 @@ _DECISION_THINKING = os.environ.get("AGENT_DECISION_THINKING", "1").strip() not 
 # so more steps can afford thinking. The pro-rated guard below still hard-stops
 # before 4h, so this only spends otherwise-idle wall-clock budget.
 _THINKING_WALL_BUDGET_SECONDS = float(os.environ.get("AGENT_THINKING_WALL_BUDGET_SECONDS", "6600"))
-# [D1] Selective thinking. The submission ran with the *permanent* runtime guard
-# above: as soon as the early-season wall time exceeded the budget pro-rated by
-# (tiny) simulation progress, thinking was switched off for the WHOLE season and
-# never came back — the leaderboard run shows avg ~2.9s/step and only ~2.0M
-# tokens used (out of 10M for two drivers), i.e. thinking effectively never ran
-# and the spare reasoning budget was wasted. Selective mode instead (a) keeps a
-# HARD cumulative thinking-time cap per driver (never risks the 4h finals kill),
-# (b) gates per-step on a self-regulating pro-rated pace (so the budget is spread
-# across the season instead of burned in the first hour), and (c) only spends the
-# expensive reasoning on *high-stakes* steps — the decisions that actually move
-# net income (a big-net candidate on the table, category-deadline pressure). All
-# other steps stay in fast mode. This converts the otherwise-idle token/wall
-# budget into better picks on the few decisions that matter. Set 0 for the legacy
-# permanent-disable behaviour.
-_THINKING_SELECTIVE = os.environ.get("AGENT_THINKING_SELECTIVE", "1").strip() not in ("0", "false", "False")
+# [D1] Selective thinking. ⚠️ DEFAULT OFF — turning this ON caused a 4h-CAP
+# TIMEOUT on the platform (notes §-7): the 2026-06-13 15:39 submission ran with
+# selective thinking enabled and was scored "评测超时，按已完成步数结算"
+# (timed out, settled on completed steps only) → net −17675 / penalty 102500.
+# Root cause: the spare ~7-8M tokens are NOT spendable — the binding constraint
+# is the 4h total-runtime cap, and our agent makes too many decision steps for
+# thinking (~22s/step) to fit. The legacy permanent-disable guard (below) is what
+# kept PR78 under 4h (avg ~2.9s/step). #1 baseline affords thinking (5.55s/step)
+# only because it makes far fewer steps than we do. So thinking is infeasible for
+# us until the per-season step count is cut. The selective mechanism (hard
+# cumulative cap + self-regulating pace + high-stakes-only) is retained behind
+# this flag for that future, but MUST stay off until step count drops — do not
+# enable on the official platform without first proving the run finishes < 4h.
+_THINKING_SELECTIVE = os.environ.get("AGENT_THINKING_SELECTIVE", "0").strip() not in ("0", "false", "False")
 # A step counts as high-stakes (worth thinking) when the best candidate's
 # absolute net is at least this, OR there is unmet category-quota pressure (those
 # are the picks where deep chain/penalty reasoning changes the monthly net most).
