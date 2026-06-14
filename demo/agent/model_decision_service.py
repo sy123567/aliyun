@@ -53,10 +53,12 @@ LONGHAUL_PENALTY = 1000.0
 _STRAND_MIN_BUDGET = 240
 _ORDER_DEADLINE_BUFFER_MIN = 10
 # Candidate list / market table sizes shown to the decision LLM. The finals
-# token budget (5M/driver) is barely 21% used at submission, so widening the
-# context the thinking model reasons over is "free" value-side spend. Tunable
-# via env for platform sweeps.
-_LLM_CARGO_SUMMARY_LIMIT = int(os.environ.get("AGENT_LLM_CARGO_SUMMARY_LIMIT", "18"))
+# token budget (5M/driver) is barely 21% used at submission while the #1 team
+# spends ~3.08M/driver, so widening the per-step context the (now fast, see
+# _DECISION_THINKING) LLM picks over is the cheapest way to convert that idle
+# token budget into better value-side decisions (higher gross). Raised 18 → 24.
+# Tunable via env for platform sweeps (notes §2 — calibrate across runs).
+_LLM_CARGO_SUMMARY_LIMIT = int(os.environ.get("AGENT_LLM_CARGO_SUMMARY_LIMIT", "24"))
 _MIN_BOUNDED_AREA_SPAN = 0.1
 # Fixed non-earning overhead (minutes) amortised per order when RANKING
 # candidates. Pure net-per-minute ranking systematically under-ranks big/long
@@ -73,7 +75,11 @@ _ORDER_TIME_OVERHEAD_MIN = float(os.environ.get("AGENT_ORDER_TIME_OVERHEAD_MIN",
 # how many cargo were seen departing each city recently and at what value.
 # Feeds chain-aware order choice (an order into a dead city strands the truck).
 _LIQ_WINDOW_MIN = 3 * DAY_MINUTES
-_LIQ_TOP_N = int(os.environ.get("AGENT_LIQ_TOP_N", "8"))
+# Active-market rows shown to the decision LLM (chain/reposition context).
+# Raised 8 → 12 alongside _LLM_CARGO_SUMMARY_LIMIT: with thinking off, spending
+# the spare token budget on a richer observed-market table is what lets the fast
+# LLM choose higher-value chains / repositions (toward the leader's gross).
+_LIQ_TOP_N = int(os.environ.get("AGENT_LIQ_TOP_N", "12"))
 # If the LLM asks for a long strategic wait while a compliant candidate at or
 # above this net-per-hour is on the table, take the order instead (the known
 # failure mode of LLM-in-the-loop runs was idling away strong orders). Lowered
@@ -98,12 +104,21 @@ _LLM_WAIT_OVERRIDE_NET_PER_H = float(os.environ.get("AGENT_LLM_WAIT_OVERRIDE_NET
 # keeps the genuinely big hauls (the feature's intent) while dropping the thin
 # crossings that drove the penalty up. Env-tunable for platform sweeps (§2).
 _NIGHT_CROSS_MARGIN = max(1.0, float(os.environ.get("AGENT_NIGHT_CROSS_MARGIN", "1.5")))
-# Thinking mode for the per-step decision call. Default ON (submission runs
-# with thinking); set AGENT_DECISION_THINKING=0 to disable. Measured on the
-# finals gateway (qwen3.7-plus) with real decision prompts: ~22s avg latency
-# per LLM decision (vs ~2s without) and ~+800 reasoning tokens/step
-# (~2.3M total/driver projected — still within the 5M cap).
-_DECISION_THINKING = os.environ.get("AGENT_DECISION_THINKING", "1").strip() not in ("0", "false", "False")
+# Thinking mode for the per-step decision call. Default **OFF** as of the
+# 2026-06-14 leaderboard review: the #1 team (USTC "baseline") scores net
+# 116876 at only 15400 penalty while spending ~3.08M tokens/driver at ~5.55s
+# avg decision latency — a profile consistent with an every-step *fast* LLM on
+# rich prompts, NOT with reasoning chains (thinking measured ~22s/step on this
+# gateway). Our own thinking runs blew the hard 4h finals cap, so the wall-clock
+# guard kept auto-disabling thinking (submission avg ~2.9-3.9s/step ⇒ thinking
+# barely ran and the reasoning budget was wasted, notes §-5); worse, the few
+# steps where it DID fire spent wall-clock that forced fast mode elsewhere and
+# coincided with a penalty regression (45100 vs the ~25-31k of earlier fast-only
+# runs). Turning thinking off frees the entire wall-clock budget for every-step
+# fast decisions on wider context (see _LLM_CARGO_SUMMARY_LIMIT / _LIQ_TOP_N
+# below), which is how the leaderboard leader converts spare token budget into
+# gross income. Set AGENT_DECISION_THINKING=1 to restore the old thinking path.
+_DECISION_THINKING = os.environ.get("AGENT_DECISION_THINKING", "0").strip() not in ("0", "false", "False")
 # The finals impose a HARD 4-hour total-runtime cap. Thinking at ~22s/step
 # projects to ~1.9h/driver (≈3.9h for two drivers) — no safety margin. Each
 # driver therefore gets a wall-clock budget; when the run is projected to
