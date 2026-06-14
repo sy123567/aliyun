@@ -33,7 +33,12 @@ competition: an LLM-driven truck-driver decision agent that maximises monthly
 ### Behaviour knobs
 Agent behaviour is tuned via `AGENT_*` env vars read at import in
 `model_decision_service.py`. Defaults are the submission values; sweep on the
-official platform, not via single local runs. Current knobs include:
+official platform, not via single local runs. The value-side gross-income knobs
+(`AGENT_ABS_NET_ALPHA` default **0.2**, `AGENT_CHAIN_VALUE_WEIGHT` default **0.45**,
+`AGENT_LLM_WAIT_OVERRIDE_NET_PER_H` default **50**) only re-rank/pick among
+candidates that already passed the `net>0` feasibility + compliance filter, so
+they raise gross without adding preference penalty; the night-crossing knobs are
+the ones that trade penalty for gross. Current knobs include:
 `AGENT_NIGHT_CROSS_MARGIN`, `AGENT_NIGHT_CROSS_MAX_DAYS`,
 `AGENT_ORDER_TIME_OVERHEAD_MIN`, `AGENT_CHAIN_VALUE_WEIGHT`, `AGENT_ABS_NET_ALPHA`,
 `AGENT_WEAK_LOCAL_REPOSITION_NET_PER_H` (default 0 = off), `AGENT_PENALTY_CAP_CREDIT`,

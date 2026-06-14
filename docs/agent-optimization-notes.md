@@ -47,9 +47,27 @@
   降序、LLM 仍只能在合规候选里选。提交时 token 仅用了上限的 ~21%（§-1.1），榜首用到 ~3.08M/司机，
   所以加宽上下文是把这段闲置预算转成"更聪明的快速决策"的最便宜杠杆 → 攻毛收入。
 
+### E3. 攻毛收入（只动"合规前已过滤"的价值排名/择单层，按构造扣分中性）
+用户诉求"更多毛收入 + 合理一点扣分"。所有夜穿越/多日穿越等"拿扣分换毛利"的 knob **一律不动**
+（扣分由确定性合规层硬守、§-6 关思考已把扣分往回压），只推**对扣分中性**的三个毛收入杠杆——
+它们都只对**已过 `net>0` 可行性 + 合规检查**的候选重排序/择单，绝不放宽任何约束、绝不新增违规：
+- `AGENT_ABS_NET_ALPHA` 默认 **0 → 0.2**：`_candidate_rank_score` 叠加绝对 net 的对数项，
+  把大单从"被略快的小单埋掉"里捞回到列表/择单前列（§-2 诊断的"最大单没接到"头号根因，
+  此前默认关）。快速 LLM 与确定性 `_pick_order` 同用此分。
+- `AGENT_CHAIN_VALUE_WEIGHT` 默认 **0.3 → 0.45**：更看重卸货城市的接力流动性，卸到旺城就地再装、
+  少空驶 → 整条链全天毛收入更高（卸货城无观测流动性时该项中性）。
+- `AGENT_LLM_WAIT_OVERRIDE_NET_PER_H` 默认 **60 → 50**：LLM 想长等而桌上已有 ≥50元/h 的**合规**单时
+  直接接单——把"等更好的货"这类毛利泄漏再收紧一档（接的都是已过合规的单，不增扣分）。
+
 测试：`test_selective_thinking.py` 新增 `test_thinking_off_by_default_even_on_big_net`（验证默认即便
 大单步也跑快速：无 `enable_thinking`、completion=180、不计思考预算）；原先依赖"默认开思考"的三项用例
-显式 opt-in（`mds._DECISION_THINKING = True`）以继续校验选择性思考机制。全仓 10 个测试文件 **116 项全绿**。
+显式 opt-in（`mds._DECISION_THINKING = True`）以继续校验选择性思考机制。
+`test_balanced_value_layer.py` 新增 `test_rank_score_abs_net_alpha_on_by_default_lifts_big_haul`（验证新
+默认即把大单抬到摊销基线之上），原"中性基线"与"链路加成"两项用例显式钉住 `_ABS_NET_ALPHA = 0` 以隔离各自被测项。
+全仓 10 个测试文件 **117 项全绿**。
+
+> 回退毛收入档（E3）：`AGENT_ABS_NET_ALPHA=0 AGENT_CHAIN_VALUE_WEIGHT=0.3 AGENT_LLM_WAIT_OVERRIDE_NET_PER_H=60`。
+> 若平台多跑发现扣分上抬（理论上 E3 中性、不应发生），优先排查 E1/思考或夜穿越档，而非 E3。
 
 > 回退到 §-5 行为：`AGENT_DECISION_THINKING=1`（恢复选择性思考）+
 > `AGENT_LLM_CARGO_SUMMARY_LIMIT=18 AGENT_LIQ_TOP_N=8`（恢复旧上下文宽度）。
