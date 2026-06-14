@@ -122,6 +122,22 @@ _NIGHT_CROSS_MARGIN = max(1.0, float(os.environ.get("AGENT_NIGHT_CROSS_MARGIN", 
 # involvement scored *worse*, and the leaderboard's near-zero-LLM teams currently
 # out-net our LLM-on submission — so this is the highest-signal A/B to run.
 _DECISION_LLM = os.environ.get("AGENT_DECISION_LLM", "1").strip() not in ("0", "false", "False")
+# Whether to compile preferences with the LLM AT ALL. Default ON (per-text LLM
+# extraction + audit + the per-day compliance directive). Set AGENT_PARSE_LLM=0
+# for a *fully deterministic* "直接解析" agent: every preference is parsed by the
+# local regex engine (_parse_one + _supplement_*) and the per-day LLM directive
+# is skipped. Combined with AGENT_DECISION_LLM=0 this makes decide() issue ZERO
+# model calls — the zero-token / sub-second leaderboard profile (§-8) — at the
+# cost of relying on the regex parser's coverage. The regex parser already
+# handles the 3-month D001 fixture (night window, monthly category quotas +
+# carryover, long-haul cap); the weekend night-rest relaxation that the per-day
+# directive used to supply is reproduced deterministically via
+# DriverRules.weekend_no_drive_shift_min (see §-9). Anything the regex parser
+# cannot express still lands in residual_constraints, but with the decision LLM
+# also off those are not re-read per step — so this mode trades a little recall
+# for determinism/speed and is meant for the multi-run platform A/B, not a
+# single local run (notes §2).
+_PARSE_LLM = os.environ.get("AGENT_PARSE_LLM", "1").strip() not in ("0", "false", "False")
 # Thinking mode for the per-step decision call. Default **OFF** as of the
 # 2026-06-14 leaderboard review: the #1 team (USTC "baseline") scores net
 # 116876 at only 15400 penalty while spending ~3.08M tokens/driver at ~5.55s
@@ -521,6 +537,13 @@ class DriverRules:
         # These concretize calendar-conditional preferences (weekend shifts,
         # dated events, month carryovers) that a static schema cannot express.
         self.daily_directives: dict[int, dict[str, Any]] = {}
+        # Deterministic weekend relaxation of the night no-drive window
+        # ("周末两天可以晚两个小时再休息"): minutes by which the window START is
+        # delayed on Sat/Sun. Set ONLY by the regex parser, so the LLM-on path is
+        # unaffected (None ⇒ no shift). When set it lets a *fully deterministic*
+        # (AGENT_PARSE_LLM=0) run recover the weekend evening hours the per-day
+        # LLM directive would otherwise have unlocked — see no_drive_windows_for.
+        self.weekend_no_drive_shift_min: int | None = None
 
     def no_drive_windows_for(self, day: int) -> list[tuple[int, int]]:
         """Effective no-drive windows for one simulation day.
@@ -538,7 +561,18 @@ class DriverRules:
         """
         directive = self.daily_directives.get(int(day))
         if not directive:
-            return list(self.no_drive_windows)
+            base = list(self.no_drive_windows)
+            shift = self.weekend_no_drive_shift_min
+            if shift and base and _calendar_for_day(day)[2]:
+                # Weekend: delay the night window's START (keep its END), e.g.
+                # 21:00→06:00 becomes 23:00→06:00 — exactly what the per-day LLM
+                # directive used to do, now available with the directive off.
+                shifted: list[tuple[int, int]] = []
+                for s, e in base:
+                    ns = s + shift
+                    shifted.append((ns, e) if ns < e else (s, e))
+                return shifted
+            return base
         extra = [tuple(w) for w in (directive.get("windows") or [])]
         if directive.get("replace") and extra:
             static_cov = sum(e - s for s, e in self.no_drive_windows)
@@ -1845,6 +1879,11 @@ class ModelDecisionService:
         解析结果（fail-safe），且每天最多重试 2 次、结果按天缓存，token
         开销 ~1 次小调用/司机日。
         """
+        # Fully deterministic mode: skip the per-day LLM grounding entirely. The
+        # static parse (incl. the deterministic weekend night-rest relaxation via
+        # DriverRules.weekend_no_drive_shift_min) stays in charge — no network.
+        if not _PARSE_LLM:
+            return
         records = self._pref_records.get(driver_id) or []
         if not records:
             return
@@ -3276,11 +3315,14 @@ class ModelDecisionService:
         coord_map = self._collect_coords(prefs)
         compiled: list[tuple[str, Any, Any]] = []
         for text, penalty, cap in new_items:
-            if self._llm_parse_preferences(driver_id, [text], rules, coord_map, [penalty], [cap]):
+            # AGENT_PARSE_LLM=0 forces the deterministic regex parser for every
+            # text (fully "直接解析"); otherwise try the LLM compile first and fall
+            # back to regex only when the model is unavailable.
+            if _PARSE_LLM and self._llm_parse_preferences(driver_id, [text], rules, coord_map, [penalty], [cap]):
                 compiled.append((text, penalty, cap))
             else:
-                # offline / model unavailable: deterministic regex fallback for
-                # this text only.
+                # offline / model unavailable / parse-LLM disabled: deterministic
+                # regex fallback for this text only.
                 self._parse_one(text, rules, coord_map)
                 self._supplement_basic_rules(text, rules)
                 self._supplement_dated_events(text, rules, coord_map)
@@ -4561,6 +4603,35 @@ class ModelDecisionService:
         if default_month_idx is not None and any(kw in text for kw in ("欠", "补", "接着补", "没完成")):
             rules.category_carryover_months.add(default_month_idx)
 
+    def _supplement_weekend_shift(self, text: str, rules: DriverRules) -> None:
+        """Deterministic weekend night-rest relaxation.
+
+        Phrasings like D001's "但是周末两天可以晚两个小时再休息" relax the standing
+        night no-drive window by N hours on Sat/Sun. The LLM daily directive used
+        to supply this per day; this lets a fully deterministic (AGENT_PARSE_LLM=0)
+        run apply it too. Conservative gates (weekend marker + an explicit
+        delay-by-N-hours phrase + a rest/night context) keep it from firing on
+        unrelated text. The shift is only ever *applied* when a night window
+        actually exists (see no_drive_windows_for), so parsing it before the
+        night fail-safe runs is safe.
+        """
+        if rules.weekend_no_drive_shift_min is not None:
+            return
+        if not any(kw in text for kw in (
+            "周末", "双休", "礼拜六", "礼拜天", "礼拜日", "星期六", "星期日", "星期天", "周六", "周日",
+        )):
+            return
+        if not any(kw in text for kw in (
+            "休息", "睡", "收车", "收工", "歇", "停车", "熄火", "不出车", "不接单", "不空驶", "夜",
+        )):
+            return
+        m = re.search(r"(?:晚|推迟|延后|迟|多跑|晚点)\s*([零一二两三四五六七八九十\d]+)\s*(?:个)?\s*(?:小时|个钟|钟头)", text)
+        if not m:
+            return
+        hours = _cn_to_int(m.group(1))
+        if 0 < hours <= 6:
+            rules.weekend_no_drive_shift_min = hours * 60
+
     def _supplement_allowed_regions(self, text: str, rules: DriverRules) -> None:
         strong_kws = ("只跑", "只接", "只在", "仅在", "限定", "不出", "不离开", "不离", "固定在", "范围内", "区域内")
         if not any(kw in text for kw in strong_kws):
@@ -5064,6 +5135,7 @@ class ModelDecisionService:
             if req > 0 and 18 <= mlat <= 55 and 70 <= mlng <= 140:
                 rules.must_visit.append({"lat": mlat, "lng": mlng, "radius_km": radius, "required_days": req})
         self._supplement_category_targets(text, rules)
+        self._supplement_weekend_shift(text, rules)
 
     def _supplement_dated_events(
         self, text: str, rules: DriverRules, coord_map: dict[str, tuple[float, float]]
@@ -5241,6 +5313,7 @@ class ModelDecisionService:
             if hm_m:
                 rules.haul_max_km = float(_cn_to_int(hm_m.group(1)))
         self._supplement_category_targets(text, rules)
+        self._supplement_weekend_shift(text, rules)
 
     # ----------------------------------------------------- small text parsers
     @staticmethod
