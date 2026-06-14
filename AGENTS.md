@@ -37,9 +37,14 @@ official platform, not via single local runs. Current knobs include:
 `AGENT_NIGHT_CROSS_MARGIN`, `AGENT_NIGHT_CROSS_MAX_DAYS`,
 `AGENT_ORDER_TIME_OVERHEAD_MIN`, `AGENT_CHAIN_VALUE_WEIGHT`, `AGENT_ABS_NET_ALPHA`,
 `AGENT_WEAK_LOCAL_REPOSITION_NET_PER_H` (default 0 = off), `AGENT_PENALTY_CAP_CREDIT`,
-`AGENT_CATEGORY_SOFT`, `AGENT_LLM_WAIT_OVERRIDE_NET_PER_H`, `AGENT_DECISION_THINKING`,
+`AGENT_CATEGORY_SOFT`, `AGENT_LLM_WAIT_OVERRIDE_NET_PER_H`,
+`AGENT_DECISION_THINKING` (default **0 = OFF** as of 2026-06-14 — the per-step decision
+LLM runs in fast mode; set 1 to restore the old selective-thinking path),
 `AGENT_THINKING_WALL_BUDGET_SECONDS`, `AGENT_THINKING_SELECTIVE` (default 1 = spend the
-idle reasoning budget only on high-stakes steps under a hard cumulative cap),
-`AGENT_THINKING_HIGH_STAKES_NET` (default 1500), `AGENT_NIGHT_CROSS_EXTRA_MARGIN_PER_DAY`
+idle reasoning budget only on high-stakes steps under a hard cumulative cap; only takes
+effect when thinking is re-enabled), `AGENT_THINKING_HIGH_STAKES_NET` (default 1500),
+`AGENT_LLM_CARGO_SUMMARY_LIMIT` (default **24**) / `AGENT_LIQ_TOP_N` (default **12**) —
+candidate / market-table widths shown to the fast decision LLM (spend idle token budget on
+context throughput, not reasoning depth), `AGENT_NIGHT_CROSS_EXTRA_MARGIN_PER_DAY`
 (default 0 = no-op; raise to trim marginal multi-day crossings). See
-`docs/agent-optimization-notes.md` §-5/§-4 for what each does and how to revert.
+`docs/agent-optimization-notes.md` §-6/§-5/§-4 for what each does and how to revert.
