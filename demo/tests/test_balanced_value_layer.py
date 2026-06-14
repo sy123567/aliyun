@@ -53,18 +53,40 @@ def _svc(items=None, progress=0):
 
 def test_rank_score_neutral_without_chain_or_abs_boost() -> None:
     """With chain weight active but no destination liquidity, and abs-alpha 0,
-    the score equals the plain overhead-amortised rate."""
-    base = ModelDecisionService._amortized_rate(1000.0, 100)
-    assert abs(ModelDecisionService._candidate_rank_score(1000.0, 100, 0.0) - base) < 1e-9
+    the score equals the plain overhead-amortised rate. (abs-alpha now defaults
+    to 0.2, so pin it to 0 here to verify the neutral baseline.)"""
+    original = mds._ABS_NET_ALPHA
+    mds._ABS_NET_ALPHA = 0.0
+    try:
+        base = ModelDecisionService._amortized_rate(1000.0, 100)
+        assert abs(ModelDecisionService._candidate_rank_score(1000.0, 100, 0.0) - base) < 1e-9
+    finally:
+        mds._ABS_NET_ALPHA = original
+
+
+def test_rank_score_abs_net_alpha_on_by_default_lifts_big_haul() -> None:
+    """Shipped default now emphasises big absolute net (2026-06-14 gross push):
+    a big haul ranks strictly above its plain overhead-amortised rate out of the
+    box, so big orders stop getting buried behind marginally-faster small ones."""
+    assert mds._ABS_NET_ALPHA > 0.0, "default AGENT_ABS_NET_ALPHA must emphasise big net"
+    big = ModelDecisionService._candidate_rank_score(8000.0, 600, 0.0)
+    base_big = ModelDecisionService._amortized_rate(8000.0, 600)
+    assert big > base_big
 
 
 def test_rank_score_chain_liquidity_boosts() -> None:
-    """A liquid destination market boosts the ranking score (default weight)."""
-    base = ModelDecisionService._amortized_rate(1000.0, 100)
-    boosted = ModelDecisionService._candidate_rank_score(1000.0, 100, 100.0)
-    assert boosted > base
-    # bounded: ~ (1 + weight) at/above the reference market value
-    assert boosted <= base * (1.0 + mds._CHAIN_VALUE_WEIGHT) + 1e-9
+    """A liquid destination market boosts the ranking score (default weight).
+    Pin abs-alpha to 0 to isolate the chain term (abs-alpha now defaults > 0)."""
+    original = mds._ABS_NET_ALPHA
+    mds._ABS_NET_ALPHA = 0.0
+    try:
+        base = ModelDecisionService._amortized_rate(1000.0, 100)
+        boosted = ModelDecisionService._candidate_rank_score(1000.0, 100, 100.0)
+        assert boosted > base
+        # bounded: ~ (1 + weight) at/above the reference market value
+        assert boosted <= base * (1.0 + mds._CHAIN_VALUE_WEIGHT) + 1e-9
+    finally:
+        mds._ABS_NET_ALPHA = original
 
 
 def test_rank_score_chain_can_flip_two_equal_net_orders() -> None:

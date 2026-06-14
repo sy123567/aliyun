@@ -53,10 +53,12 @@ LONGHAUL_PENALTY = 1000.0
 _STRAND_MIN_BUDGET = 240
 _ORDER_DEADLINE_BUFFER_MIN = 10
 # Candidate list / market table sizes shown to the decision LLM. The finals
-# token budget (5M/driver) is barely 21% used at submission, so widening the
-# context the thinking model reasons over is "free" value-side spend. Tunable
-# via env for platform sweeps.
-_LLM_CARGO_SUMMARY_LIMIT = int(os.environ.get("AGENT_LLM_CARGO_SUMMARY_LIMIT", "18"))
+# token budget (5M/driver) is barely 21% used at submission while the #1 team
+# spends ~3.08M/driver, so widening the per-step context the (now fast, see
+# _DECISION_THINKING) LLM picks over is the cheapest way to convert that idle
+# token budget into better value-side decisions (higher gross). Raised 18 → 24.
+# Tunable via env for platform sweeps (notes §2 — calibrate across runs).
+_LLM_CARGO_SUMMARY_LIMIT = int(os.environ.get("AGENT_LLM_CARGO_SUMMARY_LIMIT", "24"))
 _MIN_BOUNDED_AREA_SPAN = 0.1
 # Fixed non-earning overhead (minutes) amortised per order when RANKING
 # candidates. Pure net-per-minute ranking systematically under-ranks big/long
@@ -66,21 +68,31 @@ _MIN_BOUNDED_AREA_SPAN = 0.1
 # inter-order idle), so amortising a constant into the time denominator favours
 # consolidating into fewer, larger orders — directly attacking the documented
 # gross-income gap — WITHOUT ever accepting an unprofitable order (the net>0
-# filter is unchanged; this only re-ranks already-feasible candidates). Tune on
-# the official platform (multi-run, see notes §2); env AGENT_ORDER_TIME_OVERHEAD_MIN.
-_ORDER_TIME_OVERHEAD_MIN = float(os.environ.get("AGENT_ORDER_TIME_OVERHEAD_MIN", "60"))
+# filter is unchanged; this only re-ranks already-feasible candidates). Raised
+# 60 → 75 (2026-06-14 gross push v2) to consolidate harder into fewer, larger
+# orders now that gross is the dominant gap. Re-ranking only ⇒ no compliance
+# penalty; the one indirect effect is a mild lean toward longer hauls, but the
+# longhaul cap is *soft-priced* (an over-cap long haul is only taken when its
+# net still beats the cap penalty), so penalty stays bounded. Drop back to 60 if
+# a platform sweep shows longhaul penalty creeping up. Tune multi-run (notes §2).
+_ORDER_TIME_OVERHEAD_MIN = float(os.environ.get("AGENT_ORDER_TIME_OVERHEAD_MIN", "75"))
 # Market-liquidity view built from the scan cache (zero extra sim cost):
 # how many cargo were seen departing each city recently and at what value.
 # Feeds chain-aware order choice (an order into a dead city strands the truck).
 _LIQ_WINDOW_MIN = 3 * DAY_MINUTES
-_LIQ_TOP_N = int(os.environ.get("AGENT_LIQ_TOP_N", "8"))
+# Active-market rows shown to the decision LLM (chain/reposition context).
+# Raised 8 → 12 alongside _LLM_CARGO_SUMMARY_LIMIT: with thinking off, spending
+# the spare token budget on a richer observed-market table is what lets the fast
+# LLM choose higher-value chains / repositions (toward the leader's gross).
+_LIQ_TOP_N = int(os.environ.get("AGENT_LIQ_TOP_N", "12"))
 # If the LLM asks for a long strategic wait while a compliant candidate at or
 # above this net-per-hour is on the table, take the order instead (the known
 # failure mode of LLM-in-the-loop runs was idling away strong orders). Lowered
-# from 80 → 60: the submission was too conservative (lowest gross income on the
-# board), so idling a compliant >=60元/h order for "something better" is itself
-# a net-income leak. Env-tunable for platform sweeps.
-_LLM_WAIT_OVERRIDE_NET_PER_H = float(os.environ.get("AGENT_LLM_WAIT_OVERRIDE_NET_PER_H", "60"))
+# 80 → 60 → 50 (2026-06-14 gross push): we still trail the leader on gross
+# income, and idling a *compliant* ≥50元/h order while "waiting for something
+# better" is a pure net-income leak (the orders here already passed every
+# compliance guard, so taking them never adds penalty). Env-tunable for sweeps.
+_LLM_WAIT_OVERRIDE_NET_PER_H = float(os.environ.get("AGENT_LLM_WAIT_OVERRIDE_NET_PER_H", "50"))
 # Safety margin required to soft-cross a penalised night/rest window for a big
 # evening order (see ``_evaluate_cargo``). The crossing model charges only ONE
 # per-day rest penalty, but its realised cost is systematically UNDER-estimated:
@@ -98,12 +110,49 @@ _LLM_WAIT_OVERRIDE_NET_PER_H = float(os.environ.get("AGENT_LLM_WAIT_OVERRIDE_NET
 # keeps the genuinely big hauls (the feature's intent) while dropping the thin
 # crossings that drove the penalty up. Env-tunable for platform sweeps (§2).
 _NIGHT_CROSS_MARGIN = max(1.0, float(os.environ.get("AGENT_NIGHT_CROSS_MARGIN", "1.5")))
-# Thinking mode for the per-step decision call. Default ON (submission runs
-# with thinking); set AGENT_DECISION_THINKING=0 to disable. Measured on the
-# finals gateway (qwen3.7-plus) with real decision prompts: ~22s avg latency
-# per LLM decision (vs ~2s without) and ~+800 reasoning tokens/step
-# (~2.3M total/driver projected — still within the 5M cap).
-_DECISION_THINKING = os.environ.get("AGENT_DECISION_THINKING", "1").strip() not in ("0", "false", "False")
+# Whether to consult the decision LLM on each step AT ALL. Default ON (the LLM
+# co-decides every compliant step). Set AGENT_DECISION_LLM=0 for a *fully
+# deterministic* agent: the per-step decision LLM is skipped and every step is
+# resolved by the local rule-engine scheduler (_schedule). This is how the
+# sub-second / tens-of-thousands-of-token teams on the leaderboard run — no
+# per-step network round-trip ⇒ ~0.1-0.3s/decision and negligible tokens, and
+# zero risk of the hard 4h finals cap. Preference compilation + the daily
+# directive (a handful of calls per driver) still use the LLM, so compliance
+# understanding is unchanged. Our own notes §-1 found that deeper per-step LLM
+# involvement scored *worse*, and the leaderboard's near-zero-LLM teams currently
+# out-net our LLM-on submission — so this is the highest-signal A/B to run.
+_DECISION_LLM = os.environ.get("AGENT_DECISION_LLM", "1").strip() not in ("0", "false", "False")
+# Whether to compile preferences with the LLM AT ALL. Default ON (per-text LLM
+# extraction + audit + the per-day compliance directive). Set AGENT_PARSE_LLM=0
+# for a *fully deterministic* "直接解析" agent: every preference is parsed by the
+# local regex engine (_parse_one + _supplement_*) and the per-day LLM directive
+# is skipped. Combined with AGENT_DECISION_LLM=0 this makes decide() issue ZERO
+# model calls — the zero-token / sub-second leaderboard profile (§-8) — at the
+# cost of relying on the regex parser's coverage. The regex parser already
+# handles the 3-month D001 fixture (night window, monthly category quotas +
+# carryover, long-haul cap); the weekend night-rest relaxation that the per-day
+# directive used to supply is reproduced deterministically via
+# DriverRules.weekend_no_drive_shift_min (see §-9). Anything the regex parser
+# cannot express still lands in residual_constraints, but with the decision LLM
+# also off those are not re-read per step — so this mode trades a little recall
+# for determinism/speed and is meant for the multi-run platform A/B, not a
+# single local run (notes §2).
+_PARSE_LLM = os.environ.get("AGENT_PARSE_LLM", "1").strip() not in ("0", "false", "False")
+# Thinking mode for the per-step decision call. Default **OFF** as of the
+# 2026-06-14 leaderboard review: the #1 team (USTC "baseline") scores net
+# 116876 at only 15400 penalty while spending ~3.08M tokens/driver at ~5.55s
+# avg decision latency — a profile consistent with an every-step *fast* LLM on
+# rich prompts, NOT with reasoning chains (thinking measured ~22s/step on this
+# gateway). Our own thinking runs blew the hard 4h finals cap, so the wall-clock
+# guard kept auto-disabling thinking (submission avg ~2.9-3.9s/step ⇒ thinking
+# barely ran and the reasoning budget was wasted, notes §-5); worse, the few
+# steps where it DID fire spent wall-clock that forced fast mode elsewhere and
+# coincided with a penalty regression (45100 vs the ~25-31k of earlier fast-only
+# runs). Turning thinking off frees the entire wall-clock budget for every-step
+# fast decisions on wider context (see _LLM_CARGO_SUMMARY_LIMIT / _LIQ_TOP_N
+# below), which is how the leaderboard leader converts spare token budget into
+# gross income. Set AGENT_DECISION_THINKING=1 to restore the old thinking path.
+_DECISION_THINKING = os.environ.get("AGENT_DECISION_THINKING", "0").strip() not in ("0", "false", "False")
 # The finals impose a HARD 4-hour total-runtime cap. Thinking at ~22s/step
 # projects to ~1.9h/driver (≈3.9h for two drivers) — no safety margin. Each
 # driver therefore gets a wall-clock budget; when the run is projected to
@@ -141,11 +190,20 @@ _THINKING_HIGH_STAKES_NET = float(os.environ.get("AGENT_THINKING_HIGH_STAKES_NET
 # is worth more than its standalone net (the truck immediately re-loads instead
 # of dead-heading out). Multiplies the candidate ranking score by
 # (1 + weight * f(to_liq)); 0 == off (pure standalone ranking). Re-ranks only,
-# never changes feasibility (net>0 filter unchanged).
-_CHAIN_VALUE_WEIGHT = max(0.0, float(os.environ.get("AGENT_CHAIN_VALUE_WEIGHT", "0.3")))
+# never changes feasibility (net>0 filter unchanged). Raised 0.3 → 0.45
+# (2026-06-14 gross push): chaining into a liquid drop-off city keeps the truck
+# earning instead of dead-heading out — pure gross upside, penalty-neutral
+# (ranking happens after the compliance/feasibility filter).
+_CHAIN_VALUE_WEIGHT = max(0.0, float(os.environ.get("AGENT_CHAIN_VALUE_WEIGHT", "0.45")))
 # A1 — absolute-net emphasis: extra log-boost on big absolute net on top of the
-# overhead-amortised rate. 0 == off (rely on _ORDER_TIME_OVERHEAD_MIN only).
-_ABS_NET_ALPHA = max(0.0, float(os.environ.get("AGENT_ABS_NET_ALPHA", "0.0")))
+# overhead-amortised rate. Default 0 → 0.2 (2026-06-14 gross push): the
+# submission had the LOWEST gross income on the board — too many big-absolute-net
+# hauls were buried behind marginally-faster small orders by pure net/h ranking
+# (notes §-2 "big orders left on the table"). The log term lifts big hauls so the
+# fast LLM and the deterministic picker both prefer them. Re-ranking only — never
+# touches the net>0 feasibility filter or any compliance guard, so it adds gross
+# without adding preference penalty. Set 0 to restore pure amortised ranking.
+_ABS_NET_ALPHA = max(0.0, float(os.environ.get("AGENT_ABS_NET_ALPHA", "0.2")))
 # A2 — multi-day night crossing: allow a very large haul to run PAST the end of
 # the nightly rest window into the next day(s), pricing one rest penalty PER
 # crossed window instead of hard-rejecting. 1 == legacy (finish must stay inside
@@ -167,8 +225,15 @@ _NIGHT_CROSS_EXTRA_MARGIN_PER_DAY = max(0.0, float(os.environ.get("AGENT_NIGHT_C
 # A3 — weak-local reposition: when the best locally-pickable order's efficiency
 # is below this net-per-hour, prefer an anti-strand reposition toward a richer
 # observed market instead of locking the day into the weak order. 0 == off
-# (only reposition when NO order is reachable — the legacy trigger).
-_WEAK_LOCAL_REPOSITION_NET_PER_H = max(0.0, float(os.environ.get("AGENT_WEAK_LOCAL_REPOSITION_NET_PER_H", "0")))
+# (only reposition when NO order is reachable — the legacy trigger). Enabled at
+# 45 (2026-06-14 gross push v2): the submission's gap to the leader is now almost
+# entirely gross income (penalty already controlled), and idling/locking a day
+# into a sub-45元/h local order is a gross leak. The divert is net-protected
+# (``_anti_strand`` only moves when the richer market's anchor net, with the
+# reposition deadhead already netted out, STRICTLY beats the local order) and
+# window-safe (``_safe_reposition`` never drives into a no-drive window), so it
+# is penalty-neutral. Set 0 to restore the legacy "reposition only when stranded".
+_WEAK_LOCAL_REPOSITION_NET_PER_H = max(0.0, float(os.environ.get("AGENT_WEAK_LOCAL_REPOSITION_NET_PER_H", "45")))
 # B1 — penalty_cap credit: once a soft rule's monthly cumulative penalty has hit
 # its cap, further violations of that rule are free (the scorer caps the total),
 # so stop pricing them and unlock the orders they were blocking. 1 == on.
@@ -472,6 +537,13 @@ class DriverRules:
         # These concretize calendar-conditional preferences (weekend shifts,
         # dated events, month carryovers) that a static schema cannot express.
         self.daily_directives: dict[int, dict[str, Any]] = {}
+        # Deterministic weekend relaxation of the night no-drive window
+        # ("周末两天可以晚两个小时再休息"): minutes by which the window START is
+        # delayed on Sat/Sun. Set ONLY by the regex parser, so the LLM-on path is
+        # unaffected (None ⇒ no shift). When set it lets a *fully deterministic*
+        # (AGENT_PARSE_LLM=0) run recover the weekend evening hours the per-day
+        # LLM directive would otherwise have unlocked — see no_drive_windows_for.
+        self.weekend_no_drive_shift_min: int | None = None
 
     def no_drive_windows_for(self, day: int) -> list[tuple[int, int]]:
         """Effective no-drive windows for one simulation day.
@@ -489,7 +561,18 @@ class DriverRules:
         """
         directive = self.daily_directives.get(int(day))
         if not directive:
-            return list(self.no_drive_windows)
+            base = list(self.no_drive_windows)
+            shift = self.weekend_no_drive_shift_min
+            if shift and base and _calendar_for_day(day)[2]:
+                # Weekend: delay the night window's START (keep its END), e.g.
+                # 21:00→06:00 becomes 23:00→06:00 — exactly what the per-day LLM
+                # directive used to do, now available with the directive off.
+                shifted: list[tuple[int, int]] = []
+                for s, e in base:
+                    ns = s + shift
+                    shifted.append((ns, e) if ns < e else (s, e))
+                return shifted
+            return base
         extra = [tuple(w) for w in (directive.get("windows") or [])]
         if directive.get("replace") and extra:
             static_cov = sum(e - s for s, e in self.no_drive_windows)
@@ -1098,7 +1181,9 @@ class ModelDecisionService:
         # deterministic layer still hard-guards compliance and provides the
         # fallback; the wait-loop guard keeps the known LLM idle-loop failure
         # mode in check.
-        use_llm = consecutive_waits < 3
+        # AGENT_DECISION_LLM=0 turns this off entirely → fully deterministic agent
+        # (sub-second, near-zero tokens), like the leaderboard's low-latency teams.
+        use_llm = _DECISION_LLM and consecutive_waits < 3
         if use_llm:
             action = self._llm_decide_with_history(
                 driver_id, status, rules, plan, history, now, lat, lng, day, tod
@@ -1794,6 +1879,11 @@ class ModelDecisionService:
         解析结果（fail-safe），且每天最多重试 2 次、结果按天缓存，token
         开销 ~1 次小调用/司机日。
         """
+        # Fully deterministic mode: skip the per-day LLM grounding entirely. The
+        # static parse (incl. the deterministic weekend night-rest relaxation via
+        # DriverRules.weekend_no_drive_shift_min) stays in charge — no network.
+        if not _PARSE_LLM:
+            return
         records = self._pref_records.get(driver_id) or []
         if not records:
             return
@@ -3225,11 +3315,14 @@ class ModelDecisionService:
         coord_map = self._collect_coords(prefs)
         compiled: list[tuple[str, Any, Any]] = []
         for text, penalty, cap in new_items:
-            if self._llm_parse_preferences(driver_id, [text], rules, coord_map, [penalty], [cap]):
+            # AGENT_PARSE_LLM=0 forces the deterministic regex parser for every
+            # text (fully "直接解析"); otherwise try the LLM compile first and fall
+            # back to regex only when the model is unavailable.
+            if _PARSE_LLM and self._llm_parse_preferences(driver_id, [text], rules, coord_map, [penalty], [cap]):
                 compiled.append((text, penalty, cap))
             else:
-                # offline / model unavailable: deterministic regex fallback for
-                # this text only.
+                # offline / model unavailable / parse-LLM disabled: deterministic
+                # regex fallback for this text only.
                 self._parse_one(text, rules, coord_map)
                 self._supplement_basic_rules(text, rules)
                 self._supplement_dated_events(text, rules, coord_map)
@@ -4510,6 +4603,35 @@ class ModelDecisionService:
         if default_month_idx is not None and any(kw in text for kw in ("欠", "补", "接着补", "没完成")):
             rules.category_carryover_months.add(default_month_idx)
 
+    def _supplement_weekend_shift(self, text: str, rules: DriverRules) -> None:
+        """Deterministic weekend night-rest relaxation.
+
+        Phrasings like D001's "但是周末两天可以晚两个小时再休息" relax the standing
+        night no-drive window by N hours on Sat/Sun. The LLM daily directive used
+        to supply this per day; this lets a fully deterministic (AGENT_PARSE_LLM=0)
+        run apply it too. Conservative gates (weekend marker + an explicit
+        delay-by-N-hours phrase + a rest/night context) keep it from firing on
+        unrelated text. The shift is only ever *applied* when a night window
+        actually exists (see no_drive_windows_for), so parsing it before the
+        night fail-safe runs is safe.
+        """
+        if rules.weekend_no_drive_shift_min is not None:
+            return
+        if not any(kw in text for kw in (
+            "周末", "双休", "礼拜六", "礼拜天", "礼拜日", "星期六", "星期日", "星期天", "周六", "周日",
+        )):
+            return
+        if not any(kw in text for kw in (
+            "休息", "睡", "收车", "收工", "歇", "停车", "熄火", "不出车", "不接单", "不空驶", "夜",
+        )):
+            return
+        m = re.search(r"(?:晚|推迟|延后|迟|多跑|晚点)\s*([零一二两三四五六七八九十\d]+)\s*(?:个)?\s*(?:小时|个钟|钟头)", text)
+        if not m:
+            return
+        hours = _cn_to_int(m.group(1))
+        if 0 < hours <= 6:
+            rules.weekend_no_drive_shift_min = hours * 60
+
     def _supplement_allowed_regions(self, text: str, rules: DriverRules) -> None:
         strong_kws = ("只跑", "只接", "只在", "仅在", "限定", "不出", "不离开", "不离", "固定在", "范围内", "区域内")
         if not any(kw in text for kw in strong_kws):
@@ -5013,6 +5135,7 @@ class ModelDecisionService:
             if req > 0 and 18 <= mlat <= 55 and 70 <= mlng <= 140:
                 rules.must_visit.append({"lat": mlat, "lng": mlng, "radius_km": radius, "required_days": req})
         self._supplement_category_targets(text, rules)
+        self._supplement_weekend_shift(text, rules)
 
     def _supplement_dated_events(
         self, text: str, rules: DriverRules, coord_map: dict[str, tuple[float, float]]
@@ -5190,6 +5313,7 @@ class ModelDecisionService:
             if hm_m:
                 rules.haul_max_km = float(_cn_to_int(hm_m.group(1)))
         self._supplement_category_targets(text, rules)
+        self._supplement_weekend_shift(text, rules)
 
     # ----------------------------------------------------- small text parsers
     @staticmethod

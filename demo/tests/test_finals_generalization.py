@@ -527,6 +527,115 @@ def test_llm_codecides_every_step() -> None:
     assert len(api.decision_prompts) == 2
 
 
+def test_decision_llm_off_runs_deterministic() -> None:
+    """AGENT_DECISION_LLM=0 skips the per-step decision LLM entirely (the
+    sub-second / near-zero-token leaderboard profile): decide() returns a valid
+    action from the deterministic scheduler and never sends a decision prompt."""
+    import agent.model_decision_service as mds
+    day, tod = 5, 600
+    now = day * DAY_MINUTES + tod
+    api = ValueApi(now, [], {"action": "wait", "params": {"duration_minutes": 45}})
+    svc = ModelDecisionService(api)
+    original = mds._DECISION_LLM
+    mds._DECISION_LLM = False
+    try:
+        a1 = svc.decide("DG44")
+        assert a1 is not None and "action" in a1, a1
+        assert len(api.decision_prompts) == 0, api.decision_prompts
+        svc.decide("DG44")
+        assert len(api.decision_prompts) == 0, api.decision_prompts
+    finally:
+        mds._DECISION_LLM = original
+
+
+# D001's real 3-month preference texts (server/data/drivers.json) — the finals
+# fixture that AGENT_PARSE_LLM=0 ("直接解析") must handle without any LLM.
+_D001_PREFS = [
+    {"content": "每天夜里21:00至次日06:00，车必须停车熄火休息，这段时间不得接单、空驶。但是周末两天可以晚两个小时再休息。",
+     "penalty_amount": 2700},
+    {"content": "四月公司下了考核指标，货源类型是水果的货这个月必须接满十二单，少一单扣一次。",
+     "penalty_amount": 500},
+    {"content": "四月份公司指标没完成，五月得把欠的单数接着补；五月又有新指标，货源类型是建材的货必须接满十二单，欠额和本月指标没达标的部分少一单扣一次，这回罚得比四月份重。",
+     "penalty_amount": 3500},
+    {"content": "不爱接那种一跑就是大半天、人困马乏的远活，每个月超过八小时的长途只能接最多5单，多一单扣一次。",
+     "penalty_amount": 1000},
+]
+
+
+class _D001Api(ScriptedApi):
+    """Decision-layer stub that serves D001's real 3-month preferences."""
+
+    def __init__(self, now: int):
+        super().__init__(decision_response={"action": "wait", "params": {"duration_minutes": 30}})
+        self._now = now
+
+    def get_driver_status(self, driver_id):  # noqa: ANN001, ANN201
+        return {"simulation_progress_minutes": self._now,
+                "current_lat": 22.92, "current_lng": 113.18, "preferences": _D001_PREFS}
+
+
+def test_parse_llm_off_parses_d001_three_month_prefs() -> None:
+    """AGENT_PARSE_LLM=0 deterministically parses every D001 obligation across
+    the 3-month horizon: night window + weekend relaxation, both monthly category
+    quotas, the May carryover, and the monthly long-haul cap."""
+    import agent.model_decision_service as mds
+    api = ScriptedApi()  # would record LLM payloads if any were made
+    svc = ModelDecisionService(api)
+    original = mds._PARSE_LLM
+    mds._PARSE_LLM = False
+    try:
+        rules = svc._ensure_rules("D001", _status(_D001_PREFS))
+    finally:
+        mds._PARSE_LLM = original
+    assert (1260, 1800) in rules.no_drive_windows, rules.no_drive_windows
+    assert rules.weekend_no_drive_shift_min == 120, rules.weekend_no_drive_shift_min
+    assert rules.monthly_category_targets.get(1, {}).get("水果") == 12, rules.monthly_category_targets
+    assert rules.monthly_category_targets.get(2, {}).get("建材") == 12, rules.monthly_category_targets
+    assert 2 in rules.category_carryover_months, rules.category_carryover_months
+    assert rules.longhaul_cap_orders == 5, rules.longhaul_cap_orders
+    # purely deterministic: no model role was invoked
+    assert api.extract_payloads == [] and api.audit_payloads == [], "parse-LLM must be skipped"
+
+
+def test_parse_llm_off_makes_zero_model_calls_end_to_end() -> None:
+    """With both AGENT_PARSE_LLM=0 and AGENT_DECISION_LLM=0, a full decide()
+    issues ZERO model calls (the zero-token / sub-second leaderboard profile)
+    while still returning compliant actions and having parsed the rules."""
+    import agent.model_decision_service as mds
+    now = 5 * DAY_MINUTES + 600
+    api = _D001Api(now)
+    svc = ModelDecisionService(api)
+    o_parse, o_dec = mds._PARSE_LLM, mds._DECISION_LLM
+    mds._PARSE_LLM = False
+    mds._DECISION_LLM = False
+    try:
+        a1 = svc.decide("D001")
+        a2 = svc.decide("D001")
+    finally:
+        mds._PARSE_LLM, mds._DECISION_LLM = o_parse, o_dec
+    assert a1 and "action" in a1 and a2 and "action" in a2, (a1, a2)
+    assert api.extract_payloads == [], api.extract_payloads
+    assert api.audit_payloads == [], api.audit_payloads
+    assert api.directive_payloads == [], api.directive_payloads
+    assert api.decision_prompts == [], api.decision_prompts
+    assert api.confirm_payloads == [] and api.yes_no_questions == [], "no semantic calls either"
+    # the 3-month rules were still compiled deterministically
+    assert svc._rules["D001"].monthly_category_targets.get(2, {}).get("建材") == 12
+
+
+def test_weekend_night_shift_applies_only_on_weekends() -> None:
+    """weekend_no_drive_shift_min delays the night window START on Sat/Sun only,
+    keeping the END — reproducing the per-day directive's weekend relaxation in
+    fully deterministic mode."""
+    rules = DriverRules()
+    rules.no_drive_windows.append((1260, 1800))  # 21:00 -> next-day 06:00
+    rules.weekend_no_drive_shift_min = 120
+    # 2026-03-01 is a Sunday (day 0), 03-07 a Saturday (day 6); 03-02..03-06 weekdays
+    assert rules.no_drive_windows_for(1) == [(1260, 1800)], "weekday unchanged"
+    assert rules.no_drive_windows_for(0) == [(1380, 1800)], "Sunday relaxed to 23:00"
+    assert rules.no_drive_windows_for(6) == [(1380, 1800)], "Saturday relaxed to 23:00"
+
+
 def test_decision_prompt_contains_market_table() -> None:
     day, tod = 5, 600
     now = day * DAY_MINUTES + tod

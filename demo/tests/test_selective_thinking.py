@@ -90,15 +90,23 @@ def _last_thinking(api) -> bool:
 
 def test_big_net_candidate_triggers_thinking() -> None:
     """A candidate whose net clears the high-stakes threshold makes the step
-    spend the reasoning budget (enable_thinking + the 2000-token completion)."""
+    spend the reasoning budget (enable_thinking + the 2000-token completion).
+
+    Thinking is OFF by default now (the leaderboard leader wins in fast mode),
+    so this opts back in to exercise the selective-thinking mechanics."""
     big = _cargo("BIG", price=3000.0, cost_time=120)  # zero-dist net 3000 >= 1500
     api = _StubApi([big], progress=480)
     svc = ModelDecisionService(api)
-    _decide_once(svc, api, DriverRules(), now=480, day=0, tod=480)
-    assert _last_thinking(api) is True
-    assert api.payloads[-1]["max_tokens"] == 2000
-    # the thinking call was charged against the per-driver cumulative budget
-    assert "D" in svc._thinking_spent
+    original = mds._DECISION_THINKING
+    mds._DECISION_THINKING = True
+    try:
+        _decide_once(svc, api, DriverRules(), now=480, day=0, tod=480)
+        assert _last_thinking(api) is True
+        assert api.payloads[-1]["max_tokens"] == 2000
+        # the thinking call was charged against the per-driver cumulative budget
+        assert "D" in svc._thinking_spent
+    finally:
+        mds._DECISION_THINKING = original
 
 
 def test_low_stakes_step_stays_fast() -> None:
@@ -122,8 +130,13 @@ def test_category_pressure_triggers_thinking_even_on_small_orders() -> None:
     rules = DriverRules()
     rules.monthly_category_targets = {0: {"水果": 12}}
     rules.rule_penalties["category_targets"] = 500.0
-    _decide_once(svc, api, rules, now=480, day=0, tod=480)
-    assert _last_thinking(api) is True
+    original = mds._DECISION_THINKING
+    mds._DECISION_THINKING = True
+    try:
+        _decide_once(svc, api, rules, now=480, day=0, tod=480)
+        assert _last_thinking(api) is True
+    finally:
+        mds._DECISION_THINKING = original
 
 
 def test_cumulative_cap_disables_thinking() -> None:
@@ -158,12 +171,29 @@ def test_selective_can_be_disabled_for_legacy_behaviour() -> None:
     api = _StubApi([big], progress=480)
     svc = ModelDecisionService(api)
     original = mds._THINKING_SELECTIVE
+    original_think = mds._DECISION_THINKING
     mds._THINKING_SELECTIVE = False
+    mds._DECISION_THINKING = True
     try:
         _decide_once(svc, api, DriverRules(), now=480, day=0, tod=480)
         assert _last_thinking(api) is True
     finally:
         mds._THINKING_SELECTIVE = original
+        mds._DECISION_THINKING = original_think
+
+
+def test_thinking_off_by_default_even_on_big_net() -> None:
+    """Shipped default is now thinking OFF: even a high-stakes big-net step runs
+    the decision LLM in fast mode (no enable_thinking, 180-token completion).
+    This is the 2026-06-14 change — the leaderboard leader wins in fast mode."""
+    assert mds._DECISION_THINKING is False, "default AGENT_DECISION_THINKING must be off"
+    big = _cargo("BIG", price=3000.0, cost_time=120)  # net 3000 >= high-stakes
+    api = _StubApi([big], progress=480)
+    svc = ModelDecisionService(api)
+    _decide_once(svc, api, DriverRules(), now=480, day=0, tod=480)
+    assert _last_thinking(api) is False
+    assert api.payloads[-1]["max_tokens"] == 180
+    assert "D" not in svc._thinking_spent  # no reasoning budget charged
 
 
 def test_thinking_off_when_decision_thinking_disabled() -> None:
