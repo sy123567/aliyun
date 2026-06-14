@@ -68,9 +68,14 @@ _MIN_BOUNDED_AREA_SPAN = 0.1
 # inter-order idle), so amortising a constant into the time denominator favours
 # consolidating into fewer, larger orders — directly attacking the documented
 # gross-income gap — WITHOUT ever accepting an unprofitable order (the net>0
-# filter is unchanged; this only re-ranks already-feasible candidates). Tune on
-# the official platform (multi-run, see notes §2); env AGENT_ORDER_TIME_OVERHEAD_MIN.
-_ORDER_TIME_OVERHEAD_MIN = float(os.environ.get("AGENT_ORDER_TIME_OVERHEAD_MIN", "60"))
+# filter is unchanged; this only re-ranks already-feasible candidates). Raised
+# 60 → 75 (2026-06-14 gross push v2) to consolidate harder into fewer, larger
+# orders now that gross is the dominant gap. Re-ranking only ⇒ no compliance
+# penalty; the one indirect effect is a mild lean toward longer hauls, but the
+# longhaul cap is *soft-priced* (an over-cap long haul is only taken when its
+# net still beats the cap penalty), so penalty stays bounded. Drop back to 60 if
+# a platform sweep shows longhaul penalty creeping up. Tune multi-run (notes §2).
+_ORDER_TIME_OVERHEAD_MIN = float(os.environ.get("AGENT_ORDER_TIME_OVERHEAD_MIN", "75"))
 # Market-liquidity view built from the scan cache (zero extra sim cost):
 # how many cargo were seen departing each city recently and at what value.
 # Feeds chain-aware order choice (an order into a dead city strands the truck).
@@ -192,8 +197,15 @@ _NIGHT_CROSS_EXTRA_MARGIN_PER_DAY = max(0.0, float(os.environ.get("AGENT_NIGHT_C
 # A3 — weak-local reposition: when the best locally-pickable order's efficiency
 # is below this net-per-hour, prefer an anti-strand reposition toward a richer
 # observed market instead of locking the day into the weak order. 0 == off
-# (only reposition when NO order is reachable — the legacy trigger).
-_WEAK_LOCAL_REPOSITION_NET_PER_H = max(0.0, float(os.environ.get("AGENT_WEAK_LOCAL_REPOSITION_NET_PER_H", "0")))
+# (only reposition when NO order is reachable — the legacy trigger). Enabled at
+# 45 (2026-06-14 gross push v2): the submission's gap to the leader is now almost
+# entirely gross income (penalty already controlled), and idling/locking a day
+# into a sub-45元/h local order is a gross leak. The divert is net-protected
+# (``_anti_strand`` only moves when the richer market's anchor net, with the
+# reposition deadhead already netted out, STRICTLY beats the local order) and
+# window-safe (``_safe_reposition`` never drives into a no-drive window), so it
+# is penalty-neutral. Set 0 to restore the legacy "reposition only when stranded".
+_WEAK_LOCAL_REPOSITION_NET_PER_H = max(0.0, float(os.environ.get("AGENT_WEAK_LOCAL_REPOSITION_NET_PER_H", "45")))
 # B1 — penalty_cap credit: once a soft rule's monthly cumulative penalty has hit
 # its cap, further violations of that rule are free (the scorer caps the total),
 # so stop pricing them and unlock the orders they were blocking. 1 == on.
