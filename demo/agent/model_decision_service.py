@@ -110,6 +110,18 @@ _LLM_WAIT_OVERRIDE_NET_PER_H = float(os.environ.get("AGENT_LLM_WAIT_OVERRIDE_NET
 # keeps the genuinely big hauls (the feature's intent) while dropping the thin
 # crossings that drove the penalty up. Env-tunable for platform sweeps (§2).
 _NIGHT_CROSS_MARGIN = max(1.0, float(os.environ.get("AGENT_NIGHT_CROSS_MARGIN", "1.5")))
+# Whether to consult the decision LLM on each step AT ALL. Default ON (the LLM
+# co-decides every compliant step). Set AGENT_DECISION_LLM=0 for a *fully
+# deterministic* agent: the per-step decision LLM is skipped and every step is
+# resolved by the local rule-engine scheduler (_schedule). This is how the
+# sub-second / tens-of-thousands-of-token teams on the leaderboard run — no
+# per-step network round-trip ⇒ ~0.1-0.3s/decision and negligible tokens, and
+# zero risk of the hard 4h finals cap. Preference compilation + the daily
+# directive (a handful of calls per driver) still use the LLM, so compliance
+# understanding is unchanged. Our own notes §-1 found that deeper per-step LLM
+# involvement scored *worse*, and the leaderboard's near-zero-LLM teams currently
+# out-net our LLM-on submission — so this is the highest-signal A/B to run.
+_DECISION_LLM = os.environ.get("AGENT_DECISION_LLM", "1").strip() not in ("0", "false", "False")
 # Thinking mode for the per-step decision call. Default **OFF** as of the
 # 2026-06-14 leaderboard review: the #1 team (USTC "baseline") scores net
 # 116876 at only 15400 penalty while spending ~3.08M tokens/driver at ~5.55s
@@ -1135,7 +1147,9 @@ class ModelDecisionService:
         # deterministic layer still hard-guards compliance and provides the
         # fallback; the wait-loop guard keeps the known LLM idle-loop failure
         # mode in check.
-        use_llm = consecutive_waits < 3
+        # AGENT_DECISION_LLM=0 turns this off entirely → fully deterministic agent
+        # (sub-second, near-zero tokens), like the leaderboard's low-latency teams.
+        use_llm = _DECISION_LLM and consecutive_waits < 3
         if use_llm:
             action = self._llm_decide_with_history(
                 driver_id, status, rules, plan, history, now, lat, lng, day, tod

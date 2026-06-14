@@ -527,6 +527,27 @@ def test_llm_codecides_every_step() -> None:
     assert len(api.decision_prompts) == 2
 
 
+def test_decision_llm_off_runs_deterministic() -> None:
+    """AGENT_DECISION_LLM=0 skips the per-step decision LLM entirely (the
+    sub-second / near-zero-token leaderboard profile): decide() returns a valid
+    action from the deterministic scheduler and never sends a decision prompt."""
+    import agent.model_decision_service as mds
+    day, tod = 5, 600
+    now = day * DAY_MINUTES + tod
+    api = ValueApi(now, [], {"action": "wait", "params": {"duration_minutes": 45}})
+    svc = ModelDecisionService(api)
+    original = mds._DECISION_LLM
+    mds._DECISION_LLM = False
+    try:
+        a1 = svc.decide("DG44")
+        assert a1 is not None and "action" in a1, a1
+        assert len(api.decision_prompts) == 0, api.decision_prompts
+        svc.decide("DG44")
+        assert len(api.decision_prompts) == 0, api.decision_prompts
+    finally:
+        mds._DECISION_LLM = original
+
+
 def test_decision_prompt_contains_market_table() -> None:
     day, tod = 5, 600
     now = day * DAY_MINUTES + tod
