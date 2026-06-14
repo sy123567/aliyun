@@ -41,7 +41,10 @@ they raise gross without adding preference penalty; the night-crossing knobs are
 the ones that trade penalty for gross. Current knobs include:
 `AGENT_NIGHT_CROSS_MARGIN`, `AGENT_NIGHT_CROSS_MAX_DAYS`,
 `AGENT_ORDER_TIME_OVERHEAD_MIN`, `AGENT_CHAIN_VALUE_WEIGHT`, `AGENT_ABS_NET_ALPHA`,
-`AGENT_WEAK_LOCAL_REPOSITION_NET_PER_H` (default 0 = off), `AGENT_PENALTY_CAP_CREDIT`,
+`AGENT_WEAK_LOCAL_REPOSITION_NET_PER_H` (default **45**; divert off a weak local
+order to a richer observed market — net-protected via `_anti_strand` min_net gate
+and window-safe, so penalty-neutral; set 0 to restore "reposition only when
+stranded"), `AGENT_PENALTY_CAP_CREDIT`,
 `AGENT_CATEGORY_SOFT`, `AGENT_LLM_WAIT_OVERRIDE_NET_PER_H`,
 `AGENT_DECISION_THINKING` (default **0 = OFF** as of 2026-06-14 — the per-step decision
 LLM runs in fast mode; set 1 to restore the old selective-thinking path),
