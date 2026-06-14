@@ -83,10 +83,11 @@ _LIQ_TOP_N = int(os.environ.get("AGENT_LIQ_TOP_N", "12"))
 # If the LLM asks for a long strategic wait while a compliant candidate at or
 # above this net-per-hour is on the table, take the order instead (the known
 # failure mode of LLM-in-the-loop runs was idling away strong orders). Lowered
-# from 80 → 60: the submission was too conservative (lowest gross income on the
-# board), so idling a compliant >=60元/h order for "something better" is itself
-# a net-income leak. Env-tunable for platform sweeps.
-_LLM_WAIT_OVERRIDE_NET_PER_H = float(os.environ.get("AGENT_LLM_WAIT_OVERRIDE_NET_PER_H", "60"))
+# 80 → 60 → 50 (2026-06-14 gross push): we still trail the leader on gross
+# income, and idling a *compliant* ≥50元/h order while "waiting for something
+# better" is a pure net-income leak (the orders here already passed every
+# compliance guard, so taking them never adds penalty). Env-tunable for sweeps.
+_LLM_WAIT_OVERRIDE_NET_PER_H = float(os.environ.get("AGENT_LLM_WAIT_OVERRIDE_NET_PER_H", "50"))
 # Safety margin required to soft-cross a penalised night/rest window for a big
 # evening order (see ``_evaluate_cargo``). The crossing model charges only ONE
 # per-day rest penalty, but its realised cost is systematically UNDER-estimated:
@@ -156,11 +157,20 @@ _THINKING_HIGH_STAKES_NET = float(os.environ.get("AGENT_THINKING_HIGH_STAKES_NET
 # is worth more than its standalone net (the truck immediately re-loads instead
 # of dead-heading out). Multiplies the candidate ranking score by
 # (1 + weight * f(to_liq)); 0 == off (pure standalone ranking). Re-ranks only,
-# never changes feasibility (net>0 filter unchanged).
-_CHAIN_VALUE_WEIGHT = max(0.0, float(os.environ.get("AGENT_CHAIN_VALUE_WEIGHT", "0.3")))
+# never changes feasibility (net>0 filter unchanged). Raised 0.3 → 0.45
+# (2026-06-14 gross push): chaining into a liquid drop-off city keeps the truck
+# earning instead of dead-heading out — pure gross upside, penalty-neutral
+# (ranking happens after the compliance/feasibility filter).
+_CHAIN_VALUE_WEIGHT = max(0.0, float(os.environ.get("AGENT_CHAIN_VALUE_WEIGHT", "0.45")))
 # A1 — absolute-net emphasis: extra log-boost on big absolute net on top of the
-# overhead-amortised rate. 0 == off (rely on _ORDER_TIME_OVERHEAD_MIN only).
-_ABS_NET_ALPHA = max(0.0, float(os.environ.get("AGENT_ABS_NET_ALPHA", "0.0")))
+# overhead-amortised rate. Default 0 → 0.2 (2026-06-14 gross push): the
+# submission had the LOWEST gross income on the board — too many big-absolute-net
+# hauls were buried behind marginally-faster small orders by pure net/h ranking
+# (notes §-2 "big orders left on the table"). The log term lifts big hauls so the
+# fast LLM and the deterministic picker both prefer them. Re-ranking only — never
+# touches the net>0 feasibility filter or any compliance guard, so it adds gross
+# without adding preference penalty. Set 0 to restore pure amortised ranking.
+_ABS_NET_ALPHA = max(0.0, float(os.environ.get("AGENT_ABS_NET_ALPHA", "0.2")))
 # A2 — multi-day night crossing: allow a very large haul to run PAST the end of
 # the nightly rest window into the next day(s), pricing one rest penalty PER
 # crossed window instead of hard-rejecting. 1 == legacy (finish must stay inside
