@@ -46,6 +46,11 @@ order to a richer observed market — net-protected via `_anti_strand` min_net g
 and window-safe, so penalty-neutral; set 0 to restore "reposition only when
 stranded"), `AGENT_PENALTY_CAP_CREDIT`,
 `AGENT_CATEGORY_SOFT`, `AGENT_LLM_WAIT_OVERRIDE_NET_PER_H`,
+`AGENT_DECISION_LLM` (default **1 = on**; set 0 for a fully deterministic agent —
+the per-step decision LLM is skipped entirely so `decide()` runs in ~0.1-0.3s with
+near-zero tokens, like the low-latency leaderboard teams; preference compile +
+daily directive still use the LLM. Leaderboard evidence + notes §-1/§-8 suggest
+this is worth A/B-ing since near-zero-LLM teams currently out-net our LLM-on run),
 `AGENT_DECISION_THINKING` (default **0 = OFF** as of 2026-06-14 — the per-step decision
 LLM runs in fast mode; set 1 to restore the old selective-thinking path),
 `AGENT_THINKING_WALL_BUDGET_SECONDS`, `AGENT_THINKING_SELECTIVE` (default 1 = spend the
