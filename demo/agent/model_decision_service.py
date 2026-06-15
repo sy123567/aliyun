@@ -134,6 +134,18 @@ _NIGHT_CROSS_MARGIN = max(1.0, float(os.environ.get("AGENT_NIGHT_CROSS_MARGIN", 
 # involvement scored *worse*, and the leaderboard's near-zero-LLM teams currently
 # out-net our LLM-on submission — so this is the highest-signal A/B to run.
 _DECISION_LLM = os.environ.get("AGENT_DECISION_LLM", "1").strip() not in ("0", "false", "False")
+# [G1] Selective decision-LLM gate. Default 0 = OFF (the decision LLM is consulted
+# on every non-mandatory step, as before — byte-identical). When > 0, the per-step
+# decision LLM is consulted ONLY on *ambiguous* order steps: those where the top
+# deterministic candidate does NOT clearly dominate the runner-up, i.e. the relative
+# rank gap (rank1 - rank2)/rank1 is BELOW this threshold. On clear-winner steps the
+# rule engine's deterministic pick is taken (no LLM round-trip), concentrating the
+# token budget AND the hard 4h wall-clock on the decisions that can actually change
+# the outcome. The deterministic layer still hard-guards compliance either way, so
+# this never relaxes a constraint — it only decides *where to spend the LLM*. Higher
+# = consult the LLM less often (only the closest calls). Typical A/B start 0.15-0.30.
+# Has no effect when AGENT_DECISION_LLM=0 (LLM already fully off). See notes §-13.
+_DECISION_LLM_GAP = max(0.0, float(os.environ.get("AGENT_DECISION_LLM_GAP", "0")))
 # Whether to compile preferences with the LLM AT ALL. Default ON (per-text LLM
 # extraction + audit + the per-day compliance directive). Set AGENT_PARSE_LLM=0
 # for a *fully deterministic* "直接解析" agent: every preference is parsed by the
@@ -1436,6 +1448,18 @@ class ModelDecisionService:
             cargo_summary.append(row)
         cargo_summary.sort(key=lambda r: -r["_rank"])
         cargo_summary = cargo_summary[:_LLM_CARGO_SUMMARY_LIMIT]
+        # [G1] Selective decision-LLM gate: on a clear-winner order step, skip the
+        # LLM round-trip and let the rule engine make the (same-ranked) deterministic
+        # pick. "Clear" = the top candidate's rank beats the runner-up by at least
+        # _DECISION_LLM_GAP (relative). Only fires with >=2 feasible candidates so a
+        # thin/empty market (where repositioning judgement matters) still consults the
+        # LLM. Default 0 = off → never skips. Compliance is hard-guarded downstream
+        # regardless, so this only moves *where* the LLM is spent, never what is legal.
+        if _DECISION_LLM_GAP > 0.0 and len(cargo_summary) >= 2:
+            r1 = float(cargo_summary[0].get("_rank", 0.0) or 0.0)
+            r2 = float(cargo_summary[1].get("_rank", 0.0) or 0.0)
+            if r1 > 0.0 and (r1 - r2) / r1 >= _DECISION_LLM_GAP:
+                return None  # → _schedule makes the deterministic pick
         for _r in cargo_summary:
             _r.pop("_rank", None)  # internal ranking key, never shown to the model
 

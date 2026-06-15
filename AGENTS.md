@@ -68,6 +68,15 @@ the per-step decision LLM is skipped entirely so `decide()` runs in ~0.1-0.3s wi
 near-zero tokens, like the low-latency leaderboard teams; preference compile +
 daily directive still use the LLM. Leaderboard evidence + notes §-1/§-8 suggest
 this is worth A/B-ing since near-zero-LLM teams currently out-net our LLM-on run),
+`AGENT_DECISION_LLM_GAP` (default **0 = off**; a *selective* middle ground between
+LLM-on-every-step and `AGENT_DECISION_LLM=0`. When > 0 the per-step decision LLM is
+consulted ONLY on *ambiguous* order steps — those where the top deterministic
+candidate does not beat the runner-up by this relative rank margin
+`(rank1-rank2)/rank1`; clear-winner steps take the rule engine's pick with no LLM
+round-trip. Concentrates both the token budget AND the binding 4h wall-clock on the
+close calls. Never relaxes a compliance guard (downstream filter is unchanged); only
+fires with >=2 feasible candidates. Only affects `AGENT_DECISION_LLM=1`. Typical A/B
+start 0.15-0.30 — see notes §-13),
 `AGENT_PARSE_LLM` (default **1 = on**; set 0 for fully deterministic "直接解析" —
 every preference is parsed by the regex engine and the per-day LLM directive is
 skipped, so with `AGENT_DECISION_LLM=0` `decide()` issues ZERO model calls. The

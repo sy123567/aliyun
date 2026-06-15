@@ -407,6 +407,85 @@ def test_decision_prompt_has_chain_lookahead_guidance() -> None:
     assert "接力链路前瞻" in sys_msg, sys_msg
 
 
+# ============================================ G1: selective decision-LLM gate
+
+def _capturing_svc(items, progress=480):
+    """Service whose model_chat_completion records every payload, so a test can
+    assert whether the per-step decision LLM was actually consulted."""
+    api = _StubApi(items=items, progress=progress)
+    captured: list[dict] = []
+    api.model_chat_completion = lambda payload: (  # type: ignore[assignment]
+        captured.append(payload) or {"choices": [{"message": {"content": "{}"}}]}
+    )
+    return ModelDecisionService(api), captured
+
+
+def _decide_status(progress=480):
+    return {"simulation_progress_minutes": progress, "current_lat": LAT, "current_lng": LNG}
+
+
+def test_decision_llm_gap_default_off_consults_llm() -> None:
+    """AGENT_DECISION_LLM_GAP defaults to 0 → even a clearly dominant top
+    candidate still consults the decision LLM (strict no-op until tuned)."""
+    assert mds._DECISION_LLM_GAP == 0.0, "default AGENT_DECISION_LLM_GAP must be 0 (neutral)"
+    items = [_cargo("BIG", price=8000.0, cost_time=120), _cargo("SMALL", price=200.0, cost_time=120)]
+    svc, captured = _capturing_svc(items)
+    svc._llm_decide_with_history(
+        "D", _decide_status(), DriverRules(), _full_plan(), DecisionHistory(), 480, LAT, LNG, 0, 480
+    )
+    assert captured, "LLM must be consulted on every step when the gate is off"
+
+
+def test_decision_llm_gap_skips_llm_on_clear_winner() -> None:
+    """With the gate on, a step whose top candidate dominates the runner-up by
+    more than the threshold skips the LLM round-trip entirely (returns None →
+    the rule engine makes the deterministic pick)."""
+    original = mds._DECISION_LLM_GAP
+    mds._DECISION_LLM_GAP = 0.2
+    try:
+        items = [_cargo("BIG", price=8000.0, cost_time=120), _cargo("SMALL", price=200.0, cost_time=120)]
+        svc, captured = _capturing_svc(items)
+        out = svc._llm_decide_with_history(
+            "D", _decide_status(), DriverRules(), _full_plan(), DecisionHistory(), 480, LAT, LNG, 0, 480
+        )
+        assert out is None, out
+        assert not captured, "a clear-winner step must NOT consult the decision LLM"
+    finally:
+        mds._DECISION_LLM_GAP = original
+
+
+def test_decision_llm_gap_consults_llm_on_close_candidates() -> None:
+    """With the gate on, a step whose top two candidates are near-equal (rank gap
+    below the threshold) still consults the LLM — that is exactly where the
+    per-step model judgement is worth its tokens."""
+    original = mds._DECISION_LLM_GAP
+    mds._DECISION_LLM_GAP = 0.2
+    try:
+        items = [_cargo("A", price=1000.0, cost_time=120), _cargo("B", price=980.0, cost_time=120)]
+        svc, captured = _capturing_svc(items)
+        svc._llm_decide_with_history(
+            "D", _decide_status(), DriverRules(), _full_plan(), DecisionHistory(), 480, LAT, LNG, 0, 480
+        )
+        assert captured, "an ambiguous (close top-2) step must consult the decision LLM"
+    finally:
+        mds._DECISION_LLM_GAP = original
+
+
+def test_decision_llm_gap_consults_llm_when_single_candidate() -> None:
+    """The gate only fires with >=2 feasible candidates; a thin market (0/1
+    candidate), where repositioning judgement matters, still consults the LLM."""
+    original = mds._DECISION_LLM_GAP
+    mds._DECISION_LLM_GAP = 0.2
+    try:
+        svc, captured = _capturing_svc([_cargo("ONLY", price=5000.0, cost_time=120)])
+        svc._llm_decide_with_history(
+            "D", _decide_status(), DriverRules(), _full_plan(), DecisionHistory(), 480, LAT, LNG, 0, 480
+        )
+        assert captured, "a single-candidate step must still consult the decision LLM"
+    finally:
+        mds._DECISION_LLM_GAP = original
+
+
 def _run() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     failures = 0
