@@ -41,6 +41,13 @@ they raise gross without adding preference penalty; the night-crossing knobs are
 the ones that trade penalty for gross. Current knobs include:
 `AGENT_NIGHT_CROSS_MARGIN`, `AGENT_NIGHT_CROSS_MAX_DAYS`,
 `AGENT_ORDER_TIME_OVERHEAD_MIN`, `AGENT_CHAIN_VALUE_WEIGHT`, `AGENT_ABS_NET_ALPHA`,
+`AGENT_CHAIN_DEPTH_WEIGHT` (default **0 = off**; complements `AGENT_CHAIN_VALUE_WEIGHT`
+by rewarding drop-off cities with *many* recently-observed orders, i.e. a reliable
+immediate re-load / less dead-head, not just a high mean rate — log-scaled, saturating
+at `AGENT_CHAIN_DEPTH_REF` orders, only on liquidity-positive destinations. Pure
+re-rank of already net>0+compliant candidates → gross-only, penalty-neutral; shared by
+the deterministic picker and the fast decision LLM; A/B 0.2–0.4 — see notes §-11),
+`AGENT_CHAIN_DEPTH_REF` (default **8**),
 `AGENT_WEAK_LOCAL_REPOSITION_NET_PER_H` (default **45**; divert off a weak local
 order to a richer observed market — net-protected via `_anti_strand` min_net gate
 and window-safe, so penalty-neutral; set 0 to restore "reposition only when
