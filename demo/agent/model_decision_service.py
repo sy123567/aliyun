@@ -225,10 +225,13 @@ _CHAIN_VALUE_WEIGHT = max(0.0, float(os.environ.get("AGENT_CHAIN_VALUE_WEIGHT", 
 # strand the truck after one chain. Folds in the depth count ``n`` from the same
 # liquidity table, log-scaled and saturating at ``_CHAIN_DEPTH_REF`` orders.
 # Pure re-ranking of already feasible+compliant candidates (applied after the
-# net>0/compliance filter) → gross-only, penalty-neutral. Default 0 == off, so it
-# is a strict no-op until tuned on the platform; the deterministic picker and the
-# fast decision LLM share the same score.
-_CHAIN_DEPTH_WEIGHT = max(0.0, float(os.environ.get("AGENT_CHAIN_DEPTH_WEIGHT", "0")))
+# net>0/compliance filter) → gross-only, penalty-neutral; the deterministic
+# picker and the fast decision LLM share the same score.
+# Default 0 → 0.3 (2026-06-15 gross push v5): the board gap to the leader is
+# almost entirely gross income (ours ~102.7k vs leader ~132.3k), and this lever
+# cannot add preference penalty by construction, so it is shipped on at the
+# notes §-11 A/B starting point. Set 0 to restore pure mean-rate chaining.
+_CHAIN_DEPTH_WEIGHT = max(0.0, float(os.environ.get("AGENT_CHAIN_DEPTH_WEIGHT", "0.3")))
 _CHAIN_DEPTH_REF = max(1.0, float(os.environ.get("AGENT_CHAIN_DEPTH_REF", "8")))
 # A1c — NEAR-hub chain credit: ``_CHAIN_VALUE_WEIGHT``/``_CHAIN_DEPTH_WEIGHT`` only
 # fire when the drop-off CITY itself appears in the recent-liquidity table (exact
@@ -239,11 +242,14 @@ _CHAIN_DEPTH_REF = max(1.0, float(os.environ.get("AGENT_CHAIN_DEPTH_REF", "8")))
 # value (within ``_CHAIN_NEAR_RADIUS_KM``), linearly decayed by distance and
 # scaled by ``_CHAIN_NEAR_WEIGHT`` (0..1), then fed through the SAME chain
 # multipliers. It is consulted ONLY when the exact-city lookup misses, so the
-# existing exact-match behaviour is byte-identical. Default 0 == off → strict
-# no-op until tuned on the platform. Pure re-ranking of already feasible+compliant
-# candidates → gross-only, penalty-neutral; zero extra scan cost (reuses the
-# already-built liquidity rows + city centroids).
-_CHAIN_NEAR_WEIGHT = max(0.0, min(1.0, float(os.environ.get("AGENT_CHAIN_NEAR_WEIGHT", "0"))))
+# existing exact-match behaviour is byte-identical. Pure re-ranking of already
+# feasible+compliant candidates → gross-only, penalty-neutral; zero extra scan
+# cost (reuses the already-built liquidity rows + city centroids).
+# Default 0 → 0.4 (2026-06-15 gross push v5): shipped on at the notes §-12 A/B
+# starting point to stop "short hop to a busy hub" drop-offs from being scored as
+# dead cities — pure gross upside, penalty-neutral. Set 0 to restore exact-city
+# chaining only.
+_CHAIN_NEAR_WEIGHT = max(0.0, min(1.0, float(os.environ.get("AGENT_CHAIN_NEAR_WEIGHT", "0.4"))))
 _CHAIN_NEAR_RADIUS_KM = max(1.0, float(os.environ.get("AGENT_CHAIN_NEAR_RADIUS_KM", "60")))
 # A1 — absolute-net emphasis: extra log-boost on big absolute net on top of the
 # overhead-amortised rate. Default 0 → 0.2 (2026-06-14 gross push): the

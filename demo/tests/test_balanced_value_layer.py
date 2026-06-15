@@ -110,13 +110,17 @@ def test_rank_score_abs_net_alpha_emphasises_big() -> None:
         mds._ABS_NET_ALPHA = original
 
 
-def test_rank_score_chain_depth_default_off_is_noop() -> None:
-    """AGENT_CHAIN_DEPTH_WEIGHT defaults to 0 → supplying a destination depth
-    count must not change the score (strict no-op until tuned on the platform)."""
-    assert mds._CHAIN_DEPTH_WEIGHT == 0.0, "default AGENT_CHAIN_DEPTH_WEIGHT must be 0 (neutral)"
-    without = ModelDecisionService._candidate_rank_score(1000.0, 100, 90.0)
+def test_rank_score_chain_depth_on_by_default_rewards_deep_market() -> None:
+    """Shipped default now rewards re-load depth (2026-06-15 gross push v5):
+    on a liquidity-positive destination, supplying a depth count lifts the score
+    above the no-depth ranking out of the box, and the bonus stays bounded by
+    (1 + weight). Penalty-neutral by construction (pure re-rank of net>0
+    candidates). Set AGENT_CHAIN_DEPTH_WEIGHT=0 to restore the strict no-op."""
+    assert mds._CHAIN_DEPTH_WEIGHT > 0.0, "default AGENT_CHAIN_DEPTH_WEIGHT must reward re-load depth"
+    no_depth = ModelDecisionService._candidate_rank_score(1000.0, 100, 90.0, 0)
     with_depth = ModelDecisionService._candidate_rank_score(1000.0, 100, 90.0, 50)
-    assert abs(without - with_depth) < 1e-9
+    assert with_depth > no_depth
+    assert with_depth <= no_depth * (1.0 + mds._CHAIN_DEPTH_WEIGHT) + 1e-9
 
 
 def test_rank_score_chain_depth_rewards_deeper_market() -> None:
@@ -157,12 +161,16 @@ def test_rank_score_chain_depth_neutral_when_dest_illiquid() -> None:
 _HUB = {"city": "广州", "n": 30, "net_per_h": 80.0, "lat": 23.13, "lng": 113.26}
 
 
-def test_nearby_chain_liquidity_default_off_is_noop() -> None:
-    """AGENT_CHAIN_NEAR_WEIGHT defaults to 0 → a drop-off right on top of a busy
-    hub still earns no near-credit (strict no-op until tuned on the platform)."""
-    assert mds._CHAIN_NEAR_WEIGHT == 0.0, "default AGENT_CHAIN_NEAR_WEIGHT must be 0 (neutral)"
+def test_nearby_chain_liquidity_on_by_default_credits_close_hub() -> None:
+    """Shipped default now credits a drop-off near a liquid hub (2026-06-15 gross
+    push v5): a drop-off sitting on a busy hub earns that hub's rate (scaled by
+    the default weight) and its depth count out of the box, instead of being
+    scored as a dead city. Penalty-neutral (only consulted on an exact-city miss,
+    pure re-rank). Set AGENT_CHAIN_NEAR_WEIGHT=0 to restore the strict no-op."""
+    assert mds._CHAIN_NEAR_WEIGHT > 0.0, "default AGENT_CHAIN_NEAR_WEIGHT must credit near hubs"
     liq, n = ModelDecisionService._nearby_chain_liquidity([_HUB], _HUB["lat"], _HUB["lng"])
-    assert liq == 0.0 and n == 0
+    assert n == _HUB["n"]
+    assert abs(liq - _HUB["net_per_h"] * mds._CHAIN_NEAR_WEIGHT) < 1.0, liq
 
 
 def test_nearby_chain_liquidity_credits_close_hub_and_decays_with_distance() -> None:
