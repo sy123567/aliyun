@@ -152,6 +152,64 @@ def test_rank_score_chain_depth_neutral_when_dest_illiquid() -> None:
         mds._CHAIN_DEPTH_WEIGHT = original_depth
 
 
+# ===================================================== A1c: near-hub chain credit
+
+_HUB = {"city": "广州", "n": 30, "net_per_h": 80.0, "lat": 23.13, "lng": 113.26}
+
+
+def test_nearby_chain_liquidity_default_off_is_noop() -> None:
+    """AGENT_CHAIN_NEAR_WEIGHT defaults to 0 → a drop-off right on top of a busy
+    hub still earns no near-credit (strict no-op until tuned on the platform)."""
+    assert mds._CHAIN_NEAR_WEIGHT == 0.0, "default AGENT_CHAIN_NEAR_WEIGHT must be 0 (neutral)"
+    liq, n = ModelDecisionService._nearby_chain_liquidity([_HUB], _HUB["lat"], _HUB["lng"])
+    assert liq == 0.0 and n == 0
+
+
+def test_nearby_chain_liquidity_credits_close_hub_and_decays_with_distance() -> None:
+    """With the lever on, a drop-off near a liquid hub is credited that hub's
+    rate, decayed linearly to zero at the radius; full weight at zero distance."""
+    original = mds._CHAIN_NEAR_WEIGHT
+    mds._CHAIN_NEAR_WEIGHT = 1.0
+    try:
+        # on the hub: full rate (decay ~1)
+        on_liq, on_n = ModelDecisionService._nearby_chain_liquidity(
+            [_HUB], _HUB["lat"], _HUB["lng"]
+        )
+        assert on_n == _HUB["n"]
+        assert abs(on_liq - _HUB["net_per_h"]) < 1.0, on_liq
+        # ~half radius away → roughly half credit, still less than on-hub
+        half_lat = _HUB["lat"] + (mds._CHAIN_NEAR_RADIUS_KM / 2.0) / 111.0
+        half_liq, _ = ModelDecisionService._nearby_chain_liquidity([_HUB], half_lat, _HUB["lng"])
+        assert 0.0 < half_liq < on_liq
+        # weight scales the credit down linearly
+        mds._CHAIN_NEAR_WEIGHT = 0.5
+        scaled_liq, _ = ModelDecisionService._nearby_chain_liquidity(
+            [_HUB], _HUB["lat"], _HUB["lng"]
+        )
+        assert abs(scaled_liq - on_liq * 0.5) < 1.0, (scaled_liq, on_liq)
+    finally:
+        mds._CHAIN_NEAR_WEIGHT = original
+
+
+def test_nearby_chain_liquidity_zero_beyond_radius() -> None:
+    """A hub farther than the radius (and an empty/illiquid table) credits
+    nothing — the drop-off stays a dead city, so the lever never invents chains."""
+    original = mds._CHAIN_NEAR_WEIGHT
+    mds._CHAIN_NEAR_WEIGHT = 1.0
+    try:
+        far_lat = _HUB["lat"] + (mds._CHAIN_NEAR_RADIUS_KM * 2.0) / 111.0
+        far_liq, far_n = ModelDecisionService._nearby_chain_liquidity([_HUB], far_lat, _HUB["lng"])
+        assert far_liq == 0.0 and far_n == 0
+        # empty table and unknown coords both credit nothing
+        assert ModelDecisionService._nearby_chain_liquidity([], _HUB["lat"], _HUB["lng"]) == (0.0, 0)
+        assert ModelDecisionService._nearby_chain_liquidity([_HUB], 0.0, 0.0) == (0.0, 0)
+        # an illiquid (net_per_h<=0) hub is ignored even if it is right here
+        dead_hub = {"city": "X", "n": 9, "net_per_h": 0.0, "lat": _HUB["lat"], "lng": _HUB["lng"]}
+        assert ModelDecisionService._nearby_chain_liquidity([dead_hub], _HUB["lat"], _HUB["lng"]) == (0.0, 0)
+    finally:
+        mds._CHAIN_NEAR_WEIGHT = original
+
+
 # ====================================================== A3: weak-local reposition
 
 def _cargo(cid, *, price, cost_time, slat=LAT, slng=LNG):

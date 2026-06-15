@@ -48,6 +48,16 @@ at `AGENT_CHAIN_DEPTH_REF` orders, only on liquidity-positive destinations. Pure
 re-rank of already net>0+compliant candidates → gross-only, penalty-neutral; shared by
 the deterministic picker and the fast decision LLM; A/B 0.2–0.4 — see notes §-11),
 `AGENT_CHAIN_DEPTH_REF` (default **8**),
+`AGENT_CHAIN_NEAR_WEIGHT` (default **0 = off**; extends the chain credit to drop-offs
+whose own city is *not* in the recent-liquidity table but which sit within
+`AGENT_CHAIN_NEAR_RADIUS_KM` of a liquid hub — credits that hub's mean `net_per_h`,
+decayed linearly to 0 at the radius, then fed through the SAME chain multipliers, so a
+short hop to a busy hub is no longer scored as a dead city. Only consulted when the
+exact-city lookup misses → exact-match path is byte-identical, zero extra scan cost
+(reuses the liquidity table + city centroids). Pure re-rank of already net>0+compliant
+candidates → gross-only, penalty-neutral; shared by the deterministic picker and the
+fast decision LLM; A/B 0.3–0.5 — see notes §-12),
+`AGENT_CHAIN_NEAR_RADIUS_KM` (default **60**; the search radius for the above),
 `AGENT_WEAK_LOCAL_REPOSITION_NET_PER_H` (default **45**; divert off a weak local
 order to a richer observed market — net-protected via `_anti_strand` min_net gate
 and window-safe, so penalty-neutral; set 0 to restore "reposition only when

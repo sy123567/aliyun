@@ -230,6 +230,21 @@ _CHAIN_VALUE_WEIGHT = max(0.0, float(os.environ.get("AGENT_CHAIN_VALUE_WEIGHT", 
 # fast decision LLM share the same score.
 _CHAIN_DEPTH_WEIGHT = max(0.0, float(os.environ.get("AGENT_CHAIN_DEPTH_WEIGHT", "0")))
 _CHAIN_DEPTH_REF = max(1.0, float(os.environ.get("AGENT_CHAIN_DEPTH_REF", "8")))
+# A1c — NEAR-hub chain credit: ``_CHAIN_VALUE_WEIGHT``/``_CHAIN_DEPTH_WEIGHT`` only
+# fire when the drop-off CITY itself appears in the recent-liquidity table (exact
+# city / region match). A drop-off that is not itself a scanned market but sits a
+# short hop from a busy hub is currently treated as a dead city (chain_liq=0) and
+# under-ranked — yet the truck can reach the next load with only a brief
+# reposition. This lever credits such a drop-off with the nearest liquid hub's
+# value (within ``_CHAIN_NEAR_RADIUS_KM``), linearly decayed by distance and
+# scaled by ``_CHAIN_NEAR_WEIGHT`` (0..1), then fed through the SAME chain
+# multipliers. It is consulted ONLY when the exact-city lookup misses, so the
+# existing exact-match behaviour is byte-identical. Default 0 == off → strict
+# no-op until tuned on the platform. Pure re-ranking of already feasible+compliant
+# candidates → gross-only, penalty-neutral; zero extra scan cost (reuses the
+# already-built liquidity rows + city centroids).
+_CHAIN_NEAR_WEIGHT = max(0.0, min(1.0, float(os.environ.get("AGENT_CHAIN_NEAR_WEIGHT", "0"))))
+_CHAIN_NEAR_RADIUS_KM = max(1.0, float(os.environ.get("AGENT_CHAIN_NEAR_RADIUS_KM", "60")))
 # A1 — absolute-net emphasis: extra log-boost on big absolute net on top of the
 # overhead-amortised rate. Default 0 → 0.2 (2026-06-14 gross push): the
 # submission had the LOWEST gross income on the board — too many big-absolute-net
@@ -979,6 +994,37 @@ class ModelDecisionService:
         return None
 
     @staticmethod
+    def _nearby_chain_liquidity(
+        liq_rows: list[dict[str, Any]], elat: float, elng: float
+    ) -> tuple[float, int]:
+        """[A1c] Chain credit for a drop-off NOT itself in the liquidity table but
+        within ``_CHAIN_NEAR_RADIUS_KM`` of a liquid hub.
+
+        Returns ``(credited_net_per_h, depth_n)`` of the single richest hub in
+        range, the rate linearly decayed by distance (full credit at 0 km, none
+        at the radius) and scaled by ``_CHAIN_NEAR_WEIGHT``; ``(0.0, 0)`` when the
+        lever is off, the coords are unknown, or no liquid hub is in range. Pure
+        ranking input — only ever raises a candidate's score (fed through the
+        chain multipliers, which are ≥1), never relaxes a feasibility/compliance
+        guard. Zero extra scan cost: scans the already-built ``liq_rows``."""
+        if _CHAIN_NEAR_WEIGHT <= 0.0 or (not elat and not elng):
+            return 0.0, 0
+        best_row: dict[str, Any] | None = None
+        best_dist = _CHAIN_NEAR_RADIUS_KM
+        for row in liq_rows:
+            if float(row.get("net_per_h", 0.0) or 0.0) <= 0.0:
+                continue
+            dist = _haversine_km(elat, elng, float(row["lat"]), float(row["lng"]))
+            if dist < best_dist:
+                best_dist = dist
+                best_row = row
+        if best_row is None:
+            return 0.0, 0
+        decay = max(0.0, 1.0 - best_dist / _CHAIN_NEAR_RADIUS_KM)
+        credited = float(best_row["net_per_h"]) * _CHAIN_NEAR_WEIGHT * decay
+        return credited, int(best_row.get("n", 0) or 0)
+
+    @staticmethod
     def _amortized_rate(net: float, occupied: int) -> float:
         """Ranking score: net amortised over (occupied + fixed per-order overhead).
 
@@ -1374,6 +1420,14 @@ class ModelDecisionService:
                 row["to_liq"] = f"{dest_liq['n']}单/{dest_liq['net_per_h']:.0f}元h"
                 chain_liq = float(dest_liq.get("net_per_h", 0.0) or 0.0)
                 chain_n = int(dest_liq.get("n", 0) or 0)
+            elif _CHAIN_NEAR_WEIGHT > 0.0:
+                # [A1c] drop-off not itself a scanned market: credit the nearest
+                # liquid hub (distance-decayed) so a short-hop-to-busy drop-off
+                # is not ranked as a dead city. No-op when the lever is off.
+                end = cargo.get("end") or {}
+                chain_liq, chain_n = self._nearby_chain_liquidity(
+                    liq_rows, float(end.get("lat", 0.0) or 0.0), float(end.get("lng", 0.0) or 0.0)
+                )
             # [A1] rank by overhead-amortised net + absolute-net + destination
             # chain liquidity & depth (consistent with the deterministic
             # _score_item), so the biggest *total-day-value* orders surface at the
@@ -2680,10 +2734,17 @@ class ModelDecisionService:
             # [A1] Amortise a fixed per-order overhead AND fold in destination
             # chain liquidity so a high-absolute-net long haul into a liquid
             # market is not buried behind a marginally-faster small order.
-            dest_city = str((cargo.get("end") or {}).get("city", "") or "")
+            end = cargo.get("end") or {}
+            dest_city = str(end.get("city", "") or "")
             dliq = self._dest_liquidity(liq_rows, dest_city) if dest_city else None
             chain_liq = float(dliq.get("net_per_h", 0.0) or 0.0) if dliq else 0.0
             chain_n = int(dliq.get("n", 0) or 0) if dliq else 0
+            if dliq is None and _CHAIN_NEAR_WEIGHT > 0.0:
+                # [A1c] no exact-city market: credit the nearest liquid hub
+                # (distance-decayed) instead of treating the drop-off as dead.
+                chain_liq, chain_n = self._nearby_chain_liquidity(
+                    liq_rows, float(end.get("lat", 0.0) or 0.0), float(end.get("lng", 0.0) or 0.0)
+                )
             score = self._candidate_rank_score(eff_net, occupied, chain_liq, chain_n)
             # [OPT] Category preference: exact name match with strong boost
             cargo_name = str(cargo.get("cargo_name", ""))
