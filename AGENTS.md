@@ -57,6 +57,13 @@ skipped, so with `AGENT_DECISION_LLM=0` `decide()` issues ZERO model calls. The
 regex parser handles the full 3-month D001 fixture incl. the weekend night-rest
 relaxation via `DriverRules.weekend_no_drive_shift_min`; trades LLM recall on
 unstructured/dialect prefs for determinism/speed — see notes §-9),
+`AGENT_FEWSHOT_TOPK` (default **40**; the preference extractor's few-shot is no longer
+inlined — it is retrieved per preference text from the >=400-example bank in
+`demo/agent/parse_fewshot_bank.py` and only the top-K most relevant (plus fixed anchor
+negatives) are injected. Set 0 to disable retrieval and use the rules-only extractor prompt;
+lower K to cut parse tokens. Only affects `AGENT_PARSE_LLM=1`. The bank carries many
+zero-constraint negatives to fight over-extraction / hallucinated constraints — the root
+cause of our lowest-gross standing — see notes §-10),
 `AGENT_DECISION_THINKING` (default **0 = OFF** as of 2026-06-14 — the per-step decision
 LLM runs in fast mode; set 1 to restore the old selective-thinking path),
 `AGENT_THINKING_WALL_BUDGET_SECONDS`, `AGENT_THINKING_SELECTIVE` (default 1 = spend the
@@ -66,7 +73,7 @@ effect when thinking is re-enabled), `AGENT_THINKING_HIGH_STAKES_NET` (default 1
 candidate / market-table widths shown to the fast decision LLM (spend idle token budget on
 context throughput, not reasoning depth), `AGENT_NIGHT_CROSS_EXTRA_MARGIN_PER_DAY`
 (default 0 = no-op; raise to trim marginal multi-day crossings). See
-`docs/agent-optimization-notes.md` §-9/§-8/§-6/§-5/§-4 for what each does and how to revert.
+`docs/agent-optimization-notes.md` §-10/§-9/§-8/§-6/§-5/§-4 for what each does and how to revert.
 
 The driver fixture (`demo/server/data/drivers.json`, D001) spans **three months**
 (2026-03-01→05-31): month-windowed category quotas (Apr 水果 12, May 建材 12 + Apr

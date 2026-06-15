@@ -34,6 +34,18 @@ from typing import Any
 
 from simkit.ports import SimulationApiPort
 
+# Dynamic few-shot bank + retriever for the preference extractor (see
+# parse_fewshot_bank.py / notes §-10). Guarded so the agent still imports even if
+# the bank module is somehow unavailable — retrieval just degrades to "no
+# examples" (rules-only prompt) rather than crashing.
+try:  # pragma: no cover - exercised indirectly
+    from agent.parse_fewshot_bank import select_examples as _select_fewshot_examples
+except Exception:  # pragma: no cover
+    try:
+        from parse_fewshot_bank import select_examples as _select_fewshot_examples  # type: ignore
+    except Exception:
+        _select_fewshot_examples = None  # type: ignore
+
 DAY_MINUTES = 1440
 MONTH_DAYS = 92
 SPEED_KM_PER_HOUR = 60.0
@@ -138,6 +150,16 @@ _DECISION_LLM = os.environ.get("AGENT_DECISION_LLM", "1").strip() not in ("0", "
 # for determinism/speed and is meant for the multi-run platform A/B, not a
 # single local run (notes §2).
 _PARSE_LLM = os.environ.get("AGENT_PARSE_LLM", "1").strip() not in ("0", "false", "False")
+# Dynamic few-shot retrieval for the preference extractor. Instead of inlining a
+# few hundred examples into _PARSE_SYSTEM (token-heavy + triggers over-extraction
+# / hallucinated constraints → needless order-skipping → lower gross, our actual
+# bottleneck), the >=400-example bank in parse_fewshot_bank.py is retrieved per
+# preference text and only the top-K most relevant (plus a few fixed anchor
+# negatives) are injected. K examples ≈ K×~270 tokens once per preference text;
+# at K=40 that's ~11k few-shot tokens/parse call, trivial against the 5M/driver
+# budget. Set 0 to disable retrieval entirely (rules-only extractor prompt — the
+# leanest parse mode). Only affects AGENT_PARSE_LLM=1. See notes §-10.
+_FEWSHOT_TOPK = int(os.environ.get("AGENT_FEWSHOT_TOPK", "40"))
 # Thinking mode for the per-step decision call. Default **OFF** as of the
 # 2026-06-14 leaderboard review: the #1 team (USTC "baseline") scores net
 # 116876 at only 15400 penalty while spending ~3.08M tokens/driver at ~5.55s
@@ -3493,53 +3515,37 @@ class ModelDecisionService:
         '同时把各金额按规则类别归因填入 rule_penalties。\n'
         '13) 输入可能含 penalty_caps 数组（各偏好的累计扣款上限，null=不封顶）。'
         '不封顶且每日生效的约束最危险（按天复利），其全部细节必须最优先完整抽出。\n\n'
-        "示例1：\n"
-        '入: {"preferences":["每天零点到六点停着熄火睡觉","凡是生鲜货源碰不得","三月四号五号不往深圳（22.55，114.05）跑"]}\n'
-        '出: {"daily_rest_hours":null,"rest_window":{"start_hour":0,"end_hour":6},'
-        '"no_drive_windows":[{"start_hour":0,"end_hour":6}],"off_days_min":0,'
-        '"forbidden_categories":["生鲜"],"avoid_categories":[],"forbidden_regions":[],"forbidden_zones":[],"bounded_area":null,'
-        '"required_region":null,"must_visit":[],"pickup_max_km":null,"haul_max_km":null,"monthly_deadhead_max_km":null,'
-        '"daily_order_limit":null,"first_order_before_hour":null,"monthly_category_targets":[],"home_rule":null,'
-        '"blackout":[{"region":"深圳","dates":[4,5]}],"dated_single":[],"dated_route":[]}\n\n'
-        "示例2：\n"
-        '入: {"preferences":["十二号得去仓库（23.15，113.67）盘库，花两小时","连续休息满8小时","空驶超过五十五公里别接"]}\n'
-        '出: {"daily_rest_hours":8,"rest_window":null,"no_drive_windows":[],"off_days_min":0,'
-        '"forbidden_categories":[],"avoid_categories":[],"forbidden_regions":[],"forbidden_zones":[],"bounded_area":null,'
-        '"required_region":null,"must_visit":[],"pickup_max_km":55,"haul_max_km":null,"monthly_deadhead_max_km":null,'
-        '"daily_order_limit":null,"first_order_before_hour":null,"monthly_category_targets":[],"home_rule":null,'
-        '"blackout":[],"dated_single":[{"date":12,"lat":23.15,"lng":113.67,"wait_minutes":120,"before_hour":null}],"dated_route":[]}\n\n'
-        "示例3：\n"
-        '入: {"preferences":["三十一号先过档口（23.15，113.67）取礼物，中午十二点前赶到县城（23.35，112.47）赴宴到下午两点"]}\n'
-        '出: {"daily_rest_hours":null,"rest_window":null,"no_drive_windows":[],"off_days_min":0,'
-        '"forbidden_categories":[],"avoid_categories":[],"forbidden_regions":[],"forbidden_zones":[],"bounded_area":null,'
-        '"required_region":null,"must_visit":[],"pickup_max_km":null,"haul_max_km":null,"monthly_deadhead_max_km":null,'
-        '"daily_order_limit":null,"first_order_before_hour":null,"monthly_category_targets":[],"home_rule":null,'
-        '"blackout":[],"dated_single":[],"dated_route":[{"date":31,"stops":[{"lat":23.15,"lng":113.67,"wait_minutes":0,"before_hour":12},{"lat":23.35,"lng":112.47,"wait_minutes":120,"before_hour":12}]}]}\n\n'
-        "示例4：\n"
-        '入: {"preferences":["龙门吊底座、机床铸件这类机械设备活儿干不了","装货地或卸货地在惠州的货一律不接"]}\n'
-        '出: {"daily_rest_hours":null,"rest_window":null,"no_drive_windows":[],"off_days_min":0,'
-        '"forbidden_categories":["龙门吊底座","机床铸件","机械设备"],"avoid_categories":[],"forbidden_regions":["惠州"],'
-        '"forbidden_zones":[],"bounded_area":null,"required_region":null,"must_visit":[],'
-        '"pickup_max_km":null,"haul_max_km":null,"monthly_deadhead_max_km":null,'
-        '"daily_order_limit":null,"first_order_before_hour":null,"monthly_category_targets":[],"home_rule":null,'
-        '"blackout":[],"dated_single":[],"dated_route":[]}\n\n'
-        "示例5：\n"
-        '入: {"preferences":["每天23点前车辆须在自家位置（23.10，113.50）1公里内，到次日8点前不接单不空跑","同一天接单不得超过3单"]}\n'
-        '出: {"daily_rest_hours":null,"rest_window":null,"no_drive_windows":[{"start_hour":23,"end_hour":8}],"off_days_min":0,'
-        '"forbidden_categories":[],"avoid_categories":[],"forbidden_regions":[],"forbidden_zones":[],"bounded_area":null,'
-        '"required_region":null,"must_visit":[],"pickup_max_km":null,"haul_max_km":null,"monthly_deadhead_max_km":null,'
-        '"daily_order_limit":3,"first_order_before_hour":null,"monthly_category_targets":[],'
-        '"home_rule":{"lat":23.10,"lng":113.50,"radius_km":1,"home_by_hour":23,"no_drive_until_hour":8},'
-        '"blackout":[],"dated_single":[],"dated_route":[]}\n\n'
-        "示例6：\n"
-        '入: {"preferences":["十一点半到下午一点半歇晌，雷打不动","二十号去老李仓库（23.25，113.40）对账，大概两小时"]}\n'
-        '出: {"daily_rest_hours":null,"rest_window":{"start_hour":11.5,"end_hour":13.5},'
-        '"no_drive_windows":[],"off_days_min":0,'
-        '"forbidden_categories":[],"avoid_categories":[],"forbidden_regions":[],"forbidden_zones":[],"bounded_area":null,'
-        '"required_region":null,"must_visit":[],"pickup_max_km":null,"haul_max_km":null,"monthly_deadhead_max_km":null,'
-        '"daily_order_limit":null,"first_order_before_hour":null,"monthly_category_targets":[],"home_rule":null,'
-        '"blackout":[],"dated_single":[{"date":20,"lat":23.25,"lng":113.40,"wait_minutes":120,"before_hour":null}],"dated_route":[]}'
     )
+
+    @staticmethod
+    def _fewshot_block(texts: list[str]) -> str:
+        """Build the dynamic few-shot block appended to _PARSE_SYSTEM.
+
+        Retrieves the top-_FEWSHOT_TOPK bank examples most relevant to the
+        preference text(s) being parsed (plus fixed anchor negatives) and renders
+        them in the same 入/出 format the inline examples used. Returns "" when
+        retrieval is disabled (AGENT_FEWSHOT_TOPK=0) or the bank is unavailable,
+        so the extractor falls back to the rules-only prompt.
+        """
+        if _FEWSHOT_TOPK <= 0 or _select_fewshot_examples is None:
+            return ""
+        query = " ".join(t for t in texts if t)
+        try:
+            examples = _select_fewshot_examples(query, k=_FEWSHOT_TOPK)
+        except Exception:
+            return ""
+        if not examples:
+            return ""
+        parts = [
+            "\n以下示例仅供参照"
+            "字段判定边界与格式（含「零约束」反例）。"
+            "切记：只抽取本次输入中明确出现的约束，绝不照搬示例里未在输入中出现的约束。\n\n"
+        ]
+        for idx, ex in enumerate(examples, 1):
+            in_json = json.dumps(ex["in"], ensure_ascii=False)
+            out_json = json.dumps(ex["out"], ensure_ascii=False)
+            parts.append(f"示例{idx}：\n入: {in_json}\n出: {out_json}\n\n")
+        return "".join(parts)
 
     def _llm_parse_preferences(
         self, driver_id: str, texts: list[str], rules: DriverRules,
@@ -3564,8 +3570,9 @@ class ModelDecisionService:
                 name: {"lat": loc[0], "lng": loc[1]} for name, loc in coord_map.items()
             }
         user = json.dumps(payload, ensure_ascii=False)
+        system = self._PARSE_SYSTEM + self._fewshot_block(texts)
         msgs = [
-            {"role": "system", "content": self._PARSE_SYSTEM},
+            {"role": "system", "content": system},
             {"role": "user", "content": user},
         ]
         # Try with json_object format first; retry without if it fails (some
