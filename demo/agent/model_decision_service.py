@@ -284,14 +284,19 @@ _NIGHT_CROSS_EXTRA_MARGIN_PER_DAY = max(0.0, float(os.environ.get("AGENT_NIGHT_C
 # is below this net-per-hour, prefer an anti-strand reposition toward a richer
 # observed market instead of locking the day into the weak order. 0 == off
 # (only reposition when NO order is reachable — the legacy trigger). Enabled at
-# 45 (2026-06-14 gross push v2): the submission's gap to the leader is now almost
-# entirely gross income (penalty already controlled), and idling/locking a day
-# into a sub-45元/h local order is a gross leak. The divert is net-protected
-# (``_anti_strand`` only moves when the richer market's anchor net, with the
-# reposition deadhead already netted out, STRICTLY beats the local order) and
-# window-safe (``_safe_reposition`` never drives into a no-drive window), so it
-# is penalty-neutral. Set 0 to restore the legacy "reposition only when stranded".
-_WEAK_LOCAL_REPOSITION_NET_PER_H = max(0.0, float(os.environ.get("AGENT_WEAK_LOCAL_REPOSITION_NET_PER_H", "45")))
+# 45 (2026-06-14 gross push v2); raised 45 → 58 (2026-06-15 gross push v6): the
+# submission's gap to the leader is almost entirely gross income (penalty already
+# controlled), and locking a day into a mediocre 45–58元/h local order is a gross
+# leak. The divert is net-protected (``_anti_strand`` only moves when the richer
+# market's anchor net, with the reposition deadhead already netted out, STRICTLY
+# beats the local order — else the local order is taken unchanged) and window-safe
+# (``_safe_reposition`` never drives into a no-drive window), so it adds NO
+# preference penalty (the reposition takes no order). The only cost is reposition
+# deadhead km, bounded by the min_net gate + ≤2 reposition/day + the ≥4h budget
+# floor — watch gross vs total deadhead on the platform; lower back toward 45 if
+# deadhead/cost rises without a gross gain. Set 0 to restore "reposition only when
+# stranded".
+_WEAK_LOCAL_REPOSITION_NET_PER_H = max(0.0, float(os.environ.get("AGENT_WEAK_LOCAL_REPOSITION_NET_PER_H", "58")))
 # B1 — penalty_cap credit: once a soft rule's monthly cumulative penalty has hit
 # its cap, further violations of that rule are free (the scorer caps the total),
 # so stop pricing them and unlock the orders they were blocking. 1 == on.

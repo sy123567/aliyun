@@ -69,10 +69,14 @@ extra scan cost (reuses the liquidity table + city centroids); shared by the
 deterministic picker and the fast decision LLM. Keep off unless re-A/B'd carefully one
 lever at a time — see notes §-12/§-13/§-14),
 `AGENT_CHAIN_NEAR_RADIUS_KM` (default **60**; the search radius for the above),
-`AGENT_WEAK_LOCAL_REPOSITION_NET_PER_H` (default **45**; divert off a weak local
-order to a richer observed market — net-protected via `_anti_strand` min_net gate
-and window-safe, so penalty-neutral; set 0 to restore "reposition only when
-stranded"), `AGENT_PENALTY_CAP_CREDIT`,
+`AGENT_WEAK_LOCAL_REPOSITION_NET_PER_H` (default **58**, raised 45→58 in gross push
+v6 — notes §-15; divert off a weak local order to a richer observed market —
+net-protected via `_anti_strand` min_net gate (else the local order is taken
+unchanged) and window-safe, so it adds no preference penalty; the only cost is
+reposition deadhead km, bounded by ≤2 reposition/day + a ≥4h budget floor — watch
+gross vs total deadhead on the platform, lower back toward 45 if deadhead/cost
+rises without a gross gain; set 0 to restore "reposition only when stranded"),
+`AGENT_PENALTY_CAP_CREDIT`,
 `AGENT_CATEGORY_SOFT`, `AGENT_LLM_WAIT_OVERRIDE_NET_PER_H`,
 `AGENT_DECISION_LLM` (default **1 = on**; set 0 for a fully deterministic agent —
 the per-step decision LLM is skipped entirely so `decide()` runs in ~0.1-0.3s with
