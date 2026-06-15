@@ -217,6 +217,19 @@ _THINKING_HIGH_STAKES_NET = float(os.environ.get("AGENT_THINKING_HIGH_STAKES_NET
 # earning instead of dead-heading out — pure gross upside, penalty-neutral
 # (ranking happens after the compliance/feasibility filter).
 _CHAIN_VALUE_WEIGHT = max(0.0, float(os.environ.get("AGENT_CHAIN_VALUE_WEIGHT", "0.45")))
+# A1b — chain DEPTH emphasis: ``_CHAIN_VALUE_WEIGHT`` rewards how *rich* the
+# drop-off city is (mean net/h); this complementary term rewards how *deep* it is
+# (how many distinct orders were recently observed there). A dense market means a
+# reliable immediate re-load — the truck dead-heads less and keeps earning — even
+# when the mean rate is only moderate, whereas a single-order "liquid" city can
+# strand the truck after one chain. Folds in the depth count ``n`` from the same
+# liquidity table, log-scaled and saturating at ``_CHAIN_DEPTH_REF`` orders.
+# Pure re-ranking of already feasible+compliant candidates (applied after the
+# net>0/compliance filter) → gross-only, penalty-neutral. Default 0 == off, so it
+# is a strict no-op until tuned on the platform; the deterministic picker and the
+# fast decision LLM share the same score.
+_CHAIN_DEPTH_WEIGHT = max(0.0, float(os.environ.get("AGENT_CHAIN_DEPTH_WEIGHT", "0")))
+_CHAIN_DEPTH_REF = max(1.0, float(os.environ.get("AGENT_CHAIN_DEPTH_REF", "8")))
 # A1 — absolute-net emphasis: extra log-boost on big absolute net on top of the
 # overhead-amortised rate. Default 0 → 0.2 (2026-06-14 gross push): the
 # submission had the LOWEST gross income on the board — too many big-absolute-net
@@ -977,18 +990,22 @@ class ModelDecisionService:
         return float(net) / (max(1, int(occupied)) + _ORDER_TIME_OVERHEAD_MIN) * 60.0
 
     @staticmethod
-    def _candidate_rank_score(net: float, occupied: int, chain_liq: float = 0.0) -> float:
+    def _candidate_rank_score(net: float, occupied: int, chain_liq: float = 0.0,
+                              chain_n: int = 0) -> float:
         """[A1] Ranking score = overhead-amortised rate, optionally boosted by
 
         - absolute net (log term, ``_ABS_NET_ALPHA``): emphasises big hauls even
-          more than the overhead term alone; and
+          more than the overhead term alone;
         - destination chain liquidity (``_CHAIN_VALUE_WEIGHT``): an order whose
           drop-off city has a liquid follow-up market is worth more because the
-          truck re-loads immediately instead of dead-heading out.
+          truck re-loads immediately instead of dead-heading out; and
+        - destination chain DEPTH (``_CHAIN_DEPTH_WEIGHT``, ``chain_n``): a market
+          with many recently-observed orders gives a reliable re-load (less
+          dead-head) even when its mean rate is only moderate.
 
         Pure re-ranking of already-feasible candidates — never affects the net>0
-        feasibility filter. With both weights 0 it equals ``_amortized_rate`` so
-        existing behaviour/tests are preserved; the chain term is also neutral
+        feasibility filter. With all weights 0 it equals ``_amortized_rate`` so
+        existing behaviour/tests are preserved; the chain terms are also neutral
         whenever the destination has no observed liquidity (``chain_liq<=0``)."""
         base = ModelDecisionService._amortized_rate(net, occupied)
         if _ABS_NET_ALPHA > 0.0 and net > 0:
@@ -997,6 +1014,14 @@ class ModelDecisionService:
             # bounded: a destination market of ~100元/h or richer gives the full
             # weight; weaker markets scale down linearly. Never reduces the score.
             base *= 1.0 + _CHAIN_VALUE_WEIGHT * min(1.0, float(chain_liq) / 100.0)
+        if _CHAIN_DEPTH_WEIGHT > 0.0 and chain_n > 0 and chain_liq > 0.0:
+            # Reward re-load reliability (order count) at a destination that is
+            # already liquid-positive. Log-scaled and saturating at
+            # ``_CHAIN_DEPTH_REF`` orders so one dense hub does not dominate.
+            # Never reduces the score (additive multiplier ≥ 1).
+            base *= 1.0 + _CHAIN_DEPTH_WEIGHT * min(
+                1.0, math.log1p(float(chain_n)) / math.log1p(_CHAIN_DEPTH_REF)
+            )
         return base
 
     def _night_window_capped(self, rules: DriverRules, plan: dict, day: int) -> bool:
@@ -1343,15 +1368,17 @@ class ModelDecisionService:
             }
             dest_liq = self._dest_liquidity(liq_rows, dest_city)
             chain_liq = 0.0
+            chain_n = 0
             if dest_liq is not None:
                 # follow-up market at the destination: recent departures + value
                 row["to_liq"] = f"{dest_liq['n']}单/{dest_liq['net_per_h']:.0f}元h"
                 chain_liq = float(dest_liq.get("net_per_h", 0.0) or 0.0)
+                chain_n = int(dest_liq.get("n", 0) or 0)
             # [A1] rank by overhead-amortised net + absolute-net + destination
-            # chain liquidity (consistent with the deterministic _score_item), so
-            # the biggest *total-day-value* orders surface at the top of the list
-            # the model reads first, instead of the fastest tiny ones.
-            row["_rank"] = self._candidate_rank_score(row["net"], row["minutes"], chain_liq)
+            # chain liquidity & depth (consistent with the deterministic
+            # _score_item), so the biggest *total-day-value* orders surface at the
+            # top of the list the model reads first, instead of the fastest tiny ones.
+            row["_rank"] = self._candidate_rank_score(row["net"], row["minutes"], chain_liq, chain_n)
             cargo_summary.append(row)
         cargo_summary.sort(key=lambda r: -r["_rank"])
         cargo_summary = cargo_summary[:_LLM_CARGO_SUMMARY_LIMIT]
@@ -2656,7 +2683,8 @@ class ModelDecisionService:
             dest_city = str((cargo.get("end") or {}).get("city", "") or "")
             dliq = self._dest_liquidity(liq_rows, dest_city) if dest_city else None
             chain_liq = float(dliq.get("net_per_h", 0.0) or 0.0) if dliq else 0.0
-            score = self._candidate_rank_score(eff_net, occupied, chain_liq)
+            chain_n = int(dliq.get("n", 0) or 0) if dliq else 0
+            score = self._candidate_rank_score(eff_net, occupied, chain_liq, chain_n)
             # [OPT] Category preference: exact name match with strong boost
             cargo_name = str(cargo.get("cargo_name", ""))
             is_cat_target = False

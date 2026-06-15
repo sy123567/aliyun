@@ -110,6 +110,48 @@ def test_rank_score_abs_net_alpha_emphasises_big() -> None:
         mds._ABS_NET_ALPHA = original
 
 
+def test_rank_score_chain_depth_default_off_is_noop() -> None:
+    """AGENT_CHAIN_DEPTH_WEIGHT defaults to 0 → supplying a destination depth
+    count must not change the score (strict no-op until tuned on the platform)."""
+    assert mds._CHAIN_DEPTH_WEIGHT == 0.0, "default AGENT_CHAIN_DEPTH_WEIGHT must be 0 (neutral)"
+    without = ModelDecisionService._candidate_rank_score(1000.0, 100, 90.0)
+    with_depth = ModelDecisionService._candidate_rank_score(1000.0, 100, 90.0, 50)
+    assert abs(without - with_depth) < 1e-9
+
+
+def test_rank_score_chain_depth_rewards_deeper_market() -> None:
+    """With the depth term enabled, two orders with identical net AND identical
+    mean destination liquidity rank by re-load depth: the deeper market (more
+    recently-observed orders) wins, and the bonus is bounded by (1 + weight)."""
+    original_alpha = mds._ABS_NET_ALPHA
+    original_depth = mds._CHAIN_DEPTH_WEIGHT
+    mds._ABS_NET_ALPHA = 0.0
+    mds._CHAIN_DEPTH_WEIGHT = 0.3
+    try:
+        no_depth = ModelDecisionService._candidate_rank_score(1000.0, 100, 60.0, 0)
+        shallow = ModelDecisionService._candidate_rank_score(1000.0, 100, 60.0, 1)
+        deep = ModelDecisionService._candidate_rank_score(1000.0, 100, 60.0, 40)
+        assert deep > shallow >= no_depth
+        assert deep <= no_depth * (1.0 + mds._CHAIN_DEPTH_WEIGHT) + 1e-9
+    finally:
+        mds._ABS_NET_ALPHA = original_alpha
+        mds._CHAIN_DEPTH_WEIGHT = original_depth
+
+
+def test_rank_score_chain_depth_neutral_when_dest_illiquid() -> None:
+    """Depth only applies to a liquidity-positive destination: a dead drop-off
+    market (chain_liq<=0) gets no depth bonus even with many observed orders, so
+    a high count never rescues a stranding destination."""
+    original_depth = mds._CHAIN_DEPTH_WEIGHT
+    mds._CHAIN_DEPTH_WEIGHT = 0.5
+    try:
+        dead_deep = ModelDecisionService._candidate_rank_score(1000.0, 100, 0.0, 99)
+        dead_none = ModelDecisionService._candidate_rank_score(1000.0, 100, 0.0, 0)
+        assert abs(dead_deep - dead_none) < 1e-9
+    finally:
+        mds._CHAIN_DEPTH_WEIGHT = original_depth
+
+
 # ====================================================== A3: weak-local reposition
 
 def _cargo(cid, *, price, cost_time, slat=LAT, slng=LNG):
