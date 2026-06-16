@@ -88,6 +88,8 @@ _LLM_QUERY_K = max(10, int(os.environ.get("AGENT_LLM_QUERY_K", "100")))
 # Default 300 gives a slightly wider JSON response budget for the final
 # information-throughput run. Env-revertable: set to 180.
 _LLM_DECISION_MAX_TOKENS = max(50, int(os.environ.get("AGENT_LLM_DECISION_MAX_TOKENS", "300")))
+_LLM_RISK_FIELDS = os.environ.get("AGENT_LLM_RISK_FIELDS", "1").strip() not in ("0", "false", "False")
+_LLM_RISK_GATE = os.environ.get("AGENT_LLM_RISK_GATE", "1").strip() not in ("0", "false", "False")
 _MIN_BOUNDED_AREA_SPAN = 0.1
 # Fixed non-earning overhead (minutes) amortised per order when RANKING
 # candidates. Pure net-per-minute ranking systematically under-ranks big/long
@@ -1439,10 +1441,15 @@ class ModelDecisionService:
         # includes what the truck can pick up NEXT at its destination.
         liq_rows = self._cargo_liquidity_stats(now)
 
-        # Build a compact list of locally feasible cargo, best net/h first
-        # (was: first-N in distance order, which buried the best candidates).
-        # LLM may express preference, but execution safety stays deterministic.
+        month_idx = _month_index_for_day(day)
+        cat_target, cat_needed = self._get_category_target(rules, plan, day)
+
+        # Build a compact list of locally feasible cargo, best risk-adjusted
+        # whole-day value first (was: first-N in distance order, which buried the
+        # best candidates). LLM may express preference, but execution safety
+        # stays deterministic.
         cargo_summary = []
+        candidate_meta = {}
         night_capped = self._night_window_capped(rules, plan, day)
         for item in items:
             cargo = item.get("cargo", {})
@@ -1484,16 +1491,84 @@ class ModelDecisionService:
                 chain_liq, chain_n = self._nearby_chain_liquidity(
                     liq_rows, float(end.get("lat", 0.0) or 0.0), float(end.get("lng", 0.0) or 0.0)
                 )
+            risk_flags: list[str] = []
+            extra_penalty = 0.0
+            quota_state = ""
+            finish = now + int(occupied)
+            crossings = self._count_nodrive_crossings(rules, now, finish)
+            if crossings > 0:
+                risk_flags.append(f"night_cross_x{crossings}")
+            cost_time = int(cargo.get("cost_time_minutes", 0) or 0)
+            if (
+                rules.longhaul_cap_orders is not None
+                and cost_time > rules.longhaul_min_minutes
+                and int(plan.get("monthly_longhual", {}).get(month_idx, 0)) >= rules.longhaul_cap_orders
+                and not self._longhaul_cap_credit(rules, plan, day)
+            ):
+                risk_flags.append("longhaul_over_cap")
+                extra_penalty += float(rules.longhaul_penalty)
+            if cat_target and cat_needed > 0:
+                if self._category_matches_sem(cat_target, str(cargo.get("cargo_name", ""))):
+                    quota_state = "hit_target"
+                    if _LLM_RISK_FIELDS:
+                        row["quota"] = quota_state
+                else:
+                    risk_flags.append("non_target_while_quota_due")
+            if chain_liq > 0.0:
+                if _LLM_RISK_FIELDS:
+                    row["chain_n"] = chain_n
+                    row["chain_rate"] = round(chain_liq)
+            elif row["net"] >= 1500:
+                risk_flags.append("cold_dropoff")
+            risk_adjusted_net = float(net) - extra_penalty
+            if risk_adjusted_net <= 0.0:
+                continue
+            if _LLM_RISK_FIELDS:
+                if risk_flags:
+                    row["risk_flags"] = risk_flags[:4]
+                    row["risk_adjusted_net"] = round(risk_adjusted_net)
+                if extra_penalty > 0.0:
+                    row["extra_penalty"] = round(extra_penalty)
+                    row["net_after_extra_penalty"] = round(risk_adjusted_net)
             # [A1] rank by overhead-amortised net + absolute-net + destination
             # chain liquidity & depth (consistent with the deterministic
             # _score_item), so the biggest *total-day-value* orders surface at the
             # top of the list the model reads first, instead of the fastest tiny ones.
-            row["_rank"] = self._candidate_rank_score(row["net"], row["minutes"], chain_liq, chain_n)
+            row["_rank"] = self._candidate_rank_score(risk_adjusted_net, row["minutes"], chain_liq, chain_n)
+            candidate_meta[cargo_id] = {
+                "score": row["_rank"],
+                "net": risk_adjusted_net,
+                "risk_flags": risk_flags[:4],
+                "quota": quota_state,
+            }
             cargo_summary.append(row)
         cargo_summary.sort(key=lambda r: -r["_rank"])
         cargo_summary = cargo_summary[:_LLM_CARGO_SUMMARY_LIMIT]
         for _r in cargo_summary:
             _r.pop("_rank", None)  # internal ranking key, never shown to the model
+        visible_ids = {str(r.get("cargo_id", "")) for r in cargo_summary}
+        candidate_meta = {cid: meta for cid, meta in candidate_meta.items() if cid in visible_ids}
+
+        def _risk_dominated(cargo_id: str) -> bool:
+            if not _LLM_RISK_GATE:
+                return False
+            chosen = candidate_meta.get(cargo_id)
+            if not chosen or not chosen.get("risk_flags") or chosen.get("quota") == "hit_target":
+                return False
+            chosen_net = float(chosen["net"])
+            chosen_score = float(chosen["score"])
+            for other_id, other in candidate_meta.items():
+                if other_id == cargo_id or other.get("risk_flags"):
+                    continue
+                if float(other["net"]) >= chosen_net and float(other["score"]) >= chosen_score:
+                    self._logger.info(
+                        "[LLM] risk gate rejected cargo_id=%s flags=%s: safer %s dominates "
+                        "(net %.0f>=%.0f score %.1f>=%.1f)",
+                        cargo_id, chosen.get("risk_flags"), other_id,
+                        float(other["net"]), chosen_net, float(other["score"]), chosen_score,
+                    )
+                    return True
+            return False
 
         # Build preference rules summary
         pref_summary = self._format_rules_for_llm(driver_id, rules, plan, day)
@@ -1523,6 +1598,9 @@ class ModelDecisionService:
             '结合候选的 to_liq 和下方【活跃市场】表，向前推演 2-3 单：接这单卸到 X → X 的 to_liq/活跃度说明下一单能接到什么 → '
             '再下一步又能到哪。比较"高 net 但卸到冷门城(链条到此中断、要空驶找货)"与"net 稍低但卸到 to_liq 旺的枢纽(链条持续、全天连着接)"，'
             '选**整条链全天净收益总和**最大的那一单。若有未达标品类指标则优先能推进该品类的链路\n'
+            '④**风险兜底字段**：候选若有 risk_flags/extra_penalty/net_after_extra_penalty，说明它可能触发软罚分或卸到冷门地；'
+            '冲榜可以吃风险，但只能在 net_after_extra_penalty 仍明显领先、或能推进紧急品类/强链路时选择；'
+            '同等净收益优先无 risk_flags、chain_n/chain_rate 更高的单。\n'
             '- wait: 等待。参数: {"duration_minutes": 分钟数}。仅用于休息/禁驶时段(见下方硬约束)；'
             '有正净值候选时等待=白白烧时间，不要因为"等更好的货"而wait\n'
             '- reposition: 空驶到新位置。参数: {"latitude": 纬度, "longitude": 经度}。'
@@ -1570,7 +1648,7 @@ class ModelDecisionService:
             f"## 偏好规则与合规进度\n{pref_summary}\n\n"
             f"## 决策历史\n{history_text}\n\n"
             f"{liq_block}"
-            f"## 已通过本地可行性检查的候选货源({len(cargo_summary)}条, 按net_per_h降序)\n"
+            f"## 已通过本地可行性检查的候选货源({len(cargo_summary)}条, 按风险调整后的综合净收益/链路价值降序)\n"
             f"{json.dumps(cargo_summary, ensure_ascii=False, separators=(',', ':'))}\n\n"
             f"请做出决策（只输出JSON）:"
         )
@@ -1664,6 +1742,8 @@ class ModelDecisionService:
                 if action_type == "take_order" and "cargo_id" in params:
                     cargo_id = str(params["cargo_id"])
                     if not self._validate_llm_take_order(cargo_id, items, rules, plan, now, lat, lng, day, hard_end):
+                        return None
+                    if _risk_dominated(cargo_id):
                         return None
                     return self._take_order(cargo_id)
                 elif action_type == "wait" and "duration_minutes" in params:

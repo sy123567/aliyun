@@ -125,7 +125,8 @@ soft-penalised big hauls, so calibrate multi-run on the platform and revert via
 net gain. `AGENT_LLM_QUERY_K` (default **100**) controls the per-step cargo scan pool ranked
 before the prompt is truncated; spend more token + scan budget on information, revert to 50.
 `AGENT_LLM_DECISION_MAX_TOKENS` (default **300**) caps the fast JSON response; revert to 180.
-`AGENT_NIGHT_CROSS_EXTRA_MARGIN_PER_DAY`
+`AGENT_LLM_RISK_FIELDS` (default **1**) adds compact per-candidate risk/extra-penalty fields while keeping PR91 widths.
+`AGENT_LLM_RISK_GATE` (default **1**) rejects an LLM-picked risky order if a clean visible order dominates it on post-penalty net and chain-adjusted score. Set 0 to restore pure PR91 prompt-only picking. `AGENT_NIGHT_CROSS_EXTRA_MARGIN_PER_DAY`
 (default **1.0**, raised 0→1.0 in penalty push v9 — notes §-18; demands
 `night_pen * extra` of EXTRA penalty-free net for every crossed night past the first,
 so a 2+ night crossing must clear ~double the night penalty before it is even shown to
