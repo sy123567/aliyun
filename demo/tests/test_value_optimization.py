@@ -181,6 +181,54 @@ def test_llm_system_prompt_weighs_absolute_net() -> None:
     assert "绝对净收益" in sys_msg
 
 
+def test_llm_risk_rows_rank_by_post_penalty_net() -> None:
+    """Prompt widening must not sort soft-penalty over-cap hauls by raw net."""
+    risky = _cargo("RISK", price=5000.0, cost_time=600)
+    clean = _cargo("CLEAN", price=4300.0, cost_time=300)
+    rules = DriverRules()
+    rules.longhaul_cap_orders = 1
+    rules.rule_penalties["longhaul_cap"] = 1000.0
+    plan = _plan()
+    plan["monthly_longhual"] = {0: 1}
+    stub = _Stub(
+        [risky, clean],
+        progress=480,
+        on_chat=lambda p: {
+            "choices": [{"message": {"content": json.dumps(
+                {"action": "wait", "params": {"duration_minutes": 30}})}}]
+        },
+    )
+    svc = ModelDecisionService(stub)
+    status = {"simulation_progress_minutes": 480, "current_lat": LAT, "current_lng": LNG}
+    svc._llm_decide_with_history("D", status, rules, plan, DecisionHistory(), 480, LAT, LNG, 0, 480)
+    user = stub.payloads[0]["messages"][1]["content"]
+    assert '"net_after_extra_penalty":4000' in user, user
+    assert user.index("CLEAN") < user.index("RISK"), user
+
+
+def test_llm_risk_gate_rejects_dominated_overcap_pick() -> None:
+    risky = _cargo("RISK", price=5000.0, cost_time=600)
+    clean = _cargo("CLEAN", price=4300.0, cost_time=300)
+    rules = DriverRules()
+    rules.longhaul_cap_orders = 1
+    rules.rule_penalties["longhaul_cap"] = 1000.0
+    plan = _plan()
+    plan["monthly_longhual"] = {0: 1}
+    stub = _Stub(
+        [risky, clean],
+        progress=480,
+        on_chat=lambda p: {
+            "choices": [{"message": {"content": json.dumps(
+                {"action": "take_order", "params": {"cargo_id": "RISK"}, "reason": "冲高毛利"}
+            )}}]
+        },
+    )
+    svc = ModelDecisionService(stub)
+    status = {"simulation_progress_minutes": 480, "current_lat": LAT, "current_lng": LNG}
+    action = svc._llm_decide_with_history("D", status, rules, plan, DecisionHistory(), 480, LAT, LNG, 0, 480)
+    assert action is None, action
+
+
 # ------------------------------------------- decision-LLM context width (§-17)
 # Gross push v8: spend the spare token budget on a WIDER per-step context
 # (more candidates + more observed-market rows) so the fast LLM can pick better
