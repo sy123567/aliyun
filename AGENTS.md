@@ -115,14 +115,17 @@ LLM runs in fast mode; set 1 to restore the old selective-thinking path),
 `AGENT_THINKING_WALL_BUDGET_SECONDS`, `AGENT_THINKING_SELECTIVE` (default 1 = spend the
 idle reasoning budget only on high-stakes steps under a hard cumulative cap; only takes
 effect when thinking is re-enabled), `AGENT_THINKING_HIGH_STAKES_NET` (default 1500),
-`AGENT_LLM_CARGO_SUMMARY_LIMIT` (default **40**, raised 24→40 in gross push v8 — notes §-17)
-/ `AGENT_LIQ_TOP_N` (default **20**, raised 12→20) — candidate / market-table widths shown
+`AGENT_LLM_CARGO_SUMMARY_LIMIT` (default **80**, raised 24→40→80 in gross push v8/v10 — notes §-17)
+/ `AGENT_LIQ_TOP_N` (default **30**, raised 12→20→30) — candidate / market-table widths shown
 to the fast decision LLM (spend idle token budget on context throughput — INFORMATION — not
 reasoning depth; an A/B of thinking-on regressed, gross up but penalty doubled §-6/§-7). This
 is a ceiling bet, NOT penalty-neutral: a wider candidate list can also surface more
 soft-penalised big hauls, so calibrate multi-run on the platform and revert via
 `AGENT_LLM_CARGO_SUMMARY_LIMIT=24` / `AGENT_LIQ_TOP_N=12` if penalty/deadhead creep without a
-net gain. `AGENT_NIGHT_CROSS_EXTRA_MARGIN_PER_DAY`
+net gain. `AGENT_LLM_QUERY_K` (default **100**) controls the per-step cargo scan pool ranked
+before the prompt is truncated; spend more token + scan budget on information, revert to 50.
+`AGENT_LLM_DECISION_MAX_TOKENS` (default **300**) caps the fast JSON response; revert to 180.
+`AGENT_NIGHT_CROSS_EXTRA_MARGIN_PER_DAY`
 (default **1.0**, raised 0→1.0 in penalty push v9 — notes §-18; demands
 `night_pen * extra` of EXTRA penalty-free net for every crossed night past the first,
 so a 2+ night crossing must clear ~double the night penalty before it is even shown to

@@ -219,7 +219,10 @@ def test_context_width_defaults_widened() -> None:
 def test_llm_candidate_list_respects_widened_limit() -> None:
     """With more feasible candidates than the limit, the model sees exactly the
     widened number of rows (and strictly more than the old 24 default)."""
-    items = [_cargo(f"C{i:02d}", price=600.0 + i * 10, cost_time=60) for i in range(45)]
+    items = [
+        _cargo(f"C{i:02d}", price=600.0 + i * 10, cost_time=60)
+        for i in range(mds._LLM_CARGO_SUMMARY_LIMIT + 5)
+    ]
     user = _capture_payload(items)["user"]
     shown = user.count('"cargo_id":')
     assert shown == mds._LLM_CARGO_SUMMARY_LIMIT, shown
@@ -231,7 +234,7 @@ def test_llm_market_table_respects_widened_limit() -> None:
     widened number of rows (and strictly more than the old 12 default)."""
     liq = [
         {"city": f"城{i:02d}", "n": 9, "net_per_h": 120.0, "lat": LAT + i * 0.1, "lng": LNG}
-        for i in range(25)
+        for i in range(mds._LIQ_TOP_N + 5)
     ]
     user = _capture_payload([_cargo("X", price=600.0, cost_time=60)], liq_rows=liq)["user"]
     shown = user.count("近3天见")

@@ -117,7 +117,7 @@ def test_low_stakes_step_stays_fast() -> None:
     svc = ModelDecisionService(api)
     _decide_once(svc, api, DriverRules(), now=480, day=0, tod=480)
     assert _last_thinking(api) is False
-    assert api.payloads[-1]["max_tokens"] == 180
+    assert api.payloads[-1]["max_tokens"] == mds._LLM_DECISION_MAX_TOKENS
     assert "D" not in svc._thinking_spent  # nothing charged
 
 
@@ -184,7 +184,7 @@ def test_selective_can_be_disabled_for_legacy_behaviour() -> None:
 
 def test_thinking_off_by_default_even_on_big_net() -> None:
     """Shipped default is now thinking OFF: even a high-stakes big-net step runs
-    the decision LLM in fast mode (no enable_thinking, 180-token completion).
+    the decision LLM in fast mode (no enable_thinking, bounded fast completion).
     This is the 2026-06-14 change — the leaderboard leader wins in fast mode."""
     assert mds._DECISION_THINKING is False, "default AGENT_DECISION_THINKING must be off"
     big = _cargo("BIG", price=3000.0, cost_time=120)  # net 3000 >= high-stakes
@@ -192,7 +192,7 @@ def test_thinking_off_by_default_even_on_big_net() -> None:
     svc = ModelDecisionService(api)
     _decide_once(svc, api, DriverRules(), now=480, day=0, tod=480)
     assert _last_thinking(api) is False
-    assert api.payloads[-1]["max_tokens"] == 180
+    assert api.payloads[-1]["max_tokens"] == mds._LLM_DECISION_MAX_TOKENS
     assert "D" not in svc._thinking_spent  # no reasoning budget charged
 
 
