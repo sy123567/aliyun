@@ -263,6 +263,57 @@ def test_anti_strand_min_net_gate_blocks_worse_target() -> None:
     assert act_high is None, act_high
 
 
+# ================================================== F2: idle forward-reposition
+
+# ~50km east of (LAT,LNG): inside the 200km deadhead cap, reachable same day.
+def _hub_row(*, n=10, net_per_h=90.0, dlng=0.5):
+    return {"city": "广州", "n": n, "net_per_h": net_per_h, "lat": LAT, "lng": LNG + dlng}
+
+
+def test_idle_forward_reposition_on_by_default() -> None:
+    """Gross push v7 ships the lever ON: with a rich, deep, in-range observed hub
+    the otherwise-idling driver repositions toward it (a reposition action takes no
+    order, so zero preference penalty), and only once per day."""
+    assert mds._IDLE_FORWARD_REPOSITION_NET_PER_H > 0.0, "default must be on (see notes §-16)"
+    svc = _svc(progress=480)
+    svc._cargo_liquidity_stats = lambda now: [_hub_row()]  # type: ignore[method-assign]
+    plan = {"fwd_repo": set()}
+    act = svc._idle_forward_reposition("D", DriverRules(), plan, 480, LAT, LNG, 0, 1440)
+    assert act is not None and act["action"] == "reposition", act
+    assert 0 in plan["fwd_repo"]
+    # second call same day -> capped at one reposition/day
+    assert svc._idle_forward_reposition("D", DriverRules(), plan, 480, LAT, LNG, 0, 1440) is None
+
+
+def test_idle_forward_reposition_gates_block_weak_shallow_far_and_short_budget() -> None:
+    """The bet only fires for a rich (net/h>=threshold), deep (n>=MIN_N), in-range
+    (<=MAX_KM) hub with a >=4h budget left — otherwise it falls through to the wait."""
+    svc = _svc(progress=480)
+    rules = DriverRules()
+    thresh = mds._IDLE_FORWARD_REPOSITION_NET_PER_H
+    weak = _hub_row(net_per_h=thresh - 10.0)              # below richness floor
+    shallow = _hub_row(n=mds._IDLE_FORWARD_REPOSITION_MIN_N - 1)  # too few orders
+    far = _hub_row(dlng=5.0)                              # well beyond MAX_KM
+    for row in (weak, shallow, far):
+        svc._cargo_liquidity_stats = lambda now, r=row: [r]  # type: ignore[method-assign]
+        assert svc._idle_forward_reposition("D", rules, {"fwd_repo": set()}, 480, LAT, LNG, 0, 1440) is None, row
+    # rich in-range hub but <4h budget left -> no reposition (avoid late-day churn)
+    svc._cargo_liquidity_stats = lambda now: [_hub_row()]  # type: ignore[method-assign]
+    assert svc._idle_forward_reposition("D", rules, {"fwd_repo": set()}, 1320, LAT, LNG, 0, 1440) is None
+
+
+def test_idle_forward_reposition_disabled_is_noop() -> None:
+    """AGENT_IDLE_FORWARD_REPOSITION_NET_PER_H=0 restores pure-wait: never moves."""
+    svc = _svc(progress=480)
+    svc._cargo_liquidity_stats = lambda now: [_hub_row()]  # type: ignore[method-assign]
+    original = mds._IDLE_FORWARD_REPOSITION_NET_PER_H
+    mds._IDLE_FORWARD_REPOSITION_NET_PER_H = 0.0
+    try:
+        assert svc._idle_forward_reposition("D", DriverRules(), {"fwd_repo": set()}, 480, LAT, LNG, 0, 1440) is None
+    finally:
+        mds._IDLE_FORWARD_REPOSITION_NET_PER_H = original
+
+
 # ============================================================ B1: penalty cap
 
 NIGHT = (1260, 1800)

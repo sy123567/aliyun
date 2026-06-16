@@ -76,6 +76,20 @@ unchanged) and window-safe, so it adds no preference penalty; the only cost is
 reposition deadhead km, bounded by ≤2 reposition/day + a ≥4h budget floor — watch
 gross vs total deadhead on the platform, lower back toward 45 if deadhead/cost
 rises without a gross gain; set 0 to restore "reposition only when stranded"),
+`AGENT_IDLE_FORWARD_REPOSITION_NET_PER_H` (default **60**, gross push v7 — notes §-16;
+the otherwise-idling driver — no order pickable AND `_anti_strand` found no *currently
+reachable* target — repositions once toward the richest *observed* liquidity hub (mean
+`net_per_h` ≥ this, with ≥ `AGENT_IDLE_FORWARD_REPOSITION_MIN_N` recent orders, within
+`AGENT_IDLE_FORWARD_REPOSITION_MAX_KM`) instead of pure-waiting, betting the market
+re-stocks. Takes no order ⇒ zero preference penalty + window/region/blackout-safe, so
+penalty-orthogonal like the weak-local lever; but UNLIKE it this is NOT a strict no-op —
+it does not require a currently-reachable order, so it is a bounded positive-EV bet whose
+only cost is the deadhead km when the bet misses (capped by MAX_KM + 1 reposition/day +
+the ≥4h budget floor). Shipped on under the best-of-N leaderboard (a wasted-deadhead run
+is free, a landed bet lifts the ceiling). Set 0 to restore pure-wait),
+`AGENT_IDLE_FORWARD_REPOSITION_MIN_N` (default **4**; depth floor so the bet never chases
+a single outlier order) / `AGENT_IDLE_FORWARD_REPOSITION_MAX_KM` (default **200**; deadhead
+cap on the bet),
 `AGENT_PENALTY_CAP_CREDIT`,
 `AGENT_CATEGORY_SOFT`, `AGENT_LLM_WAIT_OVERRIDE_NET_PER_H`,
 `AGENT_DECISION_LLM` (default **1 = on**; set 0 for a fully deterministic agent —
