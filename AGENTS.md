@@ -115,9 +115,14 @@ LLM runs in fast mode; set 1 to restore the old selective-thinking path),
 `AGENT_THINKING_WALL_BUDGET_SECONDS`, `AGENT_THINKING_SELECTIVE` (default 1 = spend the
 idle reasoning budget only on high-stakes steps under a hard cumulative cap; only takes
 effect when thinking is re-enabled), `AGENT_THINKING_HIGH_STAKES_NET` (default 1500),
-`AGENT_LLM_CARGO_SUMMARY_LIMIT` (default **24**) / `AGENT_LIQ_TOP_N` (default **12**) —
-candidate / market-table widths shown to the fast decision LLM (spend idle token budget on
-context throughput, not reasoning depth), `AGENT_NIGHT_CROSS_EXTRA_MARGIN_PER_DAY`
+`AGENT_LLM_CARGO_SUMMARY_LIMIT` (default **40**, raised 24→40 in gross push v8 — notes §-17)
+/ `AGENT_LIQ_TOP_N` (default **20**, raised 12→20) — candidate / market-table widths shown
+to the fast decision LLM (spend idle token budget on context throughput — INFORMATION — not
+reasoning depth; an A/B of thinking-on regressed, gross up but penalty doubled §-6/§-7). This
+is a ceiling bet, NOT penalty-neutral: a wider candidate list can also surface more
+soft-penalised big hauls, so calibrate multi-run on the platform and revert via
+`AGENT_LLM_CARGO_SUMMARY_LIMIT=24` / `AGENT_LIQ_TOP_N=12` if penalty/deadhead creep without a
+net gain. `AGENT_NIGHT_CROSS_EXTRA_MARGIN_PER_DAY`
 (default **1.0**, raised 0→1.0 in penalty push v9 — notes §-18; demands
 `night_pen * extra` of EXTRA penalty-free net for every crossed night past the first,
 so a 2+ night crossing must clear ~double the night penalty before it is even shown to
@@ -127,7 +132,7 @@ single-night evening haul byte-identical — crossings == 1 are never touched at
 NOT a pure no-op (a trimmed multi-night haul whose true net was positive costs a little
 gross) but evidence-backed + low gross risk; best-of-N keeps 84949 as a floor. Revert via
 `AGENT_NIGHT_CROSS_EXTRA_MARGIN_PER_DAY=0`). See
-`docs/agent-optimization-notes.md` §-18/§-10/§-9/§-8/§-6/§-5/§-4 for what each does and how to revert.
+`docs/agent-optimization-notes.md` §-18/§-17/§-16/§-15/§-10/§-9/§-8/§-6/§-5/§-4 for what each does and how to revert.
 
 The driver fixture (`demo/server/data/drivers.json`, D001) spans **three months**
 (2026-03-01→05-31): month-windowed category quotas (Apr 水果 12, May 建材 12 + Apr

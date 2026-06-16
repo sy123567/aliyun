@@ -32,6 +32,7 @@ _DEMO_ROOT = Path(__file__).resolve().parent.parent
 if str(_DEMO_ROOT) not in sys.path:
     sys.path.insert(0, str(_DEMO_ROOT))
 
+import agent.model_decision_service as mds  # noqa: E402
 from agent.model_decision_service import (  # noqa: E402
     DecisionHistory,
     DriverRules,
@@ -178,6 +179,64 @@ def test_llm_candidates_ranked_big_value_first() -> None:
 def test_llm_system_prompt_weighs_absolute_net() -> None:
     sys_msg = _capture_llm_payload()["system"]
     assert "绝对净收益" in sys_msg
+
+
+# ------------------------------------------- decision-LLM context width (§-17)
+# Gross push v8: spend the spare token budget on a WIDER per-step context
+# (more candidates + more observed-market rows) so the fast LLM can pick better
+# without re-enabling thinking (which A/B-regressed: gross up, penalty doubled).
+
+def _capture_payload(items, liq_rows=None) -> dict:
+    stub = _Stub(
+        items,
+        progress=480,
+        on_chat=lambda p: {
+            "choices": [{"message": {"content": json.dumps(
+                {"action": "wait", "params": {"duration_minutes": 30}})}}]
+        },
+    )
+    svc = ModelDecisionService(stub)
+    if liq_rows is not None:
+        svc._cargo_liquidity_stats = lambda now, _r=liq_rows: _r  # type: ignore[assignment]
+    status = {"simulation_progress_minutes": 480, "current_lat": LAT, "current_lng": LNG}
+    svc._llm_decide_with_history(
+        "D", status, DriverRules(), _plan(), DecisionHistory(),
+        480, LAT, LNG, 0, 480,
+    )
+    assert stub.payloads, "LLM was not called"
+    return {
+        "user": stub.payloads[0]["messages"][1]["content"],
+        "system": stub.payloads[0]["messages"][0]["content"],
+    }
+
+
+def test_context_width_defaults_widened() -> None:
+    """v8 submission defaults: candidate list >= 40, market table >= 20."""
+    assert mds._LLM_CARGO_SUMMARY_LIMIT >= 40, mds._LLM_CARGO_SUMMARY_LIMIT
+    assert mds._LIQ_TOP_N >= 20, mds._LIQ_TOP_N
+
+
+def test_llm_candidate_list_respects_widened_limit() -> None:
+    """With more feasible candidates than the limit, the model sees exactly the
+    widened number of rows (and strictly more than the old 24 default)."""
+    items = [_cargo(f"C{i:02d}", price=600.0 + i * 10, cost_time=60) for i in range(45)]
+    user = _capture_payload(items)["user"]
+    shown = user.count('"cargo_id":')
+    assert shown == mds._LLM_CARGO_SUMMARY_LIMIT, shown
+    assert shown > 24, f"widening must show more than the old 24, got {shown}"
+
+
+def test_llm_market_table_respects_widened_limit() -> None:
+    """With more observed markets than the limit, the table shows exactly the
+    widened number of rows (and strictly more than the old 12 default)."""
+    liq = [
+        {"city": f"城{i:02d}", "n": 9, "net_per_h": 120.0, "lat": LAT + i * 0.1, "lng": LNG}
+        for i in range(25)
+    ]
+    user = _capture_payload([_cargo("X", price=600.0, cost_time=60)], liq_rows=liq)["user"]
+    shown = user.count("近3天见")
+    assert shown == mds._LIQ_TOP_N, shown
+    assert shown > 12, f"widening must show more market rows than the old 12, got {shown}"
 
 
 def _run() -> int:
