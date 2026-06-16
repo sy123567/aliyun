@@ -2,14 +2,14 @@
 
 架构（闭环偏好编译 + 每日合规计划，面向未知司机泛化；偏好原文为第一公民）：
 
-1. 编译（LLM 优先，逐条）：每条自然语言偏好单独交给 LLM 抽取成结构化规则
+1. 编译（PR95 默认 LLM-only，逐条）：每条自然语言偏好单独交给 LLM 抽取成结构化规则
    （时间窗 / 区域 / 品类 / 配额 / 日期事件…），逐字段做语义接地确认。
 2. 审计修复（闭环）：编译完成后，再用一次 LLM 审计「每条偏好的全部约束是否
-   都已体现在结构化规则里」，缺失的部分以补丁形式回填——这取代了旧版按
-   D001 措辞写死的正则补抽层（正则解析仅在模型不可用时作为离线兜底）。
+   都已体现在结构化规则里」，缺失的部分以补丁形式回填；审计不可用/不完整时
+   不再静默正则兜底，而是保留原文为 residual 风险。
 3. 零静默丢弃：审计后仍无法用结构化字段表达的偏好，进入
-   ``DriverRules.residual_constraints``，逐步注入决策 prompt（带违约金额），
-   由决策 LLM 在线遵守——任何偏好都不会被悄悄丢掉。
+   ``DriverRules.residual_constraints``；默认确定性执行模式会 fail-closed 等待，
+   除非显式打开决策 LLM 或关闭严格 residual gate。
 4. 每日合规计划层：每个仿真日开始时，把**偏好原文** + 当天日历（几月几号、
    星期几）+ 月度合规进度交给 LLM，产出"今天"的具体约束（今日禁驶时段、
    今日必须做/避免的事、品类缺口提醒）。任意措辞、任意条件式偏好（周末
@@ -147,34 +147,25 @@ _LLM_WAIT_OVERRIDE_NET_PER_H = float(os.environ.get("AGENT_LLM_WAIT_OVERRIDE_NET
 # keeps the genuinely big hauls (the feature's intent) while dropping the thin
 # crossings that drove the penalty up. Env-tunable for platform sweeps (§2).
 _NIGHT_CROSS_MARGIN = max(1.0, float(os.environ.get("AGENT_NIGHT_CROSS_MARGIN", "1.5")))
-# Whether to consult the decision LLM on each step AT ALL. Default ON (the LLM
-# co-decides every compliant step). Set AGENT_DECISION_LLM=0 for a *fully
-# deterministic* agent: the per-step decision LLM is skipped and every step is
-# resolved by the local rule-engine scheduler (_schedule). This is how the
-# sub-second / tens-of-thousands-of-token teams on the leaderboard run — no
-# per-step network round-trip ⇒ ~0.1-0.3s/decision and negligible tokens, and
-# zero risk of the hard 4h finals cap. Preference compilation + the daily
-# directive (a handful of calls per driver) still use the LLM, so compliance
-# understanding is unchanged. Our own notes §-1 found that deeper per-step LLM
-# involvement scored *worse*, and the leaderboard's near-zero-LLM teams currently
-# out-net our LLM-on submission — so this is the highest-signal A/B to run.
-_DECISION_LLM = os.environ.get("AGENT_DECISION_LLM", "1").strip() not in ("0", "false", "False")
-# Whether to compile preferences with the LLM AT ALL. Default ON (per-text LLM
-# extraction + audit + the per-day compliance directive). Set AGENT_PARSE_LLM=0
-# for a *fully deterministic* "直接解析" agent: every preference is parsed by the
-# local regex engine (_parse_one + _supplement_*) and the per-day LLM directive
-# is skipped. Combined with AGENT_DECISION_LLM=0 this makes decide() issue ZERO
-# model calls — the zero-token / sub-second leaderboard profile (§-8) — at the
-# cost of relying on the regex parser's coverage. The regex parser already
-# handles the 3-month D001 fixture (night window, monthly category quotas +
-# carryover, long-haul cap); the weekend night-rest relaxation that the per-day
-# directive used to supply is reproduced deterministically via
-# DriverRules.weekend_no_drive_shift_min (see §-9). Anything the regex parser
-# cannot express still lands in residual_constraints, but with the decision LLM
-# also off those are not re-read per step — so this mode trades a little recall
-# for determinism/speed and is meant for the multi-run platform A/B, not a
-# single local run (notes §2).
+# Whether to consult the decision LLM on each step AT ALL. PR95 default OFF:
+# only the preference compiler uses the model; once rules are compiled, the
+# hard-coded scheduler/validators execute them deterministically. Set
+# AGENT_DECISION_LLM=1 to restore the PR92/93 per-step co-decision path.
+_DECISION_LLM = os.environ.get("AGENT_DECISION_LLM", "0").strip() not in ("0", "false", "False")
+# Whether to compile preferences with the LLM AT ALL. PR95 default ON and strict:
+# preference understanding is LLM-only (extract + coverage audit), while
+# execution is code-only. Set AGENT_PARSE_LLM=0 to intentionally run the legacy
+# deterministic regex parser for offline/debug A/B.
 _PARSE_LLM = os.environ.get("AGENT_PARSE_LLM", "1").strip() not in ("0", "false", "False")
+# PR95 fail-closed parse mode. When the extractor/auditor is unavailable or
+# cannot prove coverage, do not silently fall back to regex; keep the raw
+# preference as a residual risk so deterministic execution can refuse unsafe
+# action. Set 0 to restore the old model-down regex fallback.
+_LLM_PARSE_STRICT = os.environ.get("AGENT_LLM_PARSE_STRICT", "1").strip() not in ("0", "false", "False")
+# When running without a decision LLM, residual constraints cannot be interpreted
+# online. Default fail-closed: wait instead of taking/repositioning until the
+# preferences are fully structured or strict mode is disabled.
+_STRICT_RESIDUAL_GATE = os.environ.get("AGENT_STRICT_RESIDUAL_GATE", "1").strip() not in ("0", "false", "False")
 # Dynamic few-shot retrieval for the preference extractor. Instead of inlining a
 # few hundred examples into _PARSE_SYSTEM (token-heavy + triggers over-extraction
 # / hallucinated constraints → needless order-skipping → lower gross, our actual
@@ -1325,19 +1316,12 @@ class ModelDecisionService:
         # any failure the static parse stays in charge.
         self._ensure_daily_directive(driver_id, rules, plan, day)
 
-        # Try LLM-driven decision with history context
+        # PR95 default: skip LLM-driven decisions and execute the hard-coded
+        # scheduler. AGENT_DECISION_LLM=1 restores the earlier every-step LLM
+        # co-decision path, still guarded by deterministic validators/fallbacks.
         action = None
         step = self._step_count[driver_id]
         consecutive_waits = plan.get("_consecutive_waits", 0)
-        # LLM co-decides EVERY step (was every 3rd). Finals data point: the #1
-        # team spends ~3.2M tokens/driver (we used ~0.2M of the 5M budget) and
-        # wins entirely on gross income at the SAME preference penalty — the
-        # value side is where unspent token budget converts into score. The
-        # deterministic layer still hard-guards compliance and provides the
-        # fallback; the wait-loop guard keeps the known LLM idle-loop failure
-        # mode in check.
-        # AGENT_DECISION_LLM=0 turns this off entirely → fully deterministic agent
-        # (sub-second, near-zero tokens), like the leaderboard's low-latency teams.
         use_llm = _DECISION_LLM and consecutive_waits < 3
         if use_llm:
             action = self._llm_decide_with_history(
@@ -2441,6 +2425,17 @@ class ModelDecisionService:
             return self._wait(1)
         day_start = day * DAY_MINUTES
         day_end = day_start + DAY_MINUTES
+
+        # PR95 risk gate: if preference parsing left any raw residual constraint
+        # and no decision LLM is available to interpret it online, do not take or
+        # reposition. Waiting is the only action that cannot violate an unknown
+        # driver preference.
+        if _STRICT_RESIDUAL_GATE and not _DECISION_LLM and rules.residual_constraints:
+            self._logger.info(
+                "strict residual gate: driver_id=%s residual=%d -> wait",
+                driver_id, len(rules.residual_constraints),
+            )
+            return self._safe_wait(rules, now, min(max(day_end - now, 1), 120))
 
         # (A) full off day: idle/rest the whole day.
         if day in plan["off_days"]:
@@ -3572,7 +3567,9 @@ class ModelDecisionService:
         #      (replaces the old D001-phrasing regex supplement layer);
         #   3. no silent drop: anything still not representable lands in
         #      rules.residual_constraints and is enforced via the decision prompt.
-        # The regex parser remains only as an offline fallback (model unavailable).
+        # PR95 strict mode no longer silently falls back to regex on model/audit
+        # failure: unresolved preferences become residual risks and deterministic
+        # execution fails closed.
         rules = self._rules.get(driver_id)
         if rules is None:
             rules = DriverRules()
@@ -3617,17 +3614,21 @@ class ModelDecisionService:
         coord_map = self._collect_coords(prefs)
         compiled: list[tuple[str, Any, Any]] = []
         for text, penalty, cap in new_items:
-            # AGENT_PARSE_LLM=0 forces the deterministic regex parser for every
-            # text (fully "直接解析"); otherwise try the LLM compile first and fall
-            # back to regex only when the model is unavailable.
+            # AGENT_PARSE_LLM=0 is the explicit legacy regex/debug mode. In PR95
+            # normal operation, parsing is LLM-only; if the model cannot produce
+            # audited structured rules, the raw preference is retained as a
+            # residual risk rather than converted by local regex.
             if _PARSE_LLM and self._llm_parse_preferences(driver_id, [text], rules, coord_map, [penalty], [cap]):
                 compiled.append((text, penalty, cap))
             else:
-                # offline / model unavailable / parse-LLM disabled: deterministic
-                # regex fallback for this text only.
-                self._parse_one(text, rules, coord_map)
-                self._supplement_basic_rules(text, rules)
-                self._supplement_dated_events(text, rules, coord_map)
+                if _PARSE_LLM and _LLM_PARSE_STRICT:
+                    self._add_residual_constraint(
+                        rules, text, penalty, "LLM偏好解析未成功，严格模式不启用正则兜底", cap
+                    )
+                else:
+                    self._parse_one(text, rules, coord_map)
+                    self._supplement_basic_rules(text, rules)
+                    self._supplement_dated_events(text, rules, coord_map)
         if compiled:
             self._audit_preference_coverage(driver_id, compiled, rules, coord_map)
             # Cross-check LLM dated event coords against text-extracted coords.
@@ -3664,7 +3665,7 @@ class ModelDecisionService:
                     rules.blackout_coords[region] = loc
                     break
         seen.update(t for t, _p, _c in new_items)
-        # Dedup avoid/forbidden AFTER supplement so regex-added items are also cleaned
+        # Dedup avoid/forbidden after all parse sources (LLM or explicit legacy regex mode).
         init_lat, init_lng = self._initial_position[driver_id]
         self._supplement_relative_allowed_regions(texts, rules, init_lat, init_lng)
         self._supplement_night_failsafe(texts, rules)
@@ -3835,8 +3836,8 @@ class ModelDecisionService:
     ) -> bool:
         """用大模型把全部可见偏好解析成结构化规则并合并进 rules。
 
-        返回 True 表示 LLM 成功产出结构化结果；False 表示模型不可用/解析失败
-        （此时调用方会退回正则解析）。
+        返回 True 表示 LLM 成功产出结构化结果；False 表示模型不可用/解析失败。
+        PR95 严格模式下调用方会保留 residual risk，而不是静默正则兜底。
         """
         if not texts:
             return False
@@ -4024,8 +4025,8 @@ class ModelDecisionService:
         constraint (enforced via the decision prompt — never silently dropped).
 
         This replaces the old phrasing-specific regex supplement layer as the
-        recall mechanism, so unseen drivers/wordings generalise. Fail-open: if
-        the audit call is unavailable the compiled rules simply stand as-is.
+        recall mechanism, so unseen drivers/wordings generalise. PR95 strict
+        mode fails closed: unavailable/malformed audits create residual risks.
         """
         texts = [t for t, _p, _c in compiled]
         penalties = [p for _t, p, _c in compiled]
@@ -4061,11 +4062,24 @@ class ModelDecisionService:
             if data is not None:
                 break
         if data is None:
-            self._logger.info("coverage audit unavailable driver_id=%s (rules stand as-is)", driver_id)
+            if _LLM_PARSE_STRICT:
+                for idx, text in enumerate(texts):
+                    self._add_residual_constraint(
+                        rules, text, penalties[idx], "LLM覆盖审计不可用，严格模式保留为未结构化偏好", caps[idx]
+                    )
+                self._logger.info("coverage audit unavailable driver_id=%s (strict residuals added)", driver_id)
+            else:
+                self._logger.info("coverage audit unavailable driver_id=%s (rules stand as-is)", driver_id)
             return
         audits = data.get("audits")
         if not isinstance(audits, list):
+            if _LLM_PARSE_STRICT:
+                for idx, text in enumerate(texts):
+                    self._add_residual_constraint(
+                        rules, text, penalties[idx], "LLM覆盖审计结果格式无效，严格模式保留为未结构化偏好", caps[idx]
+                    )
             return
+        audited: set[int] = set()
         for entry in audits:
             if not isinstance(entry, dict):
                 continue
@@ -4073,7 +4087,10 @@ class ModelDecisionService:
                 idx = int(entry.get("index"))
             except (TypeError, ValueError):
                 continue
-            if not (0 <= idx < len(texts)) or entry.get("covered") is True:
+            if not (0 <= idx < len(texts)):
+                continue
+            audited.add(idx)
+            if entry.get("covered") is True:
                 continue
             text = texts[idx]
             patch = entry.get("patch")
@@ -4098,6 +4115,12 @@ class ModelDecisionService:
                     "coverage audit: pref #%d kept as residual constraint driver_id=%s",
                     idx, driver_id,
                 )
+        if _LLM_PARSE_STRICT:
+            for idx, text in enumerate(texts):
+                if idx not in audited:
+                    self._add_residual_constraint(
+                        rules, text, penalties[idx], "LLM覆盖审计缺少该偏好，严格模式保留为未结构化偏好", caps[idx]
+                    )
 
     @staticmethod
     def _add_residual_constraint(

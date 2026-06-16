@@ -92,17 +92,18 @@ a single outlier order) / `AGENT_IDLE_FORWARD_REPOSITION_MAX_KM` (default **200*
 cap on the bet),
 `AGENT_PENALTY_CAP_CREDIT`,
 `AGENT_CATEGORY_SOFT`, `AGENT_LLM_WAIT_OVERRIDE_NET_PER_H`,
-`AGENT_DECISION_LLM` (default **1 = on**; set 0 for a fully deterministic agent —
-the per-step decision LLM is skipped entirely so `decide()` runs in ~0.1-0.3s with
-near-zero tokens, like the low-latency leaderboard teams; preference compile +
-daily directive still use the LLM. Leaderboard evidence + notes §-1/§-8 suggest
-this is worth A/B-ing since near-zero-LLM teams currently out-net our LLM-on run),
-`AGENT_PARSE_LLM` (default **1 = on**; set 0 for fully deterministic "直接解析" —
-every preference is parsed by the regex engine and the per-day LLM directive is
-skipped, so with `AGENT_DECISION_LLM=0` `decide()` issues ZERO model calls. The
-regex parser handles the full 3-month D001 fixture incl. the weekend night-rest
-relaxation via `DriverRules.weekend_no_drive_shift_min`; trades LLM recall on
-unstructured/dialect prefs for determinism/speed — see notes §-9),
+`AGENT_DECISION_LLM` (default **0 = off** in PR95; only preference parsing uses
+the model, then the hard-coded scheduler/validators execute deterministically.
+Set 1 to restore the PR92/93 per-step decision LLM),
+`AGENT_PARSE_LLM` (default **1 = on**; PR95 parses preferences with LLM extract +
+coverage audit. Set 0 for the legacy deterministic "直接解析" regex parser and to
+skip the per-day LLM directive),
+`AGENT_LLM_PARSE_STRICT` (default **1**; if extraction/audit is unavailable or
+incomplete, do **not** silently regex-fallback — keep the raw preference as a
+residual risk. Set 0 to restore old model-down regex fallback),
+`AGENT_STRICT_RESIDUAL_GATE` (default **1**; when `AGENT_DECISION_LLM=0`, any
+unresolved residual preference makes deterministic execution wait instead of
+taking/repositioning, so unknown-driver parse uncertainty fails closed),
 `AGENT_FEWSHOT_TOPK` (default **40**; the preference extractor's few-shot is no longer
 inlined — it is retrieved per preference text from the >=400-example bank in
 `demo/agent/parse_fewshot_bank.py` and only the top-K most relevant (plus fixed anchor
