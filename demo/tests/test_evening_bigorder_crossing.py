@@ -296,6 +296,69 @@ def test_margin_does_not_affect_daytime_orders() -> None:
     assert ev is not None  # daytime order never sees the crossing gate
 
 
+# ----------------------------------------- multi-night extra safety margin
+
+def _eval_with_extra_margin(extra, svc, rules, cargo, item, now, day_end):
+    """Evaluate ``cargo`` with ``_NIGHT_CROSS_EXTRA_MARGIN_PER_DAY`` set; keeps
+    ``_NIGHT_CROSS_MAX_DAYS`` at 2 so a two-window crossing is allowed."""
+    orig_extra = mds._NIGHT_CROSS_EXTRA_MARGIN_PER_DAY
+    orig_max = mds._NIGHT_CROSS_MAX_DAYS
+    mds._NIGHT_CROSS_EXTRA_MARGIN_PER_DAY = extra
+    mds._NIGHT_CROSS_MAX_DAYS = 2
+    try:
+        return _eval(svc, rules, cargo, item, now, day_end)
+    finally:
+        mds._NIGHT_CROSS_EXTRA_MARGIN_PER_DAY = orig_extra
+        mds._NIGHT_CROSS_MAX_DAYS = orig_max
+
+
+def test_extra_margin_per_day_default_is_active() -> None:
+    """penalty push v9: the multi-night extra margin now defaults to >=1.0 (it
+    used to be a no-op 0), so marginal 2+ night crossings are trimmed by default."""
+    assert mds._NIGHT_CROSS_EXTRA_MARGIN_PER_DAY >= 1.0, mds._NIGHT_CROSS_EXTRA_MARGIN_PER_DAY
+
+
+def test_two_window_crossing_trimmed_by_extra_margin() -> None:
+    """A two-window crossing whose net clears the flat margin (so it passes with
+    extra=0) but not the extra per-day margin is dropped at the default 1.0.
+    net = 9400 - 2*2700 = 4000; flat margin = (2*2700)*0.5 = 2700 (passes);
+    with extra=1.0 the bar rises by 2700*1 -> 5400, and 4000 <= 5400 -> rejected."""
+    svc = _svc()
+    rules = _rules()
+    cargo, item = _cargo(price=9400.0, cost_time=1920, haul_dst=(GZ_LAT, GZ_LNG))
+    # legacy (extra=0): the same haul is accepted -> proves the new term is the
+    # only thing rejecting it.
+    legacy = _eval_with_extra_margin(0.0, svc, rules, cargo, item, now=1080, day_end=1260)
+    assert legacy is not None
+    assert abs(legacy[0] - 4000.0) < 1.0, legacy[0]
+    # default (extra=1.0): trimmed.
+    assert _eval_with_extra_margin(1.0, svc, rules, cargo, item, now=1080, day_end=1260) is None
+
+
+def test_huge_two_window_crossing_survives_extra_margin() -> None:
+    """A genuinely huge multi-night haul (net far above double the penalty) is
+    still taken at the default extra margin — we only trim the marginal ones."""
+    svc = _svc()
+    rules = _rules()
+    cargo, item = _cargo(price=30000.0, cost_time=1920, haul_dst=(GZ_LAT, GZ_LNG))
+    ev = _eval_with_extra_margin(1.0, svc, rules, cargo, item, now=1080, day_end=1260)
+    assert ev is not None
+    assert abs(ev[0] - (30000.0 - 2 * NIGHT_PENALTY)) < 1.0, ev[0]
+
+
+def test_single_window_crossing_unaffected_by_extra_margin() -> None:
+    """The extra-per-day term only applies when crossings > 1: a single-night
+    crossing whose net beats the flat margin is accepted at the default 1.0,
+    byte-identical to before — single-night evening hauls are never touched."""
+    svc = _svc()
+    rules = _rules()
+    # net == 6000 - 2700 == 3300 > flat margin 1350, single crossing
+    cargo, item = _cargo(price=6000.0, cost_time=300, haul_dst=(GZ_LAT, GZ_LNG))
+    ev = _eval(svc, rules, cargo, item, now=1080, day_end=1260)  # default extra=1.0
+    assert ev is not None
+    assert abs(ev[0] - 3300.0) < 1.0, ev[0]
+
+
 # ----------------------------------------------- end-to-end scheduler path
 
 class _SchedStub:

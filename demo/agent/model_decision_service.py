@@ -280,12 +280,20 @@ _NIGHT_CROSS_MAX_DAYS = max(1, int(os.environ.get("AGENT_NIGHT_CROSS_MAX_DAYS", 
 # compression, stacked daily rules, longer exposure to gross-income gateway
 # noise — notes §-3). So beyond the flat ``_NIGHT_CROSS_MARGIN`` we require an
 # additional ``night_pen * extra`` of penalty-free net for every crossed night
-# past the first. 0 == no extra (legacy: only the flat per-crossing margin),
-# so the default is a strict no-op and existing single-day crossings are
-# unaffected. Raise it on the platform to trim the marginal multi-day crossings
-# that pushed the preference penalty up without hard-rejecting the genuinely
-# huge multi-day hauls.
-_NIGHT_CROSS_EXTRA_MARGIN_PER_DAY = max(0.0, float(os.environ.get("AGENT_NIGHT_CROSS_EXTRA_MARGIN_PER_DAY", "0")))
+# past the first. 0 == no extra (legacy: only the flat per-crossing margin);
+# single-day crossings (crossings == 1) are NEVER touched by this term at any
+# value. Raised 0 → 1.0 (2026-06-15 penalty push v9 — notes §-18): a 2+ night
+# crossing is the worst penalty-per-gross haul (each extra night both guarantees
+# another full per-day penalty AND compounds the under-priced hidden cost), so a
+# 2-night crossing must now clear roughly DOUBLE the night penalty in penalty-free
+# net before it is even shown to the picker / decision LLM. This is the surgical
+# penalty-trim: it drops only the marginal multi-night hauls (the thinking-A/B
+# penalty driver §-6/§-7) while leaving every single-night evening haul — the bulk
+# of legitimately profitable crossings — byte-identical. Honest: still a bet, not a
+# pure no-op (a trimmed multi-night haul whose true net was positive costs a little
+# gross), but evidence-backed + low gross risk; best-of-N keeps 84949 as a floor.
+# Revert with ``AGENT_NIGHT_CROSS_EXTRA_MARGIN_PER_DAY=0``.
+_NIGHT_CROSS_EXTRA_MARGIN_PER_DAY = max(0.0, float(os.environ.get("AGENT_NIGHT_CROSS_EXTRA_MARGIN_PER_DAY", "1.0")))
 # A3 — weak-local reposition: when the best locally-pickable order's efficiency
 # is below this net-per-hour, prefer an anti-strand reposition toward a richer
 # observed market instead of locking the day into the weak order. 0 == off
