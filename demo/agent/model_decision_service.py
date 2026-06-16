@@ -76,6 +76,19 @@ _ORDER_DEADLINE_BUFFER_MIN = 10
 # big hauls, so this is calibrated multi-run on the platform (notes §2), and
 # best-of-N keeps the prior best as a floor. Env-revertable for a sweep.
 _LLM_CARGO_SUMMARY_LIMIT = int(os.environ.get("AGENT_LLM_CARGO_SUMMARY_LIMIT", "40"))
+# Per-step decision cargo query depth. The decision LLM sees at most
+# _LLM_CARGO_SUMMARY_LIMIT candidates, but the pool to rank from is k items
+# returned by the cargo scan. k=50 ≈ 5 sim-minutes scan cost (ceil(k/10)). The
+# #1 team spends ~6.15M tokens on wider prompts; raising k to 100-120 lets us
+# show 80-100 ranked candidates and approach their information throughput while
+# staying under the 5M/driver budget. Scan cost ~10 sim-min at k=100 is bounded
+# and well under a single order duration. Env-revertable: set back to 50.
+_LLM_QUERY_K = max(10, int(os.environ.get("AGENT_LLM_QUERY_K", "50")))
+# Max completion tokens for the fast (non-thinking) decision LLM response.
+# Default 180 is tight but sufficient for the required JSON output. Raising to
+# 300-400 allows the model to express a slightly longer reason field, which on
+# some gateways improves internal reasoning fidelity. Env-revertable: set to 180.
+_LLM_DECISION_MAX_TOKENS = max(50, int(os.environ.get("AGENT_LLM_DECISION_MAX_TOKENS", "180")))
 _MIN_BOUNDED_AREA_SPAN = 0.1
 # Fixed non-earning overhead (minutes) amortised per order when RANKING
 # candidates. Pure net-per-minute ranking systematically under-ranks big/long
@@ -1411,10 +1424,10 @@ class ModelDecisionService:
         if block > 0 and day not in plan.get("rest_done", set()):
             return None  # let rule engine handle rest
 
-        # Query available cargo for context (k=50 ≈ 5 sim-minutes of scan —
-        # about the former blended per-step scan cost, but the LLM now sees a
-        # real market sample instead of the 30 nearest).
-        cargo_resp = self._query_cargo(driver_id=driver_id, latitude=lat, longitude=lng, k=50)
+        # Query available cargo for context (_LLM_QUERY_K default 50 ≈ 5
+        # sim-minutes of scan): the LLM sees a real market sample instead of the
+        # former 30 nearest.
+        cargo_resp = self._query_cargo(driver_id=driver_id, latitude=lat, longitude=lng, k=_LLM_QUERY_K)
         items = cargo_resp.get("items", [])
         now = int(self._api.get_driver_status(driver_id)["simulation_progress_minutes"])
         hard_end = self._order_finish_deadline(rules, plan, now, day)
@@ -1615,7 +1628,7 @@ class ModelDecisionService:
                 "response_format": {"type": "json_object"},
                 # With thinking the completion must hold the reasoning chain
                 # too; 180 would truncate it and break the JSON answer.
-                "max_tokens": 2000 if use_thinking else 180,
+                "max_tokens": 2000 if use_thinking else _LLM_DECISION_MAX_TOKENS,
             }
             if use_thinking:
                 req["enable_thinking"] = True
