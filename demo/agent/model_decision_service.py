@@ -71,24 +71,23 @@ _ORDER_DEADLINE_BUFFER_MIN = 10
 # cheapest way to convert that idle token budget into better value-side
 # decisions (higher gross) — spending the spare budget on INFORMATION, not
 # reasoning depth (an A/B of thinking-on regressed: gross up but penalty
-# doubled, §-6/§-7). Raised 18 → 24 → 40 (§-17 gross push v8). Ceiling bet,
+# doubled, §-6/§-7). Raised 18 → 24 → 40 (§-17 gross push v8), then 80
+# for the final direct-submit ceiling run. Ceiling bet,
 # not a guaranteed no-op: more candidates can also surface more soft-penalised
 # big hauls, so this is calibrated multi-run on the platform (notes §2), and
 # best-of-N keeps the prior best as a floor. Env-revertable for a sweep.
-_LLM_CARGO_SUMMARY_LIMIT = int(os.environ.get("AGENT_LLM_CARGO_SUMMARY_LIMIT", "40"))
+_LLM_CARGO_SUMMARY_LIMIT = int(os.environ.get("AGENT_LLM_CARGO_SUMMARY_LIMIT", "80"))
 # Per-step decision cargo query depth. The decision LLM sees at most
 # _LLM_CARGO_SUMMARY_LIMIT candidates, but the pool to rank from is k items
-# returned by the cargo scan. k=50 ≈ 5 sim-minutes scan cost (ceil(k/10)). The
-# #1 team spends ~6.15M tokens on wider prompts; raising k to 100-120 lets us
-# show 80-100 ranked candidates and approach their information throughput while
-# staying under the 5M/driver budget. Scan cost ~10 sim-min at k=100 is bounded
-# and well under a single order duration. Env-revertable: set back to 50.
-_LLM_QUERY_K = max(10, int(os.environ.get("AGENT_LLM_QUERY_K", "50")))
+# returned by the cargo scan. k=100 ≈ 10 sim-minutes scan cost (ceil(k/10)).
+# The #1 team spends ~6.15M tokens on wider prompts; using k=100 lets us show
+# 80 ranked candidates and approach their information throughput while staying
+# under the 5M/driver budget. Env-revertable: set back to 50.
+_LLM_QUERY_K = max(10, int(os.environ.get("AGENT_LLM_QUERY_K", "100")))
 # Max completion tokens for the fast (non-thinking) decision LLM response.
-# Default 180 is tight but sufficient for the required JSON output. Raising to
-# 300-400 allows the model to express a slightly longer reason field, which on
-# some gateways improves internal reasoning fidelity. Env-revertable: set to 180.
-_LLM_DECISION_MAX_TOKENS = max(50, int(os.environ.get("AGENT_LLM_DECISION_MAX_TOKENS", "180")))
+# Default 300 gives a slightly wider JSON response budget for the final
+# information-throughput run. Env-revertable: set to 180.
+_LLM_DECISION_MAX_TOKENS = max(50, int(os.environ.get("AGENT_LLM_DECISION_MAX_TOKENS", "300")))
 _MIN_BOUNDED_AREA_SPAN = 0.1
 # Fixed non-earning overhead (minutes) amortised per order when RANKING
 # candidates. Pure net-per-minute ranking systematically under-ranks big/long
@@ -111,11 +110,12 @@ _ORDER_TIME_OVERHEAD_MIN = float(os.environ.get("AGENT_ORDER_TIME_OVERHEAD_MIN",
 # Feeds chain-aware order choice (an order into a dead city strands the truck).
 _LIQ_WINDOW_MIN = 3 * DAY_MINUTES
 # Active-market rows shown to the decision LLM (chain/reposition context).
-# Raised 8 → 12 → 20 (§-17) alongside _LLM_CARGO_SUMMARY_LIMIT: with thinking
+# Raised 8 → 12 → 20 (§-17), then 30 alongside _LLM_CARGO_SUMMARY_LIMIT:
+# with thinking
 # off, spending the spare token budget on a richer observed-market table is what
 # lets the fast LLM choose higher-value chains / repositions (toward the
 # leader's gross). Env-revertable; calibrate multi-run (notes §2).
-_LIQ_TOP_N = int(os.environ.get("AGENT_LIQ_TOP_N", "20"))
+_LIQ_TOP_N = int(os.environ.get("AGENT_LIQ_TOP_N", "30"))
 # If the LLM asks for a long strategic wait while a compliant candidate at or
 # above this net-per-hour is on the table, take the order instead (the known
 # failure mode of LLM-in-the-loop runs was idling away strong orders). Lowered
