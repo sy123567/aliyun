@@ -237,15 +237,18 @@ def test_two_day_crossing_counted() -> None:
     assert svc._count_nodrive_crossings(_night_rules(), 1000, 3000) == 2
 
 
-def test_extra_margin_default_is_noop_for_multiday() -> None:
-    """Default extra margin (0) leaves the legacy flat-margin acceptance intact:
-    a 2-day crossing with net just above the flat margin is still accepted."""
+def test_extra_margin_default_trims_thin_multiday() -> None:
+    """penalty push v9: the extra-per-day margin now defaults to 1.0 (was a no-op
+    0), so a thin 2-day crossing that the flat margin alone would accept is now
+    trimmed by default. net = 1800 - 1000(2*pen) = 800; flat required =
+    1000*(1.5-1)=500 (would accept), extra adds 500*1.0*(2-1)=500 -> 1000;
+    800 <= 1000 -> rejected. (extra=0 acceptance is covered in the crossing test
+    file's test_two_window_crossing_trimmed_by_extra_margin.)"""
+    assert mds._NIGHT_CROSS_EXTRA_MARGIN_PER_DAY >= 1.0, mds._NIGHT_CROSS_EXTRA_MARGIN_PER_DAY
     svc = ModelDecisionService(_StubApi())
     rules = _night_rules(pen=500.0)
-    # net = 1800 - 1000(2*pen) = 800; flat required = 1000*(1.5-1)=500 -> accept
     cargo, item = _crossing_cargo(price=1800.0, cost_time=2000)
-    ev = svc._evaluate_cargo(cargo, item, rules, set(), 1000, 10 ** 7, LAT, LNG)
-    assert ev is not None and abs(ev[0] - 800.0) < 1.0, ev
+    assert svc._evaluate_cargo(cargo, item, rules, set(), 1000, 10 ** 7, LAT, LNG) is None
 
 
 def test_extra_margin_rejects_thin_multiday_crossing() -> None:
