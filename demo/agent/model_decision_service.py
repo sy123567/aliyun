@@ -297,6 +297,22 @@ _NIGHT_CROSS_EXTRA_MARGIN_PER_DAY = max(0.0, float(os.environ.get("AGENT_NIGHT_C
 # deadhead/cost rises without a gross gain. Set 0 to restore "reposition only when
 # stranded".
 _WEAK_LOCAL_REPOSITION_NET_PER_H = max(0.0, float(os.environ.get("AGENT_WEAK_LOCAL_REPOSITION_NET_PER_H", "58")))
+# F2 — idle forward-reposition: last-resort gross lever for the otherwise pure-wait
+# branch (no order pickable AND ``_anti_strand`` found no *currently reachable*
+# target — the driver would idle the rest of the day). Reposition once toward the
+# richest *observed* liquidity hub (mean ``net_per_h`` >= NET_PER_H, with >= MIN_N
+# recently-seen orders for depth so we never chase a single outlier) within MAX_KM,
+# betting a recently-liquid market will re-stock, instead of pure-idling. Takes NO
+# order ⇒ ZERO preference penalty; ``_safe_reposition`` keeps it window/region/
+# blackout-safe. Unlike ``_anti_strand`` it does NOT require a currently-reachable
+# order, so — honestly — it is a bounded positive-EV BET, not a strict no-op: the
+# only cost is the deadhead km when the bet misses, capped by MAX_KM + 1/day + the
+# >=4h budget floor. Default ON at 60 (2026-06-15 gross push v7): under the "best
+# submission is kept" leaderboard a wasted-deadhead run is free while a bet that
+# lands lifts the ceiling. 0 == off (restore pure-wait). See notes §-16.
+_IDLE_FORWARD_REPOSITION_NET_PER_H = max(0.0, float(os.environ.get("AGENT_IDLE_FORWARD_REPOSITION_NET_PER_H", "60")))
+_IDLE_FORWARD_REPOSITION_MIN_N = max(1, int(float(os.environ.get("AGENT_IDLE_FORWARD_REPOSITION_MIN_N", "4"))))
+_IDLE_FORWARD_REPOSITION_MAX_KM = max(0.0, float(os.environ.get("AGENT_IDLE_FORWARD_REPOSITION_MAX_KM", "200")))
 # B1 — penalty_cap credit: once a soft rule's monthly cumulative penalty has hit
 # its cap, further violations of that rule are free (the scorer caps the total),
 # so stop pricing them and unlock the orders they were blocking. 1 == on.
@@ -2531,6 +2547,13 @@ class ModelDecisionService:
         strand = self._anti_strand(driver_id, rules, plan, now, lat, lng, day, hard_end)
         if strand is not None:
             return strand
+        # (E''') [F2] still nothing reachable: rather than pure-idling, bet on the
+        # richest *observed* liquidity hub re-stocking and reposition once toward it
+        # (takes no order -> zero penalty; bounded deadhead, 1/day). Falls through to
+        # the wait below when the lever is off or no qualifying hub is in range.
+        fwd = self._idle_forward_reposition(driver_id, rules, plan, now, lat, lng, day, day_end)
+        if fwd is not None:
+            return fwd
         # (E'') Instead of idling until day end, wait 2 hours and retry.
         remaining = day_end - now
         if remaining > 240:
@@ -3059,6 +3082,53 @@ class ModelDecisionService:
         plan["strand_repo"].add(day)
         plan.setdefault("strand_count", {})
         plan["strand_count"][day] = plan["strand_count"].get(day, 0) + 1
+        return action
+
+    def _idle_forward_reposition(self, driver_id, rules, plan, now, lat, lng, day, day_end):
+        """[F2] Last-resort gross lever for the otherwise pure-wait branch: when no
+        order is pickable and ``_anti_strand`` found no *currently reachable* target,
+        reposition once toward the richest *observed* liquidity hub instead of idling
+        the rest of the day, betting a recently-liquid market will re-stock.
+
+        Takes NO order, so it adds ZERO preference penalty; ``_safe_reposition``
+        keeps it window/region/blackout-safe. Unlike ``_anti_strand`` it does not
+        require a currently-reachable order, so it is a bounded positive-EV bet: the
+        only cost is deadhead km when the bet misses, dammed by ``MAX_KM`` + one
+        reposition/day + the ``_STRAND_MIN_BUDGET`` (>=4h) budget floor. Off when
+        ``_IDLE_FORWARD_REPOSITION_NET_PER_H == 0``."""
+        if _IDLE_FORWARD_REPOSITION_NET_PER_H <= 0.0:
+            return None
+        if day in plan.setdefault("fwd_repo", set()):
+            return None
+        if day_end - now < _STRAND_MIN_BUDGET:
+            return None
+        # rows are sorted richest-first (liquidity-weighted n*net_per_h); take the
+        # first hub that clears the depth, richness and deadhead gates.
+        best: dict[str, Any] | None = None
+        best_dist = 0.0
+        for row in self._cargo_liquidity_stats(now):
+            if int(row.get("n", 0) or 0) < _IDLE_FORWARD_REPOSITION_MIN_N:
+                continue
+            if float(row.get("net_per_h", 0.0) or 0.0) < _IDLE_FORWARD_REPOSITION_NET_PER_H:
+                continue
+            dist = _haversine_km(lat, lng, float(row["lat"]), float(row["lng"]))
+            if dist < 1.0 or dist > _IDLE_FORWARD_REPOSITION_MAX_KM:
+                continue  # already there, or too far to justify the deadhead
+            best, best_dist = row, dist
+            break
+        if best is None:
+            return None
+        action = self._safe_reposition(
+            rules, now, lat, lng, float(best["lat"]), float(best["lng"]),
+            deadline=day_end, tag="idle_forward", target_city=str(best.get("city") or ""),
+        )
+        if action is None:
+            return None
+        plan["fwd_repo"].add(day)
+        self._logger.info(
+            "[F2] idle -> forward reposition to liquid hub %s net/h=%.0f n=%d dist=%.0fkm",
+            best.get("city"), float(best["net_per_h"]), int(best.get("n", 0) or 0), best_dist,
+        )
         return action
 
     def _evaluate_relocation(self, cargo, rules, blackout_regions, now, day_end, lat, lng):
