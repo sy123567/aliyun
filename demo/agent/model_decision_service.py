@@ -71,23 +71,28 @@ _ORDER_DEADLINE_BUFFER_MIN = 10
 # cheapest way to convert that idle token budget into better value-side
 # decisions (higher gross) — spending the spare budget on INFORMATION, not
 # reasoning depth (an A/B of thinking-on regressed: gross up but penalty
-# doubled, §-6/§-7). Raised 18 → 24 → 40 (§-17 gross push v8), then 80
-# for the final direct-submit ceiling run. Ceiling bet,
+# doubled, §-6/§-7). Raised 18 → 24 → 40 (§-17 gross push v8), 80 in
+# PR91, then 100 for the final aggressive ceiling run. Ceiling bet,
 # not a guaranteed no-op: more candidates can also surface more soft-penalised
 # big hauls, so this is calibrated multi-run on the platform (notes §2), and
 # best-of-N keeps the prior best as a floor. Env-revertable for a sweep.
-_LLM_CARGO_SUMMARY_LIMIT = int(os.environ.get("AGENT_LLM_CARGO_SUMMARY_LIMIT", "80"))
+_LLM_CARGO_SUMMARY_LIMIT = int(os.environ.get("AGENT_LLM_CARGO_SUMMARY_LIMIT", "100"))
 # Per-step decision cargo query depth. The decision LLM sees at most
 # _LLM_CARGO_SUMMARY_LIMIT candidates, but the pool to rank from is k items
-# returned by the cargo scan. k=100 ≈ 10 sim-minutes scan cost (ceil(k/10)).
-# The #1 team spends ~6.15M tokens on wider prompts; using k=100 lets us show
-# 80 ranked candidates and approach their information throughput while staying
-# under the 5M/driver budget. Env-revertable: set back to 50.
-_LLM_QUERY_K = max(10, int(os.environ.get("AGENT_LLM_QUERY_K", "100")))
+# returned by the cargo scan. k=120 ≈ 12 sim-minutes scan cost (ceil(k/10)).
+# The #1 team spends ~6.15M tokens on wider prompts; using k=120 lets us show
+# 100 ranked candidates and approach their information throughput while staying
+# under the 5M/driver budget. Env-revertable: set back to 50/100.
+_LLM_QUERY_K = max(10, int(os.environ.get("AGENT_LLM_QUERY_K", "120")))
 # Max completion tokens for the fast (non-thinking) decision LLM response.
-# Default 300 gives a slightly wider JSON response budget for the final
-# information-throughput run. Env-revertable: set to 180.
-_LLM_DECISION_MAX_TOKENS = max(50, int(os.environ.get("AGENT_LLM_DECISION_MAX_TOKENS", "300")))
+# Default 350 gives a slightly wider JSON response budget for the final
+# aggressive information-throughput run. Env-revertable: set to 180/300.
+_LLM_DECISION_MAX_TOKENS = max(50, int(os.environ.get("AGENT_LLM_DECISION_MAX_TOKENS", "350")))
+# Add compact structured risk fields to the widened candidate rows. This is the
+# guardrail for the aggressive prompt: the LLM can chase high gross, but it sees
+# over-cap / night / cold-dropoff risks explicitly instead of inferring them
+# from prose. Set 0 to strip these fields.
+_LLM_RISK_FIELDS = os.environ.get("AGENT_LLM_RISK_FIELDS", "1").strip() not in ("0", "false", "False")
 _MIN_BOUNDED_AREA_SPAN = 0.1
 # Fixed non-earning overhead (minutes) amortised per order when RANKING
 # candidates. Pure net-per-minute ranking systematically under-ranks big/long
@@ -110,12 +115,12 @@ _ORDER_TIME_OVERHEAD_MIN = float(os.environ.get("AGENT_ORDER_TIME_OVERHEAD_MIN",
 # Feeds chain-aware order choice (an order into a dead city strands the truck).
 _LIQ_WINDOW_MIN = 3 * DAY_MINUTES
 # Active-market rows shown to the decision LLM (chain/reposition context).
-# Raised 8 → 12 → 20 (§-17), then 30 alongside _LLM_CARGO_SUMMARY_LIMIT:
-# with thinking
+# Raised 8 → 12 → 20 (§-17), 30 in PR91, then 40 alongside
+# _LLM_CARGO_SUMMARY_LIMIT: with thinking
 # off, spending the spare token budget on a richer observed-market table is what
 # lets the fast LLM choose higher-value chains / repositions (toward the
 # leader's gross). Env-revertable; calibrate multi-run (notes §2).
-_LIQ_TOP_N = int(os.environ.get("AGENT_LIQ_TOP_N", "30"))
+_LIQ_TOP_N = int(os.environ.get("AGENT_LIQ_TOP_N", "40"))
 # If the LLM asks for a long strategic wait while a compliant candidate at or
 # above this net-per-hour is on the table, take the order instead (the known
 # failure mode of LLM-in-the-loop runs was idling away strong orders). Lowered
@@ -1424,7 +1429,7 @@ class ModelDecisionService:
         if block > 0 and day not in plan.get("rest_done", set()):
             return None  # let rule engine handle rest
 
-        # Query available cargo for context (_LLM_QUERY_K default 50 ≈ 5
+        # Query available cargo for context (_LLM_QUERY_K default 120 ≈ 12
         # sim-minutes of scan): the LLM sees a real market sample instead of the
         # former 30 nearest.
         cargo_resp = self._query_cargo(driver_id=driver_id, latitude=lat, longitude=lng, k=_LLM_QUERY_K)
@@ -1438,6 +1443,8 @@ class ModelDecisionService:
         # seen departing each city). Chain context: an order's true value
         # includes what the truck can pick up NEXT at its destination.
         liq_rows = self._cargo_liquidity_stats(now)
+        month_idx = _month_index_for_day(day)
+        cat_target, cat_needed = self._get_category_target(rules, plan, day)
 
         # Build a compact list of locally feasible cargo, best net/h first
         # (was: first-N in distance order, which buried the best candidates).
@@ -1484,6 +1491,37 @@ class ModelDecisionService:
                 chain_liq, chain_n = self._nearby_chain_liquidity(
                     liq_rows, float(end.get("lat", 0.0) or 0.0), float(end.get("lng", 0.0) or 0.0)
                 )
+            if _LLM_RISK_FIELDS:
+                risk_flags: list[str] = []
+                extra_penalty = 0.0
+                finish = now + int(occupied)
+                crossings = self._count_nodrive_crossings(rules, now, finish)
+                if crossings > 0:
+                    risk_flags.append(f"night_cross_x{crossings}")
+                cost_time = int(cargo.get("cost_time_minutes", 0) or 0)
+                if (
+                    rules.longhaul_cap_orders is not None
+                    and cost_time > rules.longhaul_min_minutes
+                    and int(plan.get("monthly_longhual", {}).get(month_idx, 0)) >= rules.longhaul_cap_orders
+                    and not self._longhaul_cap_credit(rules, plan, day)
+                ):
+                    risk_flags.append("longhaul_over_cap")
+                    extra_penalty += float(rules.longhaul_penalty)
+                if cat_target and cat_needed > 0:
+                    if self._category_matches_sem(cat_target, str(cargo.get("cargo_name", ""))):
+                        row["quota"] = "hit_target"
+                    else:
+                        risk_flags.append("non_target_while_quota_due")
+                if chain_liq > 0.0:
+                    row["chain_n"] = chain_n
+                    row["chain_rate"] = round(chain_liq)
+                elif row["net"] >= 1500:
+                    risk_flags.append("cold_dropoff")
+                if risk_flags:
+                    row["risk_flags"] = risk_flags[:4]
+                if extra_penalty > 0.0:
+                    row["extra_penalty"] = round(extra_penalty)
+                    row["net_after_extra_penalty"] = round(float(net) - extra_penalty)
             # [A1] rank by overhead-amortised net + absolute-net + destination
             # chain liquidity & depth (consistent with the deterministic
             # _score_item), so the biggest *total-day-value* orders surface at the
@@ -1504,7 +1542,6 @@ class ModelDecisionService:
 
         # Construct LLM prompt
         day_in_month = _day_in_month(day)
-        month_idx = _month_index_for_day(day)
         month_name = _month_name(month_idx)
         hour, minute = divmod(tod, 60)
 
@@ -1523,6 +1560,9 @@ class ModelDecisionService:
             '结合候选的 to_liq 和下方【活跃市场】表，向前推演 2-3 单：接这单卸到 X → X 的 to_liq/活跃度说明下一单能接到什么 → '
             '再下一步又能到哪。比较"高 net 但卸到冷门城(链条到此中断、要空驶找货)"与"net 稍低但卸到 to_liq 旺的枢纽(链条持续、全天连着接)"，'
             '选**整条链全天净收益总和**最大的那一单。若有未达标品类指标则优先能推进该品类的链路\n'
+            '④**风险兜底字段**：候选若有 risk_flags/extra_penalty/net_after_extra_penalty，说明它可能触发软罚分或卸到冷门地；'
+            '冲榜可以吃风险，但只能在 net_after_extra_penalty 仍明显领先、或能推进紧急品类/强链路时选择；'
+            '同等净收益优先无 risk_flags、chain_n/chain_rate 更高的单。\n'
             '- wait: 等待。参数: {"duration_minutes": 分钟数}。仅用于休息/禁驶时段(见下方硬约束)；'
             '有正净值候选时等待=白白烧时间，不要因为"等更好的货"而wait\n'
             '- reposition: 空驶到新位置。参数: {"latitude": 纬度, "longitude": 经度}。'
@@ -1538,7 +1578,6 @@ class ModelDecisionService:
         )
 
         # Add category target warning
-        cat_target, cat_needed = self._get_category_target(rules, plan, day)
         month_deadhead = plan.setdefault("monthly_deadhead_km", {}).get(month_idx, 0.0)
         cat_warning = ""
         if cat_target and cat_needed > 0:
