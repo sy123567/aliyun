@@ -118,8 +118,16 @@ effect when thinking is re-enabled), `AGENT_THINKING_HIGH_STAKES_NET` (default 1
 `AGENT_LLM_CARGO_SUMMARY_LIMIT` (default **24**) / `AGENT_LIQ_TOP_N` (default **12**) —
 candidate / market-table widths shown to the fast decision LLM (spend idle token budget on
 context throughput, not reasoning depth), `AGENT_NIGHT_CROSS_EXTRA_MARGIN_PER_DAY`
-(default 0 = no-op; raise to trim marginal multi-day crossings). See
-`docs/agent-optimization-notes.md` §-10/§-9/§-8/§-6/§-5/§-4 for what each does and how to revert.
+(default **1.0**, raised 0→1.0 in penalty push v9 — notes §-18; demands
+`night_pen * extra` of EXTRA penalty-free net for every crossed night past the first,
+so a 2+ night crossing must clear ~double the night penalty before it is even shown to
+the picker / decision LLM. Surgical penalty-trim: drops only the worst penalty-per-gross
+multi-night hauls (the thinking-A/B penalty driver §-6/§-7) while leaving every
+single-night evening haul byte-identical — crossings == 1 are never touched at any value.
+NOT a pure no-op (a trimmed multi-night haul whose true net was positive costs a little
+gross) but evidence-backed + low gross risk; best-of-N keeps 84949 as a floor. Revert via
+`AGENT_NIGHT_CROSS_EXTRA_MARGIN_PER_DAY=0`). See
+`docs/agent-optimization-notes.md` §-18/§-10/§-9/§-8/§-6/§-5/§-4 for what each does and how to revert.
 
 The driver fixture (`demo/server/data/drivers.json`, D001) spans **three months**
 (2026-03-01→05-31): month-windowed category quotas (Apr 水果 12, May 建材 12 + Apr
