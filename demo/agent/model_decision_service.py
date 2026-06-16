@@ -65,12 +65,17 @@ LONGHAUL_PENALTY = 1000.0
 _STRAND_MIN_BUDGET = 240
 _ORDER_DEADLINE_BUFFER_MIN = 10
 # Candidate list / market table sizes shown to the decision LLM. The finals
-# token budget (5M/driver) is barely 21% used at submission while the #1 team
-# spends ~3.08M/driver, so widening the per-step context the (now fast, see
-# _DECISION_THINKING) LLM picks over is the cheapest way to convert that idle
-# token budget into better value-side decisions (higher gross). Raised 18 → 24.
-# Tunable via env for platform sweeps (notes §2 — calibrate across runs).
-_LLM_CARGO_SUMMARY_LIMIT = int(os.environ.get("AGENT_LLM_CARGO_SUMMARY_LIMIT", "24"))
+# token budget (5M/driver) is barely 21% used at submission (~2.3M) while the
+# #1 team spends ~6.15M total at 5.55s/decision vs our 2.87s, so widening the
+# per-step context the (now fast, see _DECISION_THINKING) LLM picks over is the
+# cheapest way to convert that idle token budget into better value-side
+# decisions (higher gross) — spending the spare budget on INFORMATION, not
+# reasoning depth (an A/B of thinking-on regressed: gross up but penalty
+# doubled, §-6/§-7). Raised 18 → 24 → 40 (§-17 gross push v8). Ceiling bet,
+# not a guaranteed no-op: more candidates can also surface more soft-penalised
+# big hauls, so this is calibrated multi-run on the platform (notes §2), and
+# best-of-N keeps the prior best as a floor. Env-revertable for a sweep.
+_LLM_CARGO_SUMMARY_LIMIT = int(os.environ.get("AGENT_LLM_CARGO_SUMMARY_LIMIT", "40"))
 _MIN_BOUNDED_AREA_SPAN = 0.1
 # Fixed non-earning overhead (minutes) amortised per order when RANKING
 # candidates. Pure net-per-minute ranking systematically under-ranks big/long
@@ -93,10 +98,11 @@ _ORDER_TIME_OVERHEAD_MIN = float(os.environ.get("AGENT_ORDER_TIME_OVERHEAD_MIN",
 # Feeds chain-aware order choice (an order into a dead city strands the truck).
 _LIQ_WINDOW_MIN = 3 * DAY_MINUTES
 # Active-market rows shown to the decision LLM (chain/reposition context).
-# Raised 8 → 12 alongside _LLM_CARGO_SUMMARY_LIMIT: with thinking off, spending
-# the spare token budget on a richer observed-market table is what lets the fast
-# LLM choose higher-value chains / repositions (toward the leader's gross).
-_LIQ_TOP_N = int(os.environ.get("AGENT_LIQ_TOP_N", "12"))
+# Raised 8 → 12 → 20 (§-17) alongside _LLM_CARGO_SUMMARY_LIMIT: with thinking
+# off, spending the spare token budget on a richer observed-market table is what
+# lets the fast LLM choose higher-value chains / repositions (toward the
+# leader's gross). Env-revertable; calibrate multi-run (notes §2).
+_LIQ_TOP_N = int(os.environ.get("AGENT_LIQ_TOP_N", "20"))
 # If the LLM asks for a long strategic wait while a compliant candidate at or
 # above this net-per-hour is on the table, take the order instead (the known
 # failure mode of LLM-in-the-loop runs was idling away strong orders). Lowered
