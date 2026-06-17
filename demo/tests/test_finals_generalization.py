@@ -526,27 +526,23 @@ def test_llm_short_wait_not_overridden() -> None:
 
 
 def test_llm_codecides_every_step() -> None:
-    """AGENT_DECISION_LLM=1 restores the PR92/93 every-step co-decision path."""
+    """PR96 third-group default keeps the PR92/93 every-step co-decision path on."""
     import agent.model_decision_service as mds
     day, tod = 5, 600
     now = day * DAY_MINUTES + tod
     api = ValueApi(now, [], {"action": "wait", "params": {"duration_minutes": 45}})
     svc = ModelDecisionService(api)
-    original = mds._DECISION_LLM
-    mds._DECISION_LLM = True
-    try:
-        a1 = svc.decide("DG42")
-        assert len(api.decision_prompts) == 1, api.decision_prompts
-        assert a1["action"] == "wait", a1
-        svc.decide("DG42")
-        assert len(api.decision_prompts) == 2
-    finally:
-        mds._DECISION_LLM = original
+    assert mds._DECISION_LLM is True, "third-group default must enable decision LLM"
+    a1 = svc.decide("DG42")
+    assert len(api.decision_prompts) == 1, api.decision_prompts
+    assert a1["action"] == "wait", a1
+    svc.decide("DG42")
+    assert len(api.decision_prompts) == 2
 
 
 def test_decision_llm_off_runs_deterministic() -> None:
-    """PR95 default skips the per-step decision LLM entirely: decide() returns a
-    valid action from the deterministic scheduler and never sends a decision prompt."""
+    """AGENT_DECISION_LLM=0 still skips the per-step decision LLM entirely: decide()
+    returns a valid action from the deterministic scheduler and sends no prompt."""
     import agent.model_decision_service as mds
     day, tod = 5, 600
     now = day * DAY_MINUTES + tod
@@ -555,7 +551,6 @@ def test_decision_llm_off_runs_deterministic() -> None:
     original = mds._DECISION_LLM
     mds._DECISION_LLM = False
     try:
-        assert original is False, "PR95 default must be parse-LLM-only / deterministic execution"
         a1 = svc.decide("DG44")
         assert a1 is not None and "action" in a1, a1
         assert len(api.decision_prompts) == 0, api.decision_prompts

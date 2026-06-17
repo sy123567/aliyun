@@ -147,11 +147,11 @@ _LLM_WAIT_OVERRIDE_NET_PER_H = float(os.environ.get("AGENT_LLM_WAIT_OVERRIDE_NET
 # keeps the genuinely big hauls (the feature's intent) while dropping the thin
 # crossings that drove the penalty up. Env-tunable for platform sweeps (§2).
 _NIGHT_CROSS_MARGIN = max(1.0, float(os.environ.get("AGENT_NIGHT_CROSS_MARGIN", "1.5")))
-# Whether to consult the decision LLM on each step AT ALL. PR95 default OFF:
-# only the preference compiler uses the model; once rules are compiled, the
-# hard-coded scheduler/validators execute them deterministically. Set
-# AGENT_DECISION_LLM=1 to restore the PR92/93 per-step co-decision path.
-_DECISION_LLM = os.environ.get("AGENT_DECISION_LLM", "0").strip() not in ("0", "false", "False")
+# Whether to consult the decision LLM on each step AT ALL. PR96 third-group
+# default ON: keep PR95 strict LLM preference parsing, then let the earlier
+# PR92/93 per-step LLM co-decision path optimize value under deterministic
+# validators/Gates. Set AGENT_DECISION_LLM=0 for parse-LLM-only deterministic execution.
+_DECISION_LLM = os.environ.get("AGENT_DECISION_LLM", "1").strip() not in ("0", "false", "False")
 # Whether to compile preferences with the LLM AT ALL. PR95 default ON and strict:
 # preference understanding is LLM-only (extract + coverage audit), while
 # execution is code-only. Set AGENT_PARSE_LLM=0 to intentionally run the legacy
@@ -1316,9 +1316,9 @@ class ModelDecisionService:
         # any failure the static parse stays in charge.
         self._ensure_daily_directive(driver_id, rules, plan, day)
 
-        # PR95 default: skip LLM-driven decisions and execute the hard-coded
-        # scheduler. AGENT_DECISION_LLM=1 restores the earlier every-step LLM
-        # co-decision path, still guarded by deterministic validators/fallbacks.
+        # PR96 third-group default: use the earlier every-step LLM co-decision
+        # path on top of PR95 strict parsing, still guarded by deterministic
+        # validators/fallbacks. AGENT_DECISION_LLM=0 skips this path entirely.
         action = None
         step = self._step_count[driver_id]
         consecutive_waits = plan.get("_consecutive_waits", 0)

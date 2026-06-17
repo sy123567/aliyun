@@ -217,6 +217,7 @@ def test_malformed_audit_becomes_residual_in_strict_mode() -> None:
 
 
 def test_residual_gate_blocks_deterministic_take_order() -> None:
+    import agent.model_decision_service as mds
     svc = ModelDecisionService(ScriptedApi())
     rules = DriverRules()
     rules.residual_constraints.append({"text": PREF_RAIN, "penalty": 800.0, "cap": None, "note": "weather"})
@@ -228,9 +229,14 @@ def test_residual_gate_blocks_deterministic_take_order() -> None:
         return {"action": "take_order", "params": {"cargo_id": "unsafe"}}
 
     svc._pick_order = _pick  # type: ignore[assignment]
-    action = svc._schedule("DX06", {}, rules, plan, 9 * 60, 31.23, 121.47)
-    assert action["action"] == "wait", action
-    assert called["pick"] is False, "residual gate must run before order picking"
+    original = mds._DECISION_LLM
+    mds._DECISION_LLM = False
+    try:
+        action = svc._schedule("DX06", {}, rules, plan, 9 * 60, 31.23, 121.47)
+        assert action["action"] == "wait", action
+        assert called["pick"] is False, "residual gate must run before order picking"
+    finally:
+        mds._DECISION_LLM = original
 
 
 def _run() -> int:

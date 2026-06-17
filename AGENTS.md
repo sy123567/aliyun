@@ -92,9 +92,10 @@ a single outlier order) / `AGENT_IDLE_FORWARD_REPOSITION_MAX_KM` (default **200*
 cap on the bet),
 `AGENT_PENALTY_CAP_CREDIT`,
 `AGENT_CATEGORY_SOFT`, `AGENT_LLM_WAIT_OVERRIDE_NET_PER_H`,
-`AGENT_DECISION_LLM` (default **0 = off** in PR95; only preference parsing uses
-the model, then the hard-coded scheduler/validators execute deterministically.
-Set 1 to restore the PR92/93 per-step decision LLM),
+`AGENT_DECISION_LLM` (default **1 = on** in the PR96 third-group branch; PR95
+strict LLM preference parsing stays on, then the PR92/93 per-step decision LLM
+optimizes value under deterministic validators/Gates. Set 0 for PR95
+parse-LLM-only deterministic execution),
 `AGENT_PARSE_LLM` (default **1 = on**; PR95 parses preferences with LLM extract +
 coverage audit. Set 0 for the legacy deterministic "直接解析" regex parser and to
 skip the per-day LLM directive),
