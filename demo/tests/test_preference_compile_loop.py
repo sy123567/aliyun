@@ -8,13 +8,13 @@ whose natural-language preferences differ from the local D001 fixture):
 2. audit & repair: a second LLM pass verifies that every obligation in each
    text is represented by the structured rules and patches misses — replacing
    the old D001-phrasing regex supplement layer;
-3. no silent drop: anything still unrepresentable lands in
-   ``rules.residual_constraints`` and is injected into the decision prompt;
+3. strict no silent drop: anything still unrepresentable or unaudited lands in
+   ``rules.residual_constraints``; deterministic execution fails closed on it;
 4. semantic gates: scalar rules (daily_order_limit, haul_max_km, home_rule,
    allowed_regions, ...) are accepted/rejected by meaning, with the old keyword
    heuristics only as the offline default;
-5. offline fallback: with the model unavailable the deterministic regex parser
-   still produces rules.
+5. PR95 default is LLM-only parsing. The legacy regex parser is only used when
+   ``AGENT_PARSE_LLM=0`` is intentionally selected for offline/debug A/B.
 
 Run: ``python demo/tests/test_preference_compile_loop.py`` (no pytest dependency).
 """
@@ -193,14 +193,44 @@ def test_semantic_confirm_rejects_hallucinated_daily_limit() -> None:
     assert rules.daily_order_limit is None, rules.daily_order_limit
 
 
-def test_offline_fallback_uses_regex_parser() -> None:
-    """Model unavailable -> the deterministic regex fallback still yields rules."""
+def test_model_unavailable_becomes_residual_in_strict_mode() -> None:
+    """Model unavailable -> strict LLM-only parsing does not invent regex rules."""
     api = ScriptedApi(fail_all=True)
     svc = ModelDecisionService(api)
     rules = svc._ensure_rules("DX04", _status([
         {"content": "每天必须连续休息满8小时才扛得住。", "penalty_amount": 400},
     ]))
+    assert rules.daily_rest_minutes == 0, rules.daily_rest_minutes
+    assert rules.residual_constraints, rules.residual_constraints
+    assert "LLM偏好解析未成功" in rules.residual_constraints[0]["note"]
+
+
+def test_malformed_audit_becomes_residual_in_strict_mode() -> None:
+    api = ScriptedApi(extract_responses=[{"daily_rest_hours": 8}], audit_response={"bad": True})
+    svc = ModelDecisionService(api)
+    rules = svc._ensure_rules("DX05", _status([
+        {"content": "每天必须连续休息满8小时才扛得住。", "penalty_amount": 400},
+    ]))
     assert rules.daily_rest_minutes == 480, rules.daily_rest_minutes
+    assert rules.residual_constraints, rules.residual_constraints
+    assert "覆盖审计结果格式无效" in rules.residual_constraints[0]["note"]
+
+
+def test_residual_gate_blocks_deterministic_take_order() -> None:
+    svc = ModelDecisionService(ScriptedApi())
+    rules = DriverRules()
+    rules.residual_constraints.append({"text": PREF_RAIN, "penalty": 800.0, "cap": None, "note": "weather"})
+    plan = {"off_days": set()}
+    called = {"pick": False}
+
+    def _pick(*_args, **_kwargs):  # noqa: ANN002, ANN003, ANN202
+        called["pick"] = True
+        return {"action": "take_order", "params": {"cargo_id": "unsafe"}}
+
+    svc._pick_order = _pick  # type: ignore[assignment]
+    action = svc._schedule("DX06", {}, rules, plan, 9 * 60, 31.23, 121.47)
+    assert action["action"] == "wait", action
+    assert called["pick"] is False, "residual gate must run before order picking"
 
 
 def _run() -> int:

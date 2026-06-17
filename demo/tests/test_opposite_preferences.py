@@ -11,7 +11,7 @@ had a category *blacklist* and a haul *maximum*, so the mirrored preferences
 
 Now:
 - the long-haul cap exists only when parsed from THIS driver's preferences
-  (LLM field ``monthly_longhaul_cap`` + offline regex fallback);
+  (LLM field ``monthly_longhaul_cap`` or explicit legacy regex mode);
 - ``allowed_categories`` whitelist and ``haul_min_km`` are first-class rules
   enforced by the deterministic evaluators.
 

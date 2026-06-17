@@ -3,8 +3,8 @@
 Covers the changes aimed at the two unknown finals drivers (one Guangdong, one
 Yangtze-delta) whose preference texts may be phrased in dialect:
 
-1. dialect-robust offline night fail-safe (Cantonese/Wu phrasings, Chinese-
-   numeral clock times such as 晚上九点 / 廿三点);
+1. dialect-robust legacy regex mode (Cantonese/Wu phrasings, Chinese-numeral
+   clock times such as 晚上九点 / 廿三点);
 2. penalty_cap plumbed through preference records, the parse/audit payloads
    and the decision prompt (capped vs uncapped economics);
 3. semantic region membership fallback for region names outside the static
@@ -116,23 +116,34 @@ PREF_NIGHT_WU = "夜里向廿三点以后勿开车，困觉困到清晨五点。
 
 
 def test_dialect_night_failsafe_cantonese() -> None:
-    """Offline (model down): the night fail-safe must still derive the
-    overnight window from a Cantonese phrasing with CN-numeral clock times."""
+    """Legacy AGENT_PARSE_LLM=0 keeps the regex night fail-safe available."""
+    import agent.model_decision_service as mds
     api = ScriptedApi(fail_all=True)
     svc = ModelDecisionService(api)
-    rules = svc._ensure_rules("DG01", _status([
-        {"content": PREF_NIGHT_CANTONESE, "penalty_amount": 2700, "penalty_cap": None},
-    ]))
+    original = mds._PARSE_LLM
+    mds._PARSE_LLM = False
+    try:
+        rules = svc._ensure_rules("DG01", _status([
+            {"content": PREF_NIGHT_CANTONESE, "penalty_amount": 2700, "penalty_cap": None},
+        ]))
+    finally:
+        mds._PARSE_LLM = original
     assert (21 * 60, 30 * 60) in rules.no_drive_windows, rules.no_drive_windows
     assert rules.rest_window == (0, 6 * 60), rules.rest_window
 
 
 def test_dialect_night_failsafe_wu_with_cn_numerals() -> None:
+    import agent.model_decision_service as mds
     api = ScriptedApi(fail_all=True)
     svc = ModelDecisionService(api)
-    rules = svc._ensure_rules("DG02", _status([
-        {"content": PREF_NIGHT_WU, "penalty_amount": 500, "penalty_cap": 5000},
-    ]))
+    original = mds._PARSE_LLM
+    mds._PARSE_LLM = False
+    try:
+        rules = svc._ensure_rules("DG02", _status([
+            {"content": PREF_NIGHT_WU, "penalty_amount": 500, "penalty_cap": 5000},
+        ]))
+    finally:
+        mds._PARSE_LLM = original
     assert (23 * 60, 29 * 60) in rules.no_drive_windows, rules.no_drive_windows
 
 
@@ -515,22 +526,27 @@ def test_llm_short_wait_not_overridden() -> None:
 
 
 def test_llm_codecides_every_step() -> None:
-    """The decision LLM is consulted on every step now (was every 3rd)."""
+    """AGENT_DECISION_LLM=1 restores the PR92/93 every-step co-decision path."""
+    import agent.model_decision_service as mds
     day, tod = 5, 600
     now = day * DAY_MINUTES + tod
     api = ValueApi(now, [], {"action": "wait", "params": {"duration_minutes": 45}})
     svc = ModelDecisionService(api)
-    a1 = svc.decide("DG42")  # step 1 — old gating (step % 3 == 0) would skip the LLM
-    assert len(api.decision_prompts) == 1, api.decision_prompts
-    assert a1["action"] == "wait", a1
-    svc.decide("DG42")  # step 2 — still consulted
-    assert len(api.decision_prompts) == 2
+    original = mds._DECISION_LLM
+    mds._DECISION_LLM = True
+    try:
+        a1 = svc.decide("DG42")
+        assert len(api.decision_prompts) == 1, api.decision_prompts
+        assert a1["action"] == "wait", a1
+        svc.decide("DG42")
+        assert len(api.decision_prompts) == 2
+    finally:
+        mds._DECISION_LLM = original
 
 
 def test_decision_llm_off_runs_deterministic() -> None:
-    """AGENT_DECISION_LLM=0 skips the per-step decision LLM entirely (the
-    sub-second / near-zero-token leaderboard profile): decide() returns a valid
-    action from the deterministic scheduler and never sends a decision prompt."""
+    """PR95 default skips the per-step decision LLM entirely: decide() returns a
+    valid action from the deterministic scheduler and never sends a decision prompt."""
     import agent.model_decision_service as mds
     day, tod = 5, 600
     now = day * DAY_MINUTES + tod
@@ -539,6 +555,7 @@ def test_decision_llm_off_runs_deterministic() -> None:
     original = mds._DECISION_LLM
     mds._DECISION_LLM = False
     try:
+        assert original is False, "PR95 default must be parse-LLM-only / deterministic execution"
         a1 = svc.decide("DG44")
         assert a1 is not None and "action" in a1, a1
         assert len(api.decision_prompts) == 0, api.decision_prompts
